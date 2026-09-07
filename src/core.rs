@@ -42,6 +42,78 @@ impl ProviderTransport {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ProfileProbeTimingSnapshot {
+    response_headers_ms: Option<u64>,
+    first_byte_ms: Option<u64>,
+    response_body_ms: Option<u64>,
+}
+
+#[derive(Debug)]
+struct ProfileProbeTiming {
+    started: Instant,
+    response_headers_ms: Option<u64>,
+    first_byte_ms: Option<u64>,
+    response_body_ms: Option<u64>,
+}
+
+impl ProfileProbeTiming {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            response_headers_ms: None,
+            first_byte_ms: None,
+            response_body_ms: None,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn snapshot(&self) -> ProfileProbeTimingSnapshot {
+        ProfileProbeTimingSnapshot {
+            response_headers_ms: self.response_headers_ms,
+            first_byte_ms: self.first_byte_ms,
+            response_body_ms: self.response_body_ms,
+        }
+    }
+}
+
+tokio::task_local! {
+    static PROFILE_PROBE_TIMING: Arc<RwLock<ProfileProbeTiming>>;
+}
+
+fn mark_profile_probe_response_headers() {
+    let _ = PROFILE_PROBE_TIMING.try_with(|timing| {
+        if let Ok(mut timing) = timing.write() {
+            if timing.response_headers_ms.is_none() {
+                timing.response_headers_ms = Some(timing.elapsed_ms());
+            }
+        }
+    });
+}
+
+fn mark_profile_probe_first_byte() {
+    let _ = PROFILE_PROBE_TIMING.try_with(|timing| {
+        if let Ok(mut timing) = timing.write() {
+            if timing.first_byte_ms.is_none() {
+                timing.first_byte_ms = Some(timing.elapsed_ms());
+            }
+        }
+    });
+}
+
+fn mark_profile_probe_response_body() {
+    let _ = PROFILE_PROBE_TIMING.try_with(|timing| {
+        if let Ok(mut timing) = timing.write() {
+            if timing.response_body_ms.is_none() {
+                timing.response_body_ms = Some(timing.elapsed_ms());
+            }
+        }
+    });
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ToolSchemaMode {
     Sanitize,
@@ -448,6 +520,7 @@ async fn send_with_rate_limit_retry(
         let Some(delay) =
             rate_limit_retry_delay(attempt, response.status().as_u16(), retry_after_secs)
         else {
+            mark_profile_probe_response_headers();
             return Ok(response);
         };
         warn!(

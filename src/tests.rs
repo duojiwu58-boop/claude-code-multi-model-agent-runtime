@@ -117,6 +117,135 @@ fn url_credentials_are_redacted_from_public_values() {
 }
 
 #[test]
+fn profile_json_keeps_plain_urls_and_non_url_identity_labels() {
+    let client = Client::builder().build().unwrap();
+    let profile = ProviderProfile {
+        file_name: "personal.json".to_string(),
+        display_name: "Personal".to_string(),
+        source: ProviderProfileSource::Native,
+        model: "personal-model".to_string(),
+        context_window: None,
+        upstream_identity: Some("Qwen3.8 Max".to_string()),
+        identity_override: true,
+        base_url: "https://example.invalid/v1beta".to_string(),
+        auth_token: None,
+        api_key: None,
+        proxy_url: None,
+        local_gemini: false,
+        transport: ProviderTransport::OpenAiChat,
+        openai_capabilities: OpenAiCapabilities::default(),
+        vision: VisionConfig::default(),
+        upstream_url: "https://example.invalid/v1beta/openai/chat/completions".to_string(),
+        client,
+    };
+    let value = provider_profile_json(&profile, &profile.file_name);
+    assert_eq!(value["upstream_identity"], "Qwen3.8 Max");
+    assert_eq!(value["base_url"], "https://example.invalid/v1beta");
+    assert_eq!(
+        value["upstream_url"],
+        "https://example.invalid/v1beta/openai/chat/completions"
+    );
+}
+
+#[tokio::test]
+async fn health_json_never_exposes_url_userinfo_credentials() {
+    let client = Client::builder().build().unwrap();
+    let profile = ProviderProfile {
+        file_name: "personal.json".to_string(),
+        display_name: "Personal".to_string(),
+        source: ProviderProfileSource::Native,
+        model: "personal-model".to_string(),
+        context_window: None,
+        upstream_identity: Some("https://userid:pwid@example.invalid/identity".to_string()),
+        identity_override: true,
+        base_url: "https://userbase:pwbase@example.invalid/v1beta".to_string(),
+        auth_token: None,
+        api_key: None,
+        proxy_url: Some("http://userproxy:pwproxy@127.0.0.1:7891".to_string()),
+        local_gemini: false,
+        transport: ProviderTransport::OpenAiChat,
+        openai_capabilities: OpenAiCapabilities::default(),
+        vision: VisionConfig::default(),
+        upstream_url: "https://userup:pwup@example.invalid/v1beta/openai/chat/completions"
+            .to_string(),
+        client: client.clone(),
+    };
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = AppState {
+        gemini_transport: Arc::new(RwLock::new(GeminiTransport {
+            client,
+            proxy_url: Some("http://userproxy:pwproxy@127.0.0.1:7890".to_string()),
+        })),
+        gemini_thinking_level: Arc::new(RwLock::new(None)),
+        fallback_api_key: None,
+        local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
+        upstream_url: "https://usertop:pwtop@example.invalid/v1beta/openai/chat/completions"
+            .to_string(),
+        model: "fallback".to_string(),
+        thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+        interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        computer: Arc::new(ComputerBroker),
+        vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        routing: Arc::new(RwLock::new(ProviderRoutingState {
+            profiles: vec![profile.clone()],
+            active_file: profile.file_name.clone(),
+            source: ProviderProfileSource::Native,
+        })),
+        shutdown_tx,
+        settings_dir: PathBuf::new(),
+        providers_dir: PathBuf::new(),
+        bridge_state_path: PathBuf::new(),
+        image_output_dir: env::temp_dir(),
+        image_model: DEFAULT_IMAGE_MODEL.to_string(),
+        image_upstream_url: DEFAULT_IMAGE_UPSTREAM.to_string(),
+        local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
+        admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+    };
+    let body = health(State(Arc::new(state))).await.0;
+    // Every URL-echoing field keeps its host/path but drops the userinfo.
+    assert_eq!(
+        body["upstream"],
+        "https://example.invalid/v1beta/openai/chat/completions"
+    );
+    assert_eq!(body["gemini_proxy"], "http://127.0.0.1:7890/");
+    assert_eq!(
+        body["active_profile"]["base_url"],
+        "https://example.invalid/v1beta"
+    );
+    assert_eq!(
+        body["active_profile"]["upstream_url"],
+        "https://example.invalid/v1beta/openai/chat/completions"
+    );
+    assert_eq!(
+        body["active_profile"]["upstream_identity"],
+        "https://example.invalid/identity"
+    );
+    assert_eq!(body["active_profile"]["proxy"], "http://127.0.0.1:7891/");
+    // No credential marker survives anywhere in the serialized JSON.
+    let text = serde_json::to_string(&body).unwrap();
+    for secret in [
+        "userbase",
+        "pwbase",
+        "userup",
+        "pwup",
+        "userid",
+        "pwid",
+        "usertop",
+        "pwtop",
+        "userproxy",
+        "pwproxy",
+    ] {
+        assert!(
+            !text.contains(secret),
+            "health JSON leaked credential marker: {secret}"
+        );
+    }
+    // Usable address information is retained.
+    assert!(text.contains("example.invalid"));
+    assert!(text.contains("127.0.0.1"));
+}
+
+#[test]
 fn numeric_strings_are_accepted_only_as_unsigned_integers() {
     assert_eq!(value_as_u64(&json!(42)), Some(42));
     assert_eq!(value_as_u64(&json!("42")), Some(42));
@@ -8759,6 +8888,7 @@ fn wraps_parallel_native_actions_in_one_idempotent_batch() {
         "gemini-3.8-flash",
         None,
         Some(&request),
+        true,
     )
     .unwrap();
     assert_eq!(translated.message["content"].as_array().unwrap().len(), 1);
@@ -8872,4 +9002,848 @@ fn streaming_wraps_native_computer_calls_as_one_batch() {
     );
     assert!(events.contains("computer_action_batch"));
     assert!(!events.contains("\"name\":\"click\""));
+}
+
+// ---------------------------------------------------------------- probe
+
+fn probe_http_client() -> Client {
+    Client::builder().build().unwrap()
+}
+
+fn probe_profile(
+    file_name: &str,
+    transport: ProviderTransport,
+    base_url: &str,
+    upstream_url: &str,
+    auth_token: Option<String>,
+    api_key: Option<String>,
+) -> ProviderProfile {
+    ProviderProfile {
+        file_name: file_name.to_string(),
+        display_name: file_name.to_string(),
+        source: ProviderProfileSource::Native,
+        model: "probe-model".to_string(),
+        context_window: None,
+        upstream_identity: None,
+        identity_override: true,
+        base_url: base_url.to_string(),
+        auth_token,
+        api_key,
+        proxy_url: None,
+        local_gemini: transport == ProviderTransport::LocalGemini,
+        transport,
+        openai_capabilities: OpenAiCapabilities::default(),
+        vision: VisionConfig::default(),
+        upstream_url: upstream_url.to_string(),
+        client: probe_http_client(),
+    }
+}
+
+fn probe_state(
+    profiles: Vec<ProviderProfile>,
+    active_file: String,
+    fallback_api_key: Option<String>,
+    upstream_url: String,
+) -> Arc<AppState> {
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    Arc::new(AppState {
+        gemini_transport: Arc::new(RwLock::new(GeminiTransport {
+            client: probe_http_client(),
+            proxy_url: None,
+        })),
+        gemini_thinking_level: Arc::new(RwLock::new(None)),
+        fallback_api_key,
+        local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
+        upstream_url,
+        model: "gemini-3.8-flash".to_string(),
+        thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+        interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        computer: Arc::new(ComputerBroker),
+        vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        routing: Arc::new(RwLock::new(ProviderRoutingState {
+            profiles,
+            active_file,
+            source: ProviderProfileSource::Native,
+        })),
+        shutdown_tx,
+        settings_dir: PathBuf::new(),
+        providers_dir: PathBuf::new(),
+        bridge_state_path: PathBuf::new(),
+        image_output_dir: env::temp_dir(),
+        image_model: DEFAULT_IMAGE_MODEL.to_string(),
+        image_upstream_url: DEFAULT_IMAGE_UPSTREAM.to_string(),
+        local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
+        admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+    })
+}
+
+#[derive(Clone)]
+struct ProbeMockShared {
+    requests: Arc<std::sync::Mutex<Vec<(Value, HeaderMap)>>>,
+    status: StatusCode,
+    response: Value,
+}
+
+async fn probe_mock_handler(
+    State(shared): State<ProbeMockShared>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    shared.requests.lock().unwrap().push((body, headers));
+    (shared.status, Json(shared.response.clone())).into_response()
+}
+
+async fn spawn_probe_mock(
+    path: &str,
+    status: StatusCode,
+    response: Value,
+) -> (
+    String,
+    Arc<std::sync::Mutex<Vec<(Value, HeaderMap)>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::<(Value, HeaderMap)>::new()));
+    let shared = ProbeMockShared {
+        requests: requests.clone(),
+        status,
+        response,
+    };
+    let mock = Router::new()
+        .route(path, post(probe_mock_handler))
+        .with_state(shared);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    (format!("http://{address}"), requests, server)
+}
+
+#[test]
+fn profile_probe_request_is_minimal_and_non_streaming() {
+    let request = profile_probe_request("deepseek-v4-flash");
+    assert_eq!(request["max_tokens"], 1);
+    assert_eq!(request["stream"], false);
+    assert_eq!(request["thinking"]["type"], "disabled");
+    assert_eq!(request["messages"][0]["role"], "user");
+    assert_eq!(request["messages"][0]["content"], "ping");
+    assert_eq!(request["model"], "deepseek-v4-flash");
+}
+
+#[test]
+fn profile_probe_network_json_redacts_proxy_credentials() {
+    let network = profile_probe_network_json(
+        Some("http://user:secret@127.0.0.1:1080"),
+        ProfileProbeTimingSnapshot {
+            response_headers_ms: Some(10),
+            first_byte_ms: Some(20),
+            response_body_ms: Some(30),
+        },
+        40,
+    );
+    assert_eq!(network["proxy_mode"], "proxy");
+    assert_eq!(network["proxy_url"], "http://127.0.0.1:1080/");
+    assert_eq!(network["response_headers_ms"], 10);
+    assert_eq!(network["first_byte_ms"], 20);
+    assert_eq!(network["response_body_ms"], 30);
+    assert_eq!(network["total_ms"], 40);
+    assert!(!network.to_string().contains("secret"));
+}
+
+#[test]
+fn probe_redaction_strips_url_userinfo_from_free_text() {
+    let redacted = redact_url_credentials_in_text(
+        "error: https://user:secret@host.example:8443/v1 and http://u:p@x.invalid/ and plain text",
+    );
+    assert!(!redacted.contains("user:secret"));
+    assert!(!redacted.contains("u:p"));
+    assert!(redacted.contains("host.example:8443/v1"));
+    assert!(redacted.contains("x.invalid/"));
+    assert!(redacted.contains("plain text"));
+    // Non-URL text and already-clean URLs pass through untouched.
+    let clean = redact_url_credentials_in_text("everything is fine https://example.com/x");
+    assert_eq!(clean, "everything is fine https://example.com/x");
+}
+
+#[tokio::test]
+async fn profile_probe_succeeds_for_openai_chat_transport() {
+    let (base_url, requests, server) = spawn_probe_mock(
+        "/v1/chat/completions",
+        StatusCode::OK,
+        json!({"choices": [{"message": {"content": "ok"}}]}),
+    )
+    .await;
+    let profile = probe_profile(
+        "selected.json",
+        ProviderTransport::OpenAiChat,
+        &base_url,
+        &format!("{base_url}/v1/chat/completions"),
+        Some("probe-secret-key".to_string()),
+        None,
+    );
+    let state = probe_state(
+        vec![profile],
+        "selected.json".to_string(),
+        None,
+        "http://unused.invalid/upstream".to_string(),
+    );
+    let (status, body) = run_profile_probe(&state, "selected.json", Duration::from_secs(10)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["file"], "selected.json");
+    assert_eq!(body["model"], "probe-model");
+    assert_eq!(body["transport"], "openai-chat");
+    assert_eq!(body["upstream_status"], 200);
+    assert!(body["latency_ms"].as_u64().is_some());
+    let network = &body["network"];
+    assert_eq!(network["proxy_mode"], "direct");
+    assert!(network["proxy_url"].is_null());
+    let response_headers_ms = network["response_headers_ms"].as_u64().unwrap();
+    let first_byte_ms = network["first_byte_ms"].as_u64().unwrap();
+    let response_body_ms = network["response_body_ms"].as_u64().unwrap();
+    let total_ms = network["total_ms"].as_u64().unwrap();
+    assert!(response_headers_ms <= first_byte_ms);
+    assert!(first_byte_ms <= response_body_ms);
+    assert!(response_body_ms <= total_ms);
+    assert_eq!(network["total_ms"], body["latency_ms"]);
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let request = &captured[0].0;
+    assert_eq!(request["model"], "probe-model");
+    assert_eq!(request["max_tokens"], 1);
+    assert_eq!(request["messages"][0]["content"], "ping");
+    assert_eq!(
+        captured[0]
+            .1
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "Bearer probe-secret-key"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn profile_probe_succeeds_for_openai_responses_transport() {
+    let (base_url, requests, server) = spawn_probe_mock(
+        "/v1/responses",
+        StatusCode::OK,
+        json!({
+            "id": "resp_probe_1",
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+    )
+    .await;
+    let profile = probe_profile(
+        "selected.json",
+        ProviderTransport::OpenAiResponses,
+        &base_url,
+        &format!("{base_url}/v1/responses"),
+        Some("probe-secret-key".to_string()),
+        None,
+    );
+    let state = probe_state(
+        vec![profile],
+        "selected.json".to_string(),
+        None,
+        "http://unused.invalid/upstream".to_string(),
+    );
+    let (status, body) = run_profile_probe(&state, "selected.json", Duration::from_secs(10)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["transport"], "openai-responses");
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].0["model"], "probe-model");
+    assert_eq!(captured[0].0["stream"], false);
+    assert_eq!(
+        captured[0]
+            .1
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "Bearer probe-secret-key"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn profile_probe_succeeds_for_anthropic_transport() {
+    let (base_url, requests, server) = spawn_probe_mock(
+        "/v1/messages",
+        StatusCode::OK,
+        json!({
+            "id": "msg_probe_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "probe-model",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+    )
+    .await;
+    let profile = probe_profile(
+        "selected.json",
+        ProviderTransport::Anthropic,
+        &base_url,
+        &format!("{base_url}/v1/messages"),
+        None,
+        Some("probe-secret-key".to_string()),
+    );
+    let state = probe_state(
+        vec![profile],
+        "selected.json".to_string(),
+        None,
+        "http://unused.invalid/upstream".to_string(),
+    );
+    let (status, body) = run_profile_probe(&state, "selected.json", Duration::from_secs(10)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["transport"], "anthropic");
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let request = &captured[0].0;
+    assert_eq!(request["model"], "probe-model");
+    assert_eq!(request["max_tokens"], 1);
+    assert_eq!(request["stream"], false);
+    assert_eq!(request["thinking"]["type"], "disabled");
+    assert_eq!(
+        captured[0].1.get("x-api-key").unwrap().to_str().unwrap(),
+        "probe-secret-key"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn profile_probe_succeeds_for_gemini_interactions_transport() {
+    let (base_url, requests, server) = spawn_probe_mock(
+        "/interactions",
+        StatusCode::OK,
+        json!({
+            "id": "interaction_probe_1",
+            "status": "completed",
+            "steps": [{"type": "model_output", "content": [{"type": "text", "text": "ok"}]}],
+            "usage": {"input_token_count": 1, "output_token_count": 1}
+        }),
+    )
+    .await;
+    let profile = probe_profile(
+        "selected.json",
+        ProviderTransport::GeminiInteractions,
+        &base_url,
+        &format!("{base_url}/interactions"),
+        None,
+        Some("probe-secret-key".to_string()),
+    );
+    let state = probe_state(
+        vec![profile],
+        "selected.json".to_string(),
+        None,
+        "http://unused.invalid/upstream".to_string(),
+    );
+    let (status, body) = run_profile_probe(&state, "selected.json", Duration::from_secs(10)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["transport"], "gemini-interactions");
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let request = &captured[0].0;
+    assert_eq!(request["stream"], false);
+    assert_eq!(request["generation_config"]["max_output_tokens"], 1);
+    assert!(request["input"]
+        .as_array()
+        .is_some_and(|input| !input.is_empty()));
+    assert_eq!(
+        captured[0]
+            .1
+            .get("x-goog-api-key")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "probe-secret-key"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn profile_probe_succeeds_for_gemini_interactions_idless_store_false_response() {
+    // Real upstream response shape captured 2026-09-06 while probing
+    // gemini-3.8-flash: a store:false interaction request returns a terminal
+    // interaction without an id, because the id only addresses a stored
+    // interaction. The probe must send store:false (no store pollution) and
+    // must accept the resulting id-less terminal response. This used to fail
+    // with "Gemini Interactions response has no id" at stage=upstream.
+    let (base_url, requests, server) = spawn_probe_mock(
+        "/interactions",
+        StatusCode::OK,
+        json!({
+            "status": "incomplete",
+            "usage": {
+                "total_tokens": 2,
+                "total_input_tokens": 2,
+                "input_tokens_by_modality": [{"modality": "text", "tokens": 2}],
+                "total_cached_tokens": 0,
+                "total_output_tokens": 0,
+                "total_tool_use_tokens": 0,
+                "total_thought_tokens": 0
+            },
+            "created": "2026-09-06T23:32:36Z",
+            "updated": "2026-09-06T23:32:36Z",
+            "service_tier": "standard",
+            "steps": [
+                {
+                    "signature": "EiYKJGUyNDgzMGE3LTVjZDYtNDJmZS05OThiLWVlNTM5ZTcyYjljMw==",
+                    "type": "thought"
+                }
+            ],
+            "object": "interaction",
+            "model": "gemini-3.8-flash"
+        }),
+    )
+    .await;
+    let mut profile = probe_profile(
+        "selected.json",
+        ProviderTransport::GeminiInteractions,
+        &base_url,
+        &format!("{base_url}/interactions"),
+        None,
+        Some("probe-secret-key".to_string()),
+    );
+    profile.model = "gemini-3.8-flash".to_string();
+    let state = probe_state(
+        vec![profile],
+        "deepseek-v4-flash-vision-exp.json".to_string(),
+        None,
+        "http://unused.invalid/upstream".to_string(),
+    );
+    let (status, body) = run_profile_probe(&state, "selected.json", Duration::from_secs(10)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["file"], "selected.json");
+    assert_eq!(body["model"], "gemini-3.8-flash");
+    assert_eq!(body["transport"], "gemini-interactions");
+    assert_eq!(body["upstream_status"], 200);
+    assert!(body["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("Valid gemini-interactions response")));
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let request = &captured[0].0;
+    assert_eq!(request["model"], "gemini-3.8-flash");
+    assert_eq!(request["stream"], false);
+    assert_eq!(request["store"], false);
+    assert_eq!(request["generation_config"]["max_output_tokens"], 1);
+    assert_eq!(request["generation_config"]["thinking_level"], "low");
+    // The probe tests a highlighted-but-not-active profile: routing selection
+    // must not change and no continuation may be recorded for the id-less
+    // interaction.
+    assert_eq!(
+        state.routing.read().unwrap().active_file,
+        "deepseek-v4-flash-vision-exp.json"
+    );
+    let cache = state.interaction_continuations.read().unwrap();
+    assert!(cache.transcripts.is_empty());
+    assert!(cache.calls.is_empty());
+    server.abort();
+}
+
+#[test]
+fn gemini_interactions_stored_response_still_requires_an_id() {
+    // The relaxed id requirement applies only to non-stored responses: a
+    // stored interaction response without an id must still be rejected so
+    // branch-safe continuation tracking never breaks silently.
+    let upstream = json!({
+        "status": "completed",
+        "steps": [{"type": "model_output", "content": [{"type": "text", "text": "ok"}]}]
+    });
+    let err = match translate_gemini_interactions_response(&upstream, "gemini-3.8-flash") {
+        Err(message) => message,
+        Ok(_) => panic!("stored interaction response without an id must be rejected"),
+    };
+    assert!(err.contains("Gemini Interactions response has no id"));
+}
+
+#[tokio::test]
+async fn profile_probe_succeeds_for_local_gemini_transport() {
+    let (base_url, requests, server) = spawn_probe_mock(
+        "/v1beta/openai/chat/completions",
+        StatusCode::OK,
+        json!({"choices": [{"message": {"content": "ok"}}]}),
+    )
+    .await;
+    let mut profile = probe_profile(
+        "selected.json",
+        ProviderTransport::LocalGemini,
+        "http://127.0.0.1:18787",
+        "http://127.0.0.1:18787",
+        None,
+        None,
+    );
+    profile.openai_capabilities = OpenAiCapabilities::local_gemini();
+    let state = probe_state(
+        vec![profile],
+        "selected.json".to_string(),
+        Some("gemini-fallback-key".to_string()),
+        format!("{base_url}/v1beta/openai/chat/completions"),
+    );
+    let (status, body) = run_profile_probe(&state, "selected.json", Duration::from_secs(10)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["transport"], "gemini");
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let request = &captured[0].0;
+    // LocalGemini routes use the bridge-configured upstream model, exactly
+    // like live requests through the legacy Gemini path.
+    assert_eq!(request["model"], "gemini-3.8-flash");
+    assert_eq!(request["messages"][0]["content"], "ping");
+    assert_eq!(
+        captured[0]
+            .1
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "Bearer gemini-fallback-key"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn profile_probe_unknown_file_returns_resolve_error() {
+    let state = probe_state(
+        vec![],
+        "".to_string(),
+        None,
+        "http://unused.invalid".to_string(),
+    );
+    let (status, body) = run_profile_probe(&state, "missing.json", Duration::from_secs(1)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["error"]["stage"], "resolve");
+    assert_eq!(
+        body["error"]["message"],
+        "Unknown provider profile 'missing.json'"
+    );
+}
+
+#[tokio::test]
+async fn profile_probe_reports_auth_failure_with_preserved_upstream_status() {
+    let (base_url, _requests, server) = spawn_probe_mock(
+        "/v1/chat/completions",
+        StatusCode::UNAUTHORIZED,
+        json!({"error": {"message": "Incorrect API key provided"}}),
+    )
+    .await;
+    let profile = probe_profile(
+        "selected.json",
+        ProviderTransport::OpenAiChat,
+        &base_url,
+        &format!("{base_url}/v1/chat/completions"),
+        Some("probe-secret-key".to_string()),
+        None,
+    );
+    let state = probe_state(
+        vec![profile],
+        "selected.json".to_string(),
+        None,
+        "http://unused.invalid/upstream".to_string(),
+    );
+    let (status, body) = run_profile_probe(&state, "selected.json", Duration::from_secs(10)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["error"]["stage"], "auth");
+    assert_eq!(body["error"]["status"], 401);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Incorrect API key"));
+    assert!(body["latency_ms"].as_u64().is_some());
+    server.abort();
+}
+
+#[tokio::test]
+async fn profile_probe_reports_upstream_failure_stage() {
+    let (base_url, _requests, server) = spawn_probe_mock(
+        "/v1/chat/completions",
+        StatusCode::INTERNAL_SERVER_ERROR,
+        json!({"error": {"message": "boom"}}),
+    )
+    .await;
+    let profile = probe_profile(
+        "selected.json",
+        ProviderTransport::OpenAiChat,
+        &base_url,
+        &format!("{base_url}/v1/chat/completions"),
+        Some("probe-secret-key".to_string()),
+        None,
+    );
+    let state = probe_state(
+        vec![profile],
+        "selected.json".to_string(),
+        None,
+        "http://unused.invalid/upstream".to_string(),
+    );
+    let (status, body) = run_profile_probe(&state, "selected.json", Duration::from_secs(10)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["error"]["stage"], "upstream");
+    assert_eq!(body["error"]["status"], 500);
+    server.abort();
+}
+
+#[tokio::test]
+async fn profile_probe_rejects_malformed_success_response() {
+    let (base_url, _requests, server) =
+        spawn_probe_mock("/v1/messages", StatusCode::OK, json!({})).await;
+    let profile = probe_profile(
+        "selected.json",
+        ProviderTransport::Anthropic,
+        &base_url,
+        &format!("{base_url}/v1/messages"),
+        None,
+        Some("probe-secret-key".to_string()),
+    );
+    let state = probe_state(
+        vec![profile],
+        "selected.json".to_string(),
+        None,
+        "http://unused.invalid/upstream".to_string(),
+    );
+    let (status, body) = run_profile_probe(&state, "selected.json", Duration::from_secs(10)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["error"]["stage"], "protocol");
+    assert_eq!(body["error"]["status"], 200);
+    server.abort();
+}
+
+#[tokio::test]
+async fn profile_probe_times_out_and_is_bounded() {
+    let mock = Router::new().route(
+        "/v1/chat/completions",
+        post(|_body: Json<Value>| async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Json(json!({"choices": [{"message": {"content": "late"}}]}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let base_url = format!("http://{address}");
+    let profile = probe_profile(
+        "selected.json",
+        ProviderTransport::OpenAiChat,
+        &base_url,
+        &format!("{base_url}/v1/chat/completions"),
+        Some("probe-secret-key".to_string()),
+        None,
+    );
+    let state = probe_state(
+        vec![profile],
+        "selected.json".to_string(),
+        None,
+        "http://unused.invalid/upstream".to_string(),
+    );
+    let started = Instant::now();
+    let (status, body) =
+        run_profile_probe(&state, "selected.json", Duration::from_millis(150)).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["error"]["stage"], "timeout");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "probe bound was not honored: {elapsed:?}"
+    );
+    assert!(body["latency_ms"].as_u64().unwrap() < 5_000);
+    server.abort();
+}
+
+#[tokio::test]
+async fn profile_probe_redacts_credentials_in_upstream_error_messages() {
+    let (base_url, _requests, server) = spawn_probe_mock(
+        "/v1/chat/completions",
+        StatusCode::BAD_GATEWAY,
+        json!({"error": {
+            "message": "key probe-secret-key failed via http://user:secret@internal.example:8443/ and proxy https://proxy-user:proxy-pass@proxy.example:3128"
+        }}),
+    )
+    .await;
+    let profile = probe_profile(
+        "selected.json",
+        ProviderTransport::OpenAiChat,
+        &base_url,
+        &format!("{base_url}/v1/chat/completions"),
+        Some("probe-secret-key".to_string()),
+        None,
+    );
+    let state = probe_state(
+        vec![profile],
+        "selected.json".to_string(),
+        None,
+        "http://unused.invalid/upstream".to_string(),
+    );
+    let (status, body) = run_profile_probe(&state, "selected.json", Duration::from_secs(10)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["error"]["stage"], "upstream");
+    assert_eq!(body["error"]["status"], 502);
+    let text = body.to_string();
+    for secret in ["probe-secret-key", "user:secret", "proxy-user:proxy-pass"] {
+        assert!(
+            !text.contains(secret),
+            "probe error leaked credential marker: {secret}"
+        );
+    }
+    assert!(text.contains("internal.example"));
+    assert!(text.contains("proxy.example"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn profile_probe_does_not_switch_active_profile_or_store_interactions() {
+    let (base_url, requests, server) = spawn_probe_mock(
+        "/v1/responses",
+        StatusCode::OK,
+        json!({
+            "id": "resp_probe_1",
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }),
+    )
+    .await;
+    let mut capabilities = OpenAiCapabilities::default();
+    capabilities.responses_stateful = true;
+    let mut selected = probe_profile(
+        "selected.json",
+        ProviderTransport::OpenAiResponses,
+        &base_url,
+        &format!("{base_url}/v1/responses"),
+        Some("probe-secret-key".to_string()),
+        None,
+    );
+    selected.openai_capabilities = capabilities;
+    let active = probe_profile(
+        "active.json",
+        ProviderTransport::OpenAiChat,
+        "http://unreachable.invalid",
+        "http://unreachable.invalid/v1/chat/completions",
+        None,
+        None,
+    );
+    let state = probe_state(
+        vec![active, selected],
+        "active.json".to_string(),
+        None,
+        "http://unused.invalid/upstream".to_string(),
+    );
+    let before = {
+        let routing = state.routing.read().unwrap();
+        (routing.active_file.clone(), routing.profiles.len())
+    };
+    let (status, body) = run_profile_probe(&state, "selected.json", Duration::from_secs(10)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+    let after = {
+        let routing = state.routing.read().unwrap();
+        (routing.active_file.clone(), routing.profiles.len())
+    };
+    assert_eq!(
+        before, after,
+        "probe must not switch or otherwise mutate the active routing state"
+    );
+    assert_eq!(after.0, "active.json");
+    // The selected (highlighted) profile was probed, not the active one.
+    let captured = requests.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "only the selected profile must be probed"
+    );
+    assert_eq!(
+        captured[0].0["store"], false,
+        "stateful Responses store must stay disabled during the probe"
+    );
+    // No interaction continuation entry was created for the probe.
+    let continuations = state.interaction_continuations.read().unwrap();
+    assert_eq!(continuations.calls.len(), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn admin_profile_test_route_requires_local_auth_and_validates_file() {
+    let (base_url, _requests, server) = spawn_probe_mock(
+        "/v1/chat/completions",
+        StatusCode::OK,
+        json!({"choices": [{"message": {"content": "ok"}}]}),
+    )
+    .await;
+    let profile = probe_profile(
+        "selected.json",
+        ProviderTransport::OpenAiChat,
+        &base_url,
+        &format!("{base_url}/v1/chat/completions"),
+        Some("probe-secret-key".to_string()),
+        None,
+    );
+    let state = probe_state(
+        vec![profile],
+        "selected.json".to_string(),
+        None,
+        "http://unused.invalid/upstream".to_string(),
+    );
+    let app = Router::new()
+        .route("/admin/profiles/test", post(admin_profile_test))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_local_auth,
+        ))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let serve = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{address}");
+    let client = Client::builder().build().unwrap();
+
+    let unauthorized = client
+        .post(format!("{base}/admin/profiles/test"))
+        .json(&json!({"file": "selected.json"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let missing_file = client
+        .post(format!("{base}/admin/profiles/test"))
+        .header(
+            "authorization",
+            "Bearer test-local-token-that-is-long-enough-1234567890",
+        )
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_file.status(), StatusCode::BAD_REQUEST);
+
+    let authorized = client
+        .post(format!("{base}/admin/profiles/test"))
+        .header(
+            "authorization",
+            "Bearer test-local-token-that-is-long-enough-1234567890",
+        )
+        .json(&json!({"file": "selected.json"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let body: Value = authorized.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["file"], "selected.json");
+    serve.abort();
+    server.abort();
 }

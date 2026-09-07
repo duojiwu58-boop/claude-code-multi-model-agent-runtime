@@ -241,7 +241,7 @@ $localAuthToken = Get-BridgeLocalAuthToken `
 Copy-Item -LiteralPath $releaseExe -Destination $serviceExe -Force
 
 $binaryPath = "`"$serviceExe`" --windows-service"
-$scBinaryPath = '\"' + $serviceExe + '\" --windows-service'
+$scBinaryPath = '"' + $serviceExe + '" --windows-service'
 if ($null -eq $existingService) {
     New-Service `
         -Name $serviceName `

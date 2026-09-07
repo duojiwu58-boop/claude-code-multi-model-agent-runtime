@@ -67,6 +67,7 @@ type
     FListPanel: TPanel;
     FListTitleLabel: TLabel;
     FListHintLabel: TLabel;
+    FTestResultLabel: TLabel;
     FProfileList: TListView;
     FLogPanel: TPanel;
     FLogTitleLabel: TLabel;
@@ -77,11 +78,13 @@ type
     FStatusBar: TStatusBar;
     FRefreshButton: TButton;
     FSwitchButton: TButton;
+    FTestButton: TButton;
     FStartButton: TButton;
     FStopButton: TButton;
     FPollTimer: TTimer;
     FClosing: Boolean;
     FBusy: Boolean;
+    FTestInFlight: Boolean; // 连通性测试在途：只禁用“测试”按钮，不阻塞窗口
     FStatusInFlight: Boolean;
     FProfilesBusy: Boolean;
     FProfilesLoaded: Boolean;
@@ -93,6 +96,7 @@ type
     procedure FormResize(Sender: TObject);
     procedure RefreshClick(Sender: TObject);
     procedure SwitchClick(Sender: TObject);
+    procedure TestSelectedClick(Sender: TObject);
     procedure StartClick(Sender: TObject);
     procedure StopClick(Sender: TObject);
     procedure ThinkingLevelClick(Sender: TObject);
@@ -108,6 +112,7 @@ type
     procedure RefreshStatusAsync(const AQuiet: Boolean);
     procedure StartProfilesRefresh(const AQuiet: Boolean);
     procedure SwitchProfileAsync(const AFileName: string);
+    procedure TestProfileAsync(const AFileName: string);
     procedure SetThinkingLevelAsync(const ALevel: string);
     procedure StartStopAsync(const AStart: Boolean);
     procedure ApplyStatusSnapshot(const ASnapshot: TStatusSnapshot;
@@ -122,6 +127,14 @@ type
       AJson: string): TJSONObject;
     function JsonText(AObject: TJSONObject; const AName: string): string;
     function JsonBool(AObject: TJSONObject; const AName: string): Boolean;
+    function ProbeStageName(const AStage: string): string;
+    function ProbeTransportName(const ATransport: string): string;
+    function LocalizeProbeMessage(const AMessage: string): string;
+    function ProbeSuccessSummary(const ATransport, AUpstreamStatus,
+      ARawMessage: string): string;
+    function ProbeNetworkSummary(const AProxyMode, AProxyUrl,
+      AResponseHeadersMs, AFirstByteMs, AResponseBodyMs,
+      ATotalMs: string): string;
     function FindBridgeRoot: string;
     function ResolveBridgeUrl: string;
     function ReadLocalAuthToken: string;
@@ -145,6 +158,8 @@ const
   DEFAULT_BRIDGE_URL = 'http://127.0.0.1:18787';
   STATUS_RESPONSE_TIMEOUT_MS = 4000;
   ACTION_RESPONSE_TIMEOUT_MS = 30000;
+  // 桥接器侧探测有 30 秒总超时，客户端再加 50% 余量。
+  PROBE_RESPONSE_TIMEOUT_MS = 45000;
   SCRIPT_PROCESS_TIMEOUT_MS = 5 * 60 * 1000;
   LOG_MAX_LINES = 500;
   DWMWA_WINDOW_CORNER_PREFERENCE = 33;
@@ -361,21 +376,21 @@ begin
   FComputerPanel.Align := alBottom;
   FComputerPanel.AlignWithMargins := True;
   FComputerPanel.Margins.SetBounds(0, 12, 0, 0);
-  FComputerPanel.Height := 76;
+  FComputerPanel.Height := 88;
   FComputerPanel.BevelOuter := bvNone;
   FComputerPanel.Color := clWhite;
   FComputerPanel.ParentBackground := False;
 
   FComputerTitleLabel := TLabel.Create(Self);
   FComputerTitleLabel.Parent := FComputerPanel;
-  FComputerTitleLabel.SetBounds(16, 12, 220, 24);
+  FComputerTitleLabel.SetBounds(16, 12, 240, 24);
   FComputerTitleLabel.Caption := 'Computer Use（只读状态）';
   FComputerTitleLabel.Font.Style := [fsBold];
   FComputerTitleLabel.Font.Size := 11;
 
   FComputerStatusLabel := TLabel.Create(Self);
   FComputerStatusLabel.Parent := FComputerPanel;
-  FComputerStatusLabel.SetBounds(180, 12, 780, 48);
+  FComputerStatusLabel.SetBounds(16, 44, 500, 28);
   FComputerStatusLabel.AutoSize := False;
   FComputerStatusLabel.WordWrap := True;
   FComputerStatusLabel.Caption := 'Computer Use 由 Claude Code 自动启动本地 Host。' +
@@ -400,10 +415,26 @@ begin
 
   FListHintLabel := TLabel.Create(Self);
   FListHintLabel.Parent := FListPanel;
-  FListHintLabel.SetBounds(126, 15, 520, 20);
-  FListHintLabel.Caption := '双击模型即可切换，下一个请求立即生效';
+  FListHintLabel.SetBounds(146, 15, 340, 20);
+  FListHintLabel.Caption := '双击模型即可切换，下一请求生效';
   FListHintLabel.Font.Name := 'Segoe UI';
   FListHintLabel.Font.Color := $00606060;
+
+  FTestButton := TButton.Create(Self);
+  FTestButton.Parent := FListPanel;
+  FTestButton.SetBounds(844, 9, 112, 32);
+  FTestButton.Caption := '测试选中模型';
+  FTestButton.Enabled := False;
+  FTestButton.OnClick := TestSelectedClick;
+
+  FTestResultLabel := TLabel.Create(Self);
+  FTestResultLabel.Parent := FListPanel;
+  FTestResultLabel.SetBounds(500, 15, 230, 20);
+  FTestResultLabel.Caption := '';
+  FTestResultLabel.Font.Name := 'Segoe UI';
+  FTestResultLabel.Font.Size := 10;
+  FTestResultLabel.Font.Color := $00606060;
+  FTestResultLabel.AutoSize := False;
 
   FProfileList := TListView.Create(Self);
   FProfileList.Parent := FListPanel;
@@ -491,6 +522,19 @@ begin
   begin
     FStatusBar.Panels[0].Width := FStatusBar.ClientWidth * 2 div 5;
     FStatusBar.Panels[1].Width := FStatusBar.ClientWidth * 3 div 10;
+  end;
+
+  if Assigned(FComputerStatusLabel) and Assigned(FComputerPanel) then
+    FComputerStatusLabel.Width :=
+      FComputerPanel.ClientWidth - FComputerStatusLabel.Left - 16;
+
+  if Assigned(FTestButton) and Assigned(FTestResultLabel) and
+     Assigned(FListPanel) then
+  begin
+    FTestButton.Left :=
+      FListPanel.ClientWidth - 16 - FTestButton.Width;
+    FTestResultLabel.Left :=
+      FTestButton.Left - CONTROL_GAP - FTestResultLabel.Width;
   end;
 
   AdjustProfileColumns;
@@ -803,6 +847,7 @@ begin
     FRefreshButton.Enabled := False;
     FProfileList.Enabled := False;
     FSwitchButton.Enabled := False;
+    FTestButton.Enabled := False;
     FStartButton.Enabled := False;
     FStopButton.Enabled := False;
     FThinkingGroup.Enabled := False;
@@ -813,6 +858,8 @@ begin
     Screen.Cursor := crDefault;
     FRefreshButton.Enabled := True;
     FProfileList.Enabled := True;
+    // 探测在途时保持“测试”按钮禁用，防止重复探测。
+    FTestButton.Enabled := (FStatusLabel.Tag = 1) and not FTestInFlight;
     FThinkingGroup.Enabled :=
       (FStatusLabel.Tag = 1) and (FThinkingLevel <> '');
     RefreshStatusAsync(True);
@@ -832,6 +879,8 @@ begin
     FStatusPanel.Color := $00ECF6E9;
     FStatusLabel.Tag := 1;
     FSwitchButton.Enabled := True;
+    // 探测在途时“测试”按钮保持禁用。
+    FTestButton.Enabled := not FTestInFlight;
     FStopButton.Enabled := True;
     FStartButton.Enabled := False;
   end
@@ -845,6 +894,7 @@ begin
     FCurrentModelLabel.Caption := '当前模型：-';
     FThinkingGroup.Enabled := False;
     FSwitchButton.Enabled := False;
+    FTestButton.Enabled := False;
     FStopButton.Enabled := False;
     FStartButton.Enabled := True;
   end;
@@ -852,6 +902,7 @@ begin
   begin
     FRefreshButton.Enabled := False;
     FSwitchButton.Enabled := False;
+    FTestButton.Enabled := False;
     FStartButton.Enabled := False;
     FStopButton.Enabled := False;
   end;
@@ -1287,6 +1338,330 @@ begin
      (FProfileList.Selected.Index >= FProfileFiles.Count) then
     Exit;
   SwitchProfileAsync(FProfileFiles[FProfileList.Selected.Index]);
+end;
+
+procedure TMainForm.TestSelectedClick(Sender: TObject);
+begin
+  if not Assigned(FProfileList.Selected) then
+  begin
+    MessageDlg('请先选择一个模型配置。', mtInformation, [mbOK], 0);
+    Exit;
+  end;
+  if (FProfileList.Selected.Index < 0) or
+     (FProfileList.Selected.Index >= FProfileFiles.Count) then
+    Exit;
+  TestProfileAsync(FProfileFiles[FProfileList.Selected.Index]);
+end;
+
+// 探测失败阶段：探针 API 返回的稳定阶段标识 → 简洁中文标签。
+function TMainForm.ProbeStageName(const AStage: string): string;
+begin
+  if AStage = 'resolve' then Result := '配置解析'
+  else if AStage = 'auth' then Result := '鉴权'
+  else if AStage = 'request' then Result := '请求'
+  else if AStage = 'upstream' then Result := '上游'
+  else if AStage = 'response' then Result := '响应'
+  else if AStage = 'timeout' then Result := '超时'
+  else if AStage = 'protocol' then Result := '协议'
+  else if AStage = 'bridge' then Result := '桥接器'
+  else Result := AStage;
+end;
+
+// 探测传输协议标识 → 保留协议名称（中英混排仍易于辨认，不强行音译）。
+function TMainForm.ProbeTransportName(const ATransport: string): string;
+begin
+  if ATransport = 'anthropic' then Result := 'Anthropic'
+  else if ATransport = 'gemini-interactions' then Result := 'Gemini Interactions'
+  else if ATransport = 'openai-chat' then Result := 'OpenAI Chat'
+  else if ATransport = 'openai-responses' then Result := 'OpenAI Responses'
+  else if ATransport = 'gemini' then Result := 'Gemini'
+  else Result := ATransport;
+end;
+
+// 翻译桥接器稳定拥有的探测报错文案；上游/提供程序原文一律原样保留，
+// 避免对英文免费文本做机器式替换或误改技术详情。
+function TMainForm.LocalizeProbeMessage(const AMessage: string): string;
+const
+  CUnknownProfilePrefix = 'Unknown provider profile ''';
+  CTimeoutPrefix = 'Profile probe timed out after ';
+  CCannotReadPrefix = 'Cannot read probe response: ';
+begin
+  Result := AMessage;
+  if Result = '' then
+    Exit;
+  if SameText(Result, 'Cannot read provider routing state') then
+    Exit('无法读取提供程序路由状态');
+  if SameText(Result,
+    'Profile probe received an invalid Anthropic message response') then
+    Exit('探测响应不是有效的 Anthropic message');
+  if SameText(Result,
+    'LocalGemini requires GEMINI_API_KEY or GEMINI_BRIDGE_API_KEY_PROFILE') then
+    Exit('本地 Gemini 需要 GEMINI_API_KEY 或 GEMINI_BRIDGE_API_KEY_PROFILE');
+  if SameText(Result, 'Profile probe failed without a structured error message') then
+    Exit('探测失败：未收到结构化错误信息');
+  // 以下三条带动态片段（文件名 / 毫秒数 / 底层错误），逐段译出并保留细节。
+  if Copy(Result, 1, Length(CUnknownProfilePrefix)) = CUnknownProfilePrefix then
+    Exit('未找到模型配置：' +
+      Copy(Result, Length(CUnknownProfilePrefix) + 1,
+        Length(Result) - Length(CUnknownProfilePrefix) - 1));
+  if Copy(Result, 1, Length(CTimeoutPrefix)) = CTimeoutPrefix then
+    Exit('探测超时（上限 ' +
+      Copy(Result, Length(CTimeoutPrefix) + 1,
+        Length(Result) - Length(CTimeoutPrefix) - 3) + ' ms）');
+  if Copy(Result, 1, Length(CCannotReadPrefix)) = CCannotReadPrefix then
+    Exit('无法读取探测响应：' +
+      Copy(Result, Length(CCannotReadPrefix) + 1, MaxInt));
+end;
+
+// 成功文案按探针返回的 transport / upstream_status 渲染为自然中文，
+// 不再直接显示后端的英文通用成功消息。
+function TMainForm.ProbeSuccessSummary(const ATransport, AUpstreamStatus,
+  ARawMessage: string): string;
+begin
+  Result := ProbeTransportName(ATransport);
+  if Result <> '' then
+  begin
+    Result := Result + ' 上游响应有效';
+    if AUpstreamStatus <> '' then
+      Result := Result + '（HTTP ' + AUpstreamStatus + '）';
+    Exit;
+  end;
+  // 旧版桥接器未返回 transport：退回后端成功文案，避免丢失信息。
+  if ARawMessage <> '' then
+    Result := ARawMessage
+  else
+    Result := '上游响应有效';
+end;
+
+// 探测网络分阶段耗时。响应头阶段包含 DNS、建连、代理隧道、TLS、
+// 重试和上游排队；连接复用时不把它误报为单独的“连接耗时”。
+function TMainForm.ProbeNetworkSummary(const AProxyMode, AProxyUrl,
+  AResponseHeadersMs, AFirstByteMs, AResponseBodyMs,
+  ATotalMs: string): string;
+  procedure AddPart(const ALabel, AValue: string);
+  begin
+    if AValue = '' then
+      Exit;
+    if Result <> '' then
+      Result := Result + '；';
+    Result := Result + ALabel + '：' + AValue;
+  end;
+begin
+  Result := '';
+  if SameText(AProxyMode, 'proxy') then
+  begin
+    if AProxyUrl <> '' then
+      AddPart('代理', AProxyUrl)
+    else
+      AddPart('代理模式', '代理');
+  end
+  else if SameText(AProxyMode, 'direct') then
+    AddPart('代理模式', '直连');
+  if AResponseHeadersMs <> '' then
+    AddPart('连接/响应头', AResponseHeadersMs + ' ms');
+  if AFirstByteMs <> '' then
+    AddPart('首包', AFirstByteMs + ' ms');
+  if AResponseBodyMs <> '' then
+    AddPart('响应体完成', AResponseBodyMs + ' ms');
+  if ATotalMs <> '' then
+    AddPart('总耗时', ATotalMs + ' ms');
+end;
+
+procedure TMainForm.TestProfileAsync(const AFileName: string);
+begin
+  // 探测使用独立在途状态：只禁用“测试”按钮并拒绝重复探测，
+  // 不进入全局 FBusy，窗口与其余操作保持可用。
+  if FClosing or FBusy or FTestInFlight then
+    Exit;
+  FTestInFlight := True;
+  FTestButton.Enabled := False;
+  FTestResultLabel.Caption := '测试中：' + AFileName;
+  FTestResultLabel.Font.Color := $00606060;
+  Inc(FWorkerCount);
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      LClient: THTTPClient;
+      LRequest: TJSONObject;
+      LHeaders: TNetHeaders;
+      LStream: TStringStream;
+      LResponse: IHTTPResponse;
+      LValue: TJSONValue;
+      LJson: TJSONObject;
+      LNetwork: TJSONObject;
+      LResponseText: string;
+      LStatus: string;
+      LLatencyMs: string;
+      LTransport: string;
+      LUpstreamStatus: string;
+      LMessage: string;
+      LStage: string;
+      LProxyMode: string;
+      LProxyUrl: string;
+      LResponseHeadersMs: string;
+      LFirstByteMs: string;
+      LResponseBodyMs: string;
+      LTotalMs: string;
+      LError: string;
+    begin
+      LError := '';
+      LStatus := '';
+      LLatencyMs := '';
+      LMessage := '';
+      LStage := '';
+      LProxyMode := '';
+      LProxyUrl := '';
+      LResponseHeadersMs := '';
+      LFirstByteMs := '';
+      LResponseBodyMs := '';
+      LTotalMs := '';
+      try
+        LClient := NewHttpClient(PROBE_RESPONSE_TIMEOUT_MS);
+        try
+          SetLength(LHeaders, 2);
+          LHeaders[0].Name := 'Content-Type';
+          LHeaders[0].Value := 'application/json';
+          LHeaders[1].Name := 'Authorization';
+          LHeaders[1].Value := 'Bearer ' + FLocalAuthToken;
+          LRequest := TJSONObject.Create;
+          try
+            LRequest.AddPair('file', AFileName);
+            LStream := TStringStream.Create(LRequest.ToJSON, TEncoding.UTF8);
+          finally
+            LRequest.Free;
+          end;
+          try
+            LResponse := LClient.Post(
+              FBridgeUrl + '/admin/profiles/test',
+              LStream,
+              nil,
+              LHeaders
+            );
+            LResponseText := LResponse.ContentAsString(TEncoding.UTF8);
+            LValue := TJSONObject.ParseJSONValue(LResponseText);
+            if not (LValue is TJSONObject) then
+            begin
+              LValue.Free;
+              raise Exception.CreateFmt('HTTP %d: %s', [
+                LResponse.StatusCode,
+                LResponseText
+              ]);
+            end;
+            LJson := TJSONObject(LValue);
+            try
+              LStatus := JsonText(LJson, 'status');
+              LLatencyMs := JsonText(LJson, 'latency_ms');
+              LTransport := JsonText(LJson, 'transport');
+              LUpstreamStatus := JsonText(LJson, 'upstream_status');
+              if LJson.Values['network'] is TJSONObject then
+              begin
+                LNetwork := TJSONObject(LJson.Values['network']);
+                LProxyMode := JsonText(LNetwork, 'proxy_mode');
+                LProxyUrl := JsonText(LNetwork, 'proxy_url');
+                LResponseHeadersMs := JsonText(LNetwork, 'response_headers_ms');
+                LFirstByteMs := JsonText(LNetwork, 'first_byte_ms');
+                LResponseBodyMs := JsonText(LNetwork, 'response_body_ms');
+                LTotalMs := JsonText(LNetwork, 'total_ms');
+              end;
+              if LJson.Values['error'] is TJSONObject then
+              begin
+                LStage := JsonText(TJSONObject(LJson.Values['error']), 'stage');
+                LMessage := JsonText(TJSONObject(LJson.Values['error']), 'message');
+              end
+              else
+              begin
+                LMessage := JsonText(LJson, 'message');
+                if LMessage = '' then
+                  LMessage := JsonText(LJson, 'error');
+              end;
+              if (LStatus = '') and
+                 ((LResponse.StatusCode < 200) or
+                  (LResponse.StatusCode >= 300)) then
+                LStatus := 'error';
+              if not SameText(LStatus, 'ok') then
+              begin
+                if LStage = '' then
+                  LStage := 'bridge';
+                if LMessage = '' then
+                  LMessage := Format(
+                    '桥接器返回 HTTP %d',
+                    [LResponse.StatusCode]
+                  );
+              end;
+            finally
+              LJson.Free;
+            end;
+          finally
+            LStream.Free;
+          end;
+        finally
+          LClient.Free;
+        end;
+      except
+        on E: Exception do
+          LError := E.Message;
+      end;
+      QueueToMain(
+        procedure
+        var
+          LDisplay: string;
+          LSummary: string;
+          LNetworkSummary: string;
+          LStageZh: string;
+          LMessageZh: string;
+        begin
+          // AFileName 是发起探测时捕获的原始文件：探测期间可更改选中项，
+          // 结果与日志仍归属原模型；若其他操作仍在忙（FBusy）则不恢复按钮。
+          FTestInFlight := False;
+          FTestButton.Enabled :=
+            (FStatusLabel.Tag = 1) and not FBusy;
+          LNetworkSummary := ProbeNetworkSummary(
+            LProxyMode, LProxyUrl, LResponseHeadersMs,
+            LFirstByteMs, LResponseBodyMs, LTotalMs
+          );
+          if LError <> '' then
+          begin
+            FTestResultLabel.Caption := '测试失败：' + LError;
+            FTestResultLabel.Font.Color := $00800000;
+            AppendLog('模型连通性测试失败：' + AFileName + ' -- ' + LError);
+          end
+          else if SameText(LStatus, 'ok') then
+          begin
+            FTestResultLabel.Caption := '测试通过：' + LLatencyMs + ' ms';
+            FTestResultLabel.Font.Color := $00106410;
+            LSummary := ProbeSuccessSummary(LTransport, LUpstreamStatus, LMessage);
+            if LNetworkSummary <> '' then
+              LSummary := LSummary + '；' + LNetworkSummary;
+            AppendLog(
+              Format('模型连通性测试通过：%s（%s）', [
+                AFileName, LSummary
+              ])
+            );
+          end
+          else
+          begin
+            LStageZh := ProbeStageName(LStage);
+            LMessageZh := LocalizeProbeMessage(LMessage);
+            LDisplay := '测试失败：' + LStageZh + '：' + LMessageZh;
+            if Length(LDisplay) > 24 then
+              LDisplay := Copy(LDisplay, 1, 24) + '…';
+            FTestResultLabel.Caption := LDisplay;
+            FTestResultLabel.Font.Color := $00800000;
+            if LNetworkSummary <> '' then
+              AppendLog(
+                Format('模型连通性测试失败：%s -- %s：%s（%s）', [
+                  AFileName, LStageZh, LMessageZh, LNetworkSummary
+                ])
+              )
+            else
+              AppendLog(
+                Format('模型连通性测试失败：%s -- %s：%s', [
+                  AFileName, LStageZh, LMessageZh
+                ])
+              );
+          end;
+        end);
+    end).Start;
 end;
 
 procedure TMainForm.ProfileDblClick(Sender: TObject);

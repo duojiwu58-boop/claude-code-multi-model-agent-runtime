@@ -174,6 +174,7 @@ where
         .route("/admin/profiles", get(admin_profiles))
         .route("/admin/active-profile", post(admin_set_active_profile))
         .route("/admin/reload-profiles", post(admin_reload_profiles))
+        .route("/admin/profiles/test", post(admin_profile_test))
         .route("/admin/gemini-proxy", post(admin_set_gemini_proxy))
         .route("/admin/gemini-proxy/test", post(admin_test_gemini_proxy))
         .route(

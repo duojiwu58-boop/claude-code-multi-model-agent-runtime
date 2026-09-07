@@ -121,12 +121,15 @@ http://127.0.0.1:18787
 - [Gemini 原生 Interactions](examples/providers/gemini.example.json)
 - [DeepSeek V4 Flash](examples/providers/deepseek.example.json)
 - [DeepSeek V4 Pro](examples/providers/deepseek-v4-pro.example.json)
+- [DeepSeek V4 Flash Vision Exp](examples/providers/deepseek-v4-flash-vision-exp.example.json)
 - [Qwen3.8 Max](examples/providers/qwen.example.json)
 - [Kimi K3](examples/providers/kimi.example.json)
 - [通用 OpenAI 兼容提供商](examples/providers/custom-openai.example.json)
 - [能力覆盖配置](examples/providers/capability-overrides.example.json)
 
 打开 **Claude Code 模型中心**，选择 **重新加载配置**，再选择模型。下一次请求立即使用新模型，无需重启 VS Code、Claude Code 或服务。当前 Gemini 3.7 及更高版本 Flash Interactions profile 还提供可热切换的 **Low / Medium / High** Thinking 控件。
+
+模型中心还提供 **测试选中模型** 按钮：它针对当前高亮的那一行（不一定带 ✓，即不一定是激活模型）发起一次真实的、非流式的最小推理（输出上限为 1 个 token），用来验证该 profile 的传输协议、上游 URL、模型 ID、鉴权方式、代理配置和响应解析是否一切正常。测试**不会**切换或持久化激活模型，也不会干扰正在进行的请求；但这是一次真实调用，可能消耗少量模型配额。测试过程、成功延迟或失败阶段/状态码会显示在模型列表标题右侧，并记录在运行日志中。
 
 ### 3. 验证
 
@@ -141,7 +144,7 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:18787/health'
 | 模型 | 推荐路径 | 已适配能力 |
 | --- | --- | --- |
 | **Gemini 3.8 Flash** | `gemini-interactions` | 当前 step 型 SSE、Low/Medium/High Thinking、终态批量并行客户端调用、精确 stored continuation、1M 上下文、图片/PDF、结构化输出、原生 Token 计数、详细用量/缓存/服务层、Google 工具、可选原生 Remote MCP |
-| **DeepSeek V4 Flash / Pro** | 可用时使用 `anthropic` | 最小化 Claude 契约转换、按提供商处理 disabled/high/max 推理、工具轮推理回放、输出余量保护；保留 Responses/Chat 回退 |
+| **DeepSeek V4 Flash / Pro / Flash Vision Exp** | 可用时使用 `anthropic` | 最小化 Claude 契约转换、按提供商处理 disabled/high/max 推理、工具轮推理回放、输出余量保护；Flash Vision Exp 原生接受图片块；保留 Responses/Chat 回退 |
 | **Qwen3.8 Max** | `anthropic` 或经验证的 `openai-responses` | 有意义的 effort 档位、有界普通推理、精确 Responses 续接、DashScope 会话缓存、结构化输出、用量与延迟诊断 |
 | **Kimi K3** | `anthropic` | Bearer 鉴权、已验证模型 ID、1M 上下文元数据、原生 Token 估算和缓存用量；Chat 推理回放及按需 Kimi Formula 工具 |
 | **通过 OpenRouter 使用 Claude Sonnet 5 / Opus 5** | `anthropic` | Messages/SSE 透传、自适应签名 Thinking、严格/并行工具、结构化输出、Prompt Caching、图片/PDF、Web 工具、OpenRouter 鉴权和限额元数据 |

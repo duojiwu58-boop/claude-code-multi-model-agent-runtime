@@ -206,7 +206,6 @@ async fn anthropic_messages(
         );
         return anthropic_error(err.status, err.error_type, &err.message);
     }
-    let local_capabilities = active_profile.openai_capabilities.clone();
     match active_profile.transport {
         ProviderTransport::Anthropic => {
             let mut diagnostics = request_override_diagnostics;
@@ -296,9 +295,22 @@ async fn anthropic_messages(
             .await;
             return attach_bridge_diagnostics(response, &provider_file, &diagnostics);
         }
-        ProviderTransport::LocalGemini => {}
+        ProviderTransport::LocalGemini => {
+            return forward_local_gemini_profile(&state, &active_profile, request).await;
+        }
     }
+}
 
+/// Non-streaming and streaming Gemini legacy path shared by live requests and
+/// the connectivity probe. Uses the bridge-configured Gemini transport client,
+/// upstream URL, fallback key, and the profile's capabilities, which is how
+/// LocalGemini routes are served today; the probe reaches the same code path
+/// as a real request without switching the active profile.
+async fn forward_local_gemini_profile(
+    state: &AppState,
+    profile: &ProviderProfile,
+    request: Value,
+) -> Response {
     let Some(api_key) = state
         .fallback_api_key
         .clone()
@@ -320,14 +332,14 @@ async fn anthropic_messages(
         &request,
         &state.model,
         &state.thought_signatures,
-        &local_capabilities,
+        &profile.openai_capabilities,
     ) {
         Ok(value) => value,
         Err(message) => {
             return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
         }
     };
-    let transport = match current_gemini_transport(&state) {
+    let transport = match current_gemini_transport(state) {
         Ok(transport) => transport,
         Err(message) => {
             return anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, "api_error", &message);
@@ -343,7 +355,10 @@ async fn anthropic_messages(
         .send()
         .await
     {
-        Ok(response) => response,
+        Ok(response) => {
+            mark_profile_probe_response_headers();
+            response
+        }
         Err(err) => {
             error!("Gemini request failed: {err}");
             return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &err.to_string());
@@ -380,7 +395,7 @@ async fn anthropic_messages(
             state.model.clone(),
             state.thought_signatures.clone(),
             estimated_input_tokens,
-            local_capabilities.clone(),
+            profile.openai_capabilities.clone(),
         );
     }
 
@@ -399,7 +414,7 @@ async fn anthropic_messages(
         &upstream_body,
         &state.model,
         &state.thought_signatures,
-        &local_capabilities,
+        &profile.openai_capabilities,
     ) {
         Ok(value) => value,
         Err(message) => {
@@ -715,21 +730,33 @@ where
     stream::unfold(Some(Box::pin(byte_stream)), move |byte_stream| async move {
         let mut byte_stream = byte_stream?;
         match tokio::time::timeout(idle_timeout, byte_stream.next()).await {
-            Ok(Some(Ok(bytes))) => Some((Ok(bytes), Some(byte_stream))),
-            Ok(Some(Err(err))) => Some((
-                Err(std::io::Error::other(format!(
-                    "Anthropic upstream stream failed: {err}"
-                ))),
-                None,
-            )),
-            Ok(None) => None,
-            Err(_) => Some((
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Anthropic upstream stream was idle for too long",
-                )),
-                None,
-            )),
+            Ok(Some(Ok(bytes))) => {
+                mark_profile_probe_first_byte();
+                Some((Ok(bytes), Some(byte_stream)))
+            }
+            Ok(Some(Err(err))) => {
+                mark_profile_probe_response_body();
+                Some((
+                    Err(std::io::Error::other(format!(
+                        "Anthropic upstream stream failed: {err}"
+                    ))),
+                    None,
+                ))
+            }
+            Ok(None) => {
+                mark_profile_probe_response_body();
+                None
+            }
+            Err(_) => {
+                mark_profile_probe_response_body();
+                Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Anthropic upstream stream was idle for too long",
+                    )),
+                    None,
+                ))
+            }
         }
     })
 }

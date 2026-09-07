@@ -121,6 +121,7 @@ For deeply adapted models, start from a verified template:
 - [Gemini native Interactions](examples/providers/gemini.example.json)
 - [DeepSeek V4 Flash](examples/providers/deepseek.example.json)
 - [DeepSeek V4 Pro](examples/providers/deepseek-v4-pro.example.json)
+- [DeepSeek V4 Flash Vision Exp](examples/providers/deepseek-v4-flash-vision-exp.example.json)
 - [Qwen3.8 Max](examples/providers/qwen.example.json)
 - [Kimi K3](examples/providers/kimi.example.json)
 - [Generic OpenAI-compatible provider](examples/providers/custom-openai.example.json)
@@ -141,7 +142,7 @@ The response reports the active profile, actual model, transport, and upstream U
 | Model | Recommended path | Adapted surface |
 | --- | --- | --- |
 | **Gemini 3.8 Flash** | `gemini-interactions` | Current step-based SSE, Low/Medium/High Thinking, terminal-batched parallel client calls, exact stored continuation, 1M context, images/PDF, structured output, native token count, detailed usage/cache/tier, Google tools, optional native Remote MCP |
-| **DeepSeek V4 Flash / Pro** | `anthropic` when available | Minimal Claude contract translation, provider-aware disabled/high/max reasoning, tool-turn reasoning replay, output-headroom protection; Responses/Chat fallbacks remain available |
+| **DeepSeek V4 Flash / Pro / Flash Vision Exp** | `anthropic` when available | Minimal Claude contract translation, provider-aware disabled/high/max reasoning, tool-turn reasoning replay, output-headroom protection; Flash Vision Exp also accepts native image blocks; Responses/Chat fallbacks remain available |
 | **Qwen3.8 Max** | `anthropic` or validated `openai-responses` | Meaningful effort tiers, bounded normal reasoning, exact Responses continuation, DashScope session cache, structured output, usage and latency diagnostics |
 | **Kimi K3** | `anthropic` | Bearer auth, verified model ID, 1M context metadata, native token estimate and cache usage; Chat reasoning replay and opt-in Kimi Formula tools |
 | **Claude Sonnet 5 / Opus 5 via OpenRouter** | `anthropic` | Messages/SSE pass-through, adaptive signed thinking, strict/parallel tools, structured output, prompt caching, image/PDF, web tools, OpenRouter auth and limit metadata |

@@ -3048,7 +3048,13 @@ fn translate_gemini_interactions_response_with_service_tier(
     model: &str,
     actual_service_tier: Option<&str>,
 ) -> Result<InteractionResponseTranslation, String> {
-    translate_gemini_interactions_response_for_request(upstream, model, actual_service_tier, None)
+    translate_gemini_interactions_response_for_request(
+        upstream,
+        model,
+        actual_service_tier,
+        None,
+        true,
+    )
 }
 
 fn translate_gemini_interactions_response_for_request(
@@ -3056,18 +3062,27 @@ fn translate_gemini_interactions_response_for_request(
     model: &str,
     actual_service_tier: Option<&str>,
     request: Option<&Value>,
+    stored_interaction: bool,
 ) -> Result<InteractionResponseTranslation, String> {
-    let interaction_id = upstream
+    // The id addresses a stored interaction: store:false requests get a
+    // terminal id-less interaction response from the upstream. Continuation
+    // memory is only recorded for stored interactions, so the strict id
+    // requirement applies only there; an id-less non-stored response is still
+    // a complete, translatable interaction.
+    let interaction_id = match upstream
         .get("id")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
-        .ok_or_else(|| {
-            format!(
+    {
+        Some(id) => id.to_string(),
+        None if stored_interaction => {
+            return Err(format!(
                 "Gemini Interactions response has no id: {}",
                 safe_error_message(upstream)
-            )
-        })?
-        .to_string();
+            ));
+        }
+        None => String::new(),
+    };
     let status = upstream
         .get("status")
         .and_then(Value::as_str)
@@ -3274,6 +3289,7 @@ async fn forward_gemini_interactions_profile(
                 return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &err.to_string());
             }
         };
+        mark_profile_probe_response_headers();
         let status = response.status();
         if status.is_success() {
             break response;
@@ -3399,6 +3415,7 @@ async fn forward_gemini_interactions_profile(
         &model,
         actual_service_tier.as_deref(),
         Some(&request),
+        profile.openai_capabilities.gemini_store,
     ) {
         Ok(value) => value,
         Err(message) => {

@@ -118,6 +118,23 @@ DeepSeek V4 Flash 与 Qwen3.8-Max 的推荐默认配置是厂商原生 Anthropic
 Pro 模型只需把 `model` 换成 `deepseek-v4-pro[1m]`，其余字段与 Flash 一致，可直接复制
 [`examples/providers/deepseek-v4-pro.example.json`](examples/providers/deepseek-v4-pro.example.json)。
 
+`deepseek-v4-flash-vision-exp` 使用相同的 Anthropic endpoint，但它原生支持 Claude 图片块，
+所以必须设置 `vision.mode` 为 `native`，而不是让桥接器额外调用 Vision Proxy：
+
+```json
+{
+  "name": "DeepSeek V4 Flash Vision Exp",
+  "model": "deepseek-v4-flash-vision-exp",
+  "context_window": 1048576,
+  "protocol": "anthropic",
+  "base_url": "https://api.deepseek.com/anthropic",
+  "api_key": "<DEEPSEEK_API_KEY>",
+  "vision": { "mode": "native" }
+}
+```
+
+可直接复制 [`examples/providers/deepseek-v4-flash-vision-exp.example.json`](examples/providers/deepseek-v4-flash-vision-exp.example.json)。DeepSeek 官方限制图片仅能出现在用户消息中；支持 JPEG、PNG、GIF 与 WebP。
+
 ```json
 {
   "name": "Qwen3.8 Max",
@@ -168,7 +185,9 @@ DeepSeek V4 thinking 模式接受 `tool_choice` 的 `auto/any/none`，但拒绝�
 V4 GA 相关事实（2026-08 官方文档，Pro 与 Flash 的 effort 映射完全一致）：两模型均 1M
 上下文、最大输出 384K、纯文本（视觉走 proxy）；并发额度 Pro 500 / Flash 2500；
 价格按 peak/off-peak 时段计费（off-peak 半价）；`metadata.user_id` 可用于 KVCache
-隔离与每用户限流；Claude Code 的 Web Search 由 DeepSeek 服务端原生执行。
+隔离与每用户限流；Claude Code 的 Web Search 由 DeepSeek 服务端原生执行。另有实验性
+`deepseek-v4-flash-vision-exp`，同为 1M 上下文和 384K 最大输出，但可通过 Anthropic
+Messages 原生接收用户图片，应该使用上面的 `vision.mode: "native"` 配置。
 
 三个传输路径都带 429 退避重试（最多 3 次，500ms/1s/2s 递增，尊重 `Retry-After`，
 上限 10s），多人共用同一账户时单个 peer 的突发不会把并发上限消耗成可见失败。
@@ -690,6 +709,7 @@ DashScope/百炼兼容层支持的 `enable_thinking`、`thinking_budget` 等字�
 - `qwen.example.json`：阿里云百炼 / DashScope
 - `deepseek.example.json`：DeepSeek V4 Flash
 - `deepseek-v4-pro.example.json`：DeepSeek V4 Pro（`deepseek-v4-pro[1m]`，1M 上下文）
+- `deepseek-v4-flash-vision-exp.example.json`：DeepSeek V4 Flash Vision Exp（原生图片输入）
 - `kimi.example.json`：Kimi / Moonshot
 - `gemini.example.json`：Google Gemini 的原生有状态 Interactions 接口
 - `custom-openai.example.json`：其他 OpenAI 兼容网关

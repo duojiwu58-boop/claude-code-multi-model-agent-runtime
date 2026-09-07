@@ -1,3 +1,483 @@
+// `upstream_identity` is a free-form display label, so strip userinfo only
+// when the value actually is a URL: non-URL labels must stay untouched.
+fn redact_url_credentials_if_url(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return value.to_string();
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+// Profile connectivity probe. The bound and staleness policy is deliberately
+// small: a probe sends a one-token non-streaming request and reports the
+// round-trip result, so 30 seconds is far beyond any healthy upstream answer.
+const PROFILE_PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+const PROFILE_PROBE_BODY_LIMIT: usize = 1 * 1024 * 1024;
+const PROFILE_PROBE_MAX_TOKENS: u64 = 1;
+const PROFILE_PROBE_RESPONSE_CHARS: usize = 600;
+
+/// Minimal Anthropic-style request shared by every probe transport. Thinking
+/// is disabled so the probe stays neutral and cheap: DeepSeek/Qwen reasoning
+/// policies and Gemini thinking levels relax to their cheapest form when the
+/// client explicitly disables thinking, and the request stays valid for every
+/// upstream.
+fn profile_probe_request(model: &str) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": PROFILE_PROBE_MAX_TOKENS,
+        "stream": false,
+        "thinking": {"type": "disabled"},
+        "messages": [{"role": "user", "content": "ping"}]
+    })
+}
+
+/// Scan free-form text for `scheme://` URL fragments and remove the userinfo
+/// from the authority portion, so probe error text can never echo embedded
+/// credentials from a credential-bearing URL (proxy, upstream, or base URL
+/// with user:pass). Works for any scheme (http, https, socks5, ...) without
+/// relying on the URL parser accepting the scheme.
+fn redact_url_credentials_in_text(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(scheme_end) = rest.find("://") {
+        // Only treat markers as URLs when a plausible scheme precedes them
+        // directly: [a-z][a-z0-9+-.]*.
+        let before = &rest[..scheme_end];
+        let start = before
+            .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.'))
+            .map_or(0, |index| index + 1);
+        let scheme = &before[start..];
+        let plausible = !scheme.is_empty()
+            && scheme.chars().next().unwrap().is_ascii_alphabetic()
+            && scheme
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '+' || ch == '-' || ch == '.');
+        if !plausible {
+            // Not a URL: keep the marker verbatim and continue past it.
+            let marker_end = scheme_end + 3;
+            result.push_str(&rest[..marker_end]);
+            rest = &rest[marker_end..];
+            continue;
+        }
+        let authority_start = scheme_end + 3;
+        let authority_end = rest[authority_start..]
+            .find(|ch: char| {
+                ch.is_whitespace()
+                    || ch.is_ascii_control()
+                    || matches!(ch, '/' | '?' | '#' | '"' | '\'' | ',' | ')' | ']')
+            })
+            .map_or(rest.len(), |offset| authority_start + offset);
+        let authority = &rest[authority_start..authority_end];
+        let redacted_authority = authority
+            .rfind('@')
+            .map(|at| &authority[at + 1..])
+            .unwrap_or(authority);
+        result.push_str(&rest[..authority_start]);
+        result.push_str(redacted_authority);
+        rest = &rest[authority_end..];
+    }
+    result.push_str(rest);
+    result
+}
+
+fn probe_safe_error_message(message: &str, sensitive_values: &[String]) -> String {
+    let mut redacted = redact_url_credentials_in_text(message);
+    for sensitive in sensitive_values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        redacted = redacted.replace(sensitive, "[REDACTED]");
+    }
+    let mut chars = redacted.chars();
+    let truncated = chars.by_ref().take(PROFILE_PROBE_RESPONSE_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+fn probe_error_stage(status: u16, error_type: Option<&str>) -> &'static str {
+    match error_type.unwrap_or("") {
+        "authentication_error" | "permission_error" => return "auth",
+        "invalid_request_error" | "not_found_error" => return "request",
+        _ => {}
+    }
+    // Fall back to the preserved upstream status when the error type is
+    // generic (api_error covers both upstream failures and bridge-side
+    // configuration gaps such as a missing fallback key).
+    match status {
+        401 | 403 => "auth",
+        400 | 404 => "request",
+        _ => "upstream",
+    }
+}
+
+fn probe_error_details<'a>(
+    body: &'a Value,
+    sensitive_values: &[String],
+) -> (Option<&'a str>, String) {
+    let object = body.get("error").and_then(Value::as_object);
+    let error_type = object
+        .and_then(|object| object.get("type"))
+        .and_then(Value::as_str);
+    let message = object
+        .and_then(|object| object.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| "Profile probe failed without a structured error message".to_string());
+    (
+        error_type,
+        probe_safe_error_message(&message, sensitive_values),
+    )
+}
+
+fn is_valid_profile_probe_message(body: &Value) -> bool {
+    body.get("type").and_then(Value::as_str) == Some("message")
+        && body.get("role").and_then(Value::as_str) == Some("assistant")
+        && body.get("content").and_then(Value::as_array).is_some()
+}
+
+fn profile_probe_network_json(
+    proxy_url: Option<&str>,
+    timing: ProfileProbeTimingSnapshot,
+    total_ms: u64,
+) -> Value {
+    json!({
+        "proxy_mode": if proxy_url.is_some() { "proxy" } else { "direct" },
+        "proxy_url": proxy_url.map(redact_url_credentials),
+        // reqwest exposes response-header readiness, not a portable standalone
+        // DNS/TCP/TLS timing. This phase therefore intentionally includes DNS,
+        // connect, proxy tunnel, TLS, retries, and upstream queue time.
+        "response_headers_ms": timing.response_headers_ms,
+        "first_byte_ms": timing.first_byte_ms,
+        "response_body_ms": timing.response_body_ms,
+        "total_ms": total_ms,
+    })
+}
+
+async fn dispatch_profile_probe(
+    state: &AppState,
+    profile: ProviderProfile,
+    request: Value,
+) -> Response {
+    match profile.transport {
+        ProviderTransport::OpenAiChat => {
+            forward_openai_profile(profile, request, state.thought_signatures.clone()).await
+        }
+        ProviderTransport::OpenAiResponses => {
+            forward_openai_responses_profile(profile, request, state.interaction_continuations.clone())
+                .await
+        }
+        ProviderTransport::Anthropic => {
+            forward_anthropic_profile(profile, &HeaderMap::new(), request).await
+        }
+        ProviderTransport::GeminiInteractions => {
+            forward_gemini_interactions_profile(
+                profile,
+                request,
+                state.interaction_continuations.clone(),
+            )
+            .await
+        }
+        ProviderTransport::LocalGemini => {
+            forward_local_gemini_profile(state, &profile, request).await
+        }
+    }
+}
+
+/// Resolve a profile by file name, clone it under a short read lock, and run a
+/// real minimal non-streaming inference through the profile's own transport,
+/// upstream URL, model, credentials, proxy-configured client, and the normal
+/// bridge conversion/response-parsing semantics. The routing state is only
+/// read: the active profile is never switched, mutated, or persisted, so
+/// highlighted-but-not-active profiles can be tested without racing live
+/// requests. `timeout` bounds the whole probe including response-body reads.
+async fn run_profile_probe(
+    state: &AppState,
+    file_name: &str,
+    timeout: Duration,
+) -> (StatusCode, Value) {
+    let profile = {
+        let Ok(routing) = state.routing.read() else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "status": "error",
+                    "file": file_name,
+                    "error": {"stage": "resolve", "message": "Cannot read provider routing state"}
+                }),
+            );
+        };
+        routing
+            .profiles
+            .iter()
+            .find(|profile| profile.file_name == file_name)
+            .cloned()
+    };
+    let Some(mut profile) = profile else {
+        return (
+            StatusCode::NOT_FOUND,
+            json!({
+                "status": "error",
+                "file": file_name,
+                "model": Value::Null,
+                "transport": Value::Null,
+                "error": {
+                    "stage": "resolve",
+                    "message": format!("Unknown provider profile '{file_name}'")
+                }
+            }),
+        );
+    };
+    let profile_file = profile.file_name.clone();
+    let profile_model = profile.model.clone();
+    let transport_label = profile.transport.as_str();
+    if profile.transport == ProviderTransport::GeminiInteractions && profile.api_key.is_none() {
+        if let Err(message) = apply_bridge_managed_gemini_credentials(state, &mut profile) {
+            return (
+                StatusCode::OK,
+                json!({
+                    "status": "error",
+                    "file": profile_file,
+                    "model": profile_model,
+                    "transport": transport_label,
+                    "latency_ms": 0,
+                    "error": {
+                        "stage": "auth",
+                        "message": probe_safe_error_message(&message, &[])
+                    }
+                }),
+            );
+        }
+    }
+    if profile.transport == ProviderTransport::LocalGemini
+        && state
+            .fallback_api_key
+            .as_deref()
+            .is_none_or(|key| key.trim().is_empty())
+    {
+        return (
+            StatusCode::OK,
+            json!({
+                "status": "error",
+                "file": profile_file,
+                "model": profile_model,
+                "transport": transport_label,
+                "latency_ms": 0,
+                "error": {
+                    "stage": "auth",
+                    "message": "LocalGemini requires GEMINI_API_KEY or GEMINI_BRIDGE_API_KEY_PROFILE"
+                }
+            }),
+            );
+    }
+    let effective_proxy_url = if profile.transport == ProviderTransport::LocalGemini {
+        current_gemini_transport(state)
+            .ok()
+            .and_then(|transport| transport.proxy_url)
+    } else {
+        profile.proxy_url.clone()
+    };
+    // Keep the probe side-effect free: Responses store and Gemini interaction
+    // store feed shared in-memory continuation caches that live requests may
+    // follow, so a connectivity test must not create storable interactions.
+    profile.openai_capabilities.responses_stateful = false;
+    profile.openai_capabilities.gemini_store = false;
+
+    // Upstream error payloads are untrusted and can reflect request metadata.
+    // Strip every credential value known to this probe in addition to URL
+    // userinfo before returning any message to the GUI.
+    let sensitive_values = [
+        profile.api_key.clone(),
+        profile.auth_token.clone(),
+        state.fallback_api_key.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    let request = profile_probe_request(&profile.model);
+    let started = Instant::now();
+    let probe_timing = Arc::new(RwLock::new(ProfileProbeTiming::new(started)));
+    let outcome = tokio::time::timeout(
+        timeout,
+        PROFILE_PROBE_TIMING.scope(probe_timing.clone(), async {
+            let response = dispatch_profile_probe(state, profile, request).await;
+            let status = response.status().as_u16();
+            let body = axum::body::to_bytes(response.into_body(), PROFILE_PROBE_BODY_LIMIT).await;
+            (status, body)
+        }),
+    )
+    .await;
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let timing = probe_timing
+        .read()
+        .map(|timing| timing.snapshot())
+        .unwrap_or(ProfileProbeTimingSnapshot {
+            response_headers_ms: None,
+            first_byte_ms: None,
+            response_body_ms: None,
+        });
+    let (status, body) = match outcome {
+        Err(_) => {
+            info!(
+                provider = %profile_file,
+                transport = transport_label,
+                latency_ms,
+                "Profile connectivity probe timed out"
+            );
+            return (
+                StatusCode::OK,
+                json!({
+                    "status": "error",
+                    "file": profile_file,
+                    "model": profile_model,
+                    "transport": transport_label,
+                    "latency_ms": latency_ms,
+                    "network": profile_probe_network_json(
+                        effective_proxy_url.as_deref(), timing, latency_ms
+                    ),
+                    "error": {
+                        "stage": "timeout",
+                        "message": format!(
+                            "Profile probe timed out after {} ms",
+                            timeout.as_millis()
+                        )
+                    }
+                }),
+            );
+        }
+        Ok(outcome) => outcome,
+    };
+    let body_value = match body {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        Err(err) => {
+            info!(
+                provider = %profile_file,
+                status,
+                error = %err,
+                "Profile connectivity probe response could not be read"
+            );
+            return (
+                StatusCode::OK,
+                json!({
+                    "status": "error",
+                    "file": profile_file,
+                    "model": profile_model,
+                    "transport": transport_label,
+                    "latency_ms": latency_ms,
+                    "network": profile_probe_network_json(
+                        effective_proxy_url.as_deref(), timing, latency_ms
+                    ),
+                    "error": {
+                        "stage": "protocol",
+                        "status": status,
+                        "message": probe_safe_error_message(
+                            &format!("Cannot read probe response: {err}"),
+                            &sensitive_values
+                        )
+                    }
+                }),
+            );
+        }
+    };
+    // Every transport returns an Anthropic message at this boundary. Validate
+    // that envelope explicitly because the native Anthropic path is otherwise
+    // a byte-for-byte passthrough and a bare JSON object is not proof that the
+    // selected model completed a request.
+    if (200..300).contains(&status) && is_valid_profile_probe_message(&body_value) {
+        info!(
+            provider = %profile_file,
+            transport = transport_label,
+            status,
+            latency_ms,
+            "Profile connectivity probe succeeded"
+        );
+        return (
+            StatusCode::OK,
+            json!({
+                "status": "ok",
+                "file": profile_file,
+                "model": profile_model,
+                "transport": transport_label,
+                "upstream_status": status,
+                "latency_ms": latency_ms,
+                "network": profile_probe_network_json(
+                    effective_proxy_url.as_deref(), timing, latency_ms
+                ),
+                "message": format!("Valid {transport_label} response received from the upstream")
+            }),
+        );
+    }
+    if (200..300).contains(&status) {
+        return (
+            StatusCode::OK,
+            json!({
+                "status": "error",
+                "file": profile_file,
+                "model": profile_model,
+                "transport": transport_label,
+                "latency_ms": latency_ms,
+                "network": profile_probe_network_json(
+                    effective_proxy_url.as_deref(), timing, latency_ms
+                ),
+                "error": {
+                    "stage": "protocol",
+                    "status": status,
+                    "message": "Profile probe received an invalid Anthropic message response"
+                }
+            }),
+        );
+    }
+    let (error_type, message) = probe_error_details(&body_value, &sensitive_values);
+    let stage = probe_error_stage(status, error_type);
+    info!(
+        provider = %profile_file,
+        status,
+        error_type = error_type.unwrap_or(""),
+        error = %message,
+        "Profile connectivity probe failed"
+    );
+    let mut error_body = json!({"stage": stage, "message": message});
+    error_body["status"] = json!(status);
+    (
+        StatusCode::OK,
+        json!({
+            "status": "error",
+            "file": profile_file,
+            "model": profile_model,
+            "transport": transport_label,
+            "latency_ms": latency_ms,
+            "network": profile_probe_network_json(
+                effective_proxy_url.as_deref(), timing, latency_ms
+            ),
+            "error": error_body
+        }),
+    )
+}
+
+async fn admin_profile_test(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<Value>,
+) -> Response {
+    let Some(file_name) = request.get("file").and_then(Value::as_str) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Missing string field 'file'"})),
+        )
+            .into_response();
+    };
+    let (status, body) = run_profile_probe(&state, file_name, PROFILE_PROBE_TOTAL_TIMEOUT).await;
+    (status, Json(body)).into_response()
+}
+
 fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value {
     let public_proxy_url = profile.proxy_url.as_deref().map(redact_url_credentials);
     json!({
@@ -7,9 +487,12 @@ fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value 
         "model": profile.model,
         "context_window": profile.context_window,
         "reasoning_effort": profile.openai_capabilities.reasoning_effort_override,
-        "upstream_identity": profile.upstream_identity,
+        "upstream_identity": profile
+            .upstream_identity
+            .as_deref()
+            .map(redact_url_credentials_if_url),
         "identity_override": profile.identity_override,
-        "base_url": profile.base_url,
+        "base_url": redact_url_credentials(&profile.base_url),
         "proxy": public_proxy_url,
         "local_gemini": profile.local_gemini,
         "transport": profile.transport.as_str(),
@@ -18,7 +501,7 @@ fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value 
             "mode": profile.vision.mode.as_str(),
             "profile": profile.vision.profile
         },
-        "upstream_url": profile.upstream_url,
+        "upstream_url": redact_url_credentials(&profile.upstream_url),
         "active": profile.file_name == active_file
     })
 }
@@ -588,8 +1071,8 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "status": "ok",
         "model": state.model,
-        "upstream": state.upstream_url,
-        "gemini_proxy": proxy_url,
+        "upstream": redact_url_credentials(&state.upstream_url),
+        "gemini_proxy": proxy_url.as_deref().map(redact_url_credentials),
         "gemini_thinking_level": effective_gemini_thinking_level(&state).ok().flatten(),
         "active_profile": active_profile.as_ref().map(|profile| provider_profile_json(profile, &profile.file_name))
     }))

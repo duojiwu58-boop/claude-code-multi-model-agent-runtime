@@ -1562,11 +1562,13 @@ async fn read_response_bytes_limited(
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|err| format!("Cannot read upstream response body: {err}"))?;
+        mark_profile_probe_first_byte();
         if body.len().saturating_add(chunk.len()) > limit {
             return Err(format!("Upstream response body exceeds {limit} bytes"));
         }
         body.extend_from_slice(&chunk);
     }
+    mark_profile_probe_response_body();
     Ok(body)
 }
 

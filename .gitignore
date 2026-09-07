@@ -1,5 +1,6 @@
 # Rust build output
 /target/
+/mcp/window-tools/target/
 
 # Release packages and locally deployed service artifacts
 /dist/
@@ -10,6 +11,7 @@
 
 # Machine-local bridge state
 /bridge-state.json
+/.claude-visible-request.json
 
 # Delphi build output and user-local IDE state
 **/Win32/

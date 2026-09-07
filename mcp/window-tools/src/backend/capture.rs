@@ -16,10 +16,10 @@ use windows::{
 };
 
 use crate::error::{
-    ToolError, CAPTURE_FAILED, INVALID_ARGUMENT, LIMIT_EXCEEDED, WINDOW_NOT_VISIBLE,
+    ToolError, CAPTURE_FAILED, INVALID_ARGUMENT, LIMIT_EXCEEDED, WINDOW_HUNG, WINDOW_NOT_VISIBLE,
 };
 
-use super::window::{client_rect_of, rect_of};
+use super::window::{client_rect_of, is_window_hung, rect_of};
 
 /// 单张窗口图的硬上限：保留原始 4K，同时约束 BGRA 与 RGBA 双缓冲的峰值内存。
 pub const MAX_CAPTURE_DIM: i32 = 7680;
@@ -31,6 +31,33 @@ pub const MAX_ALL_CAPTURE_PIXELS: i64 = 3 * 3840 * 2160;
 const PW_RENDERFULLCONTENT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(2);
 /// PrintWindow 的 PW_CLIENTONLY：只渲染客户区，不包含标题栏、边框或阴影。
 const PW_CLIENTONLY: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(1);
+/// 截图硬超时:超过则放弃等待并返回结构化错误,服务绝不被单个窗口卡死。
+pub const CAPTURE_TIMEOUT_MS: u64 = 15_000;
+
+/// 在独立线程执行采集并限时等待。超时后返回 `WINDOW_HUNG`,主循环继续服务。
+///
+/// 边界说明:Rust 无法安全终止线程,超时后 worker 可能仍被 PrintWindow 卡住
+/// (线程与当次 GDI 句柄泄漏,进程退出时回收)。挂起预检(SMTO_ABORTIFHUNG 标题读取
+/// + IsHungAppWindow)已把该概率压到趋近于零,剩余风险是驱动级卡死的极端场景。
+pub fn run_capture_with_timeout<T: Send + 'static>(
+    timeout_ms: u64,
+    capture: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
+) -> Result<T, ToolError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(capture());
+    });
+    match rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(ToolError::new(
+            WINDOW_HUNG,
+            format!("截图操作超过 {timeout_ms}ms 未完成，目标窗口可能无响应"),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(ToolError::new(CAPTURE_FAILED, "截图线程异常退出"))
+        }
+    }
+}
 
 /// 所有位图分配前先以 i64 计算面积，避免 i32 乘法溢出造成小分配/越界访问。
 pub fn checked_pixels(width: i32, height: i32) -> Result<i64, ToolError> {
@@ -102,6 +129,26 @@ impl Drop for GdiHandle {
 }
 
 pub fn capture_window(hwnd: HWND, client_only: bool) -> Result<(Vec<u8>, RECT), ToolError> {
+    // 挂起预检在主线程完成(快速内核查询),挂起窗口直接给结构化错误,
+    // 绝不进入 PrintWindow——那是把 WM_PRINT 投递进目标线程的阻塞调用。
+    if is_window_hung(hwnd) {
+        return Err(ToolError::new(
+            WINDOW_HUNG,
+            format!("窗口 hwnd={} 无响应，拒绝截图；等待窗口恢复或选择其他目标", hwnd_num_str(hwnd)),
+        ));
+    }
+    // HWND 是裸指针包装,不满足 Send;以 isize 跨界传递,worker 内重建。
+    let raw = hwnd.0 as isize;
+    run_capture_with_timeout(CAPTURE_TIMEOUT_MS, move || {
+        capture_window_inner(HWND(raw as *mut core::ffi::c_void), client_only)
+    })
+}
+
+fn hwnd_num_str(hwnd: HWND) -> String {
+    (hwnd.0 as isize).to_string()
+}
+
+fn capture_window_inner(hwnd: HWND, client_only: bool) -> Result<(Vec<u8>, RECT), ToolError> {
     let rect = if client_only {
         client_rect_of(hwnd)?
     } else {
@@ -263,7 +310,12 @@ fn enum_monitors() -> Vec<MonitorRecord> {
 }
 
 /// 截取所有显示器,返回每台一张 PNG(带标签与尺寸元数据,单台失败不中断其余)。
+/// 整体限时执行:GPU 驱动级卡死也不阻塞服务。
 pub fn capture_all_monitors() -> Result<Vec<MonitorShot>, ToolError> {
+    run_capture_with_timeout(CAPTURE_TIMEOUT_MS, capture_all_monitors_inner)
+}
+
+fn capture_all_monitors_inner() -> Result<Vec<MonitorShot>, ToolError> {
     let monitors = enum_monitors();
     if monitors.is_empty() {
         return Err(ToolError::new(CAPTURE_FAILED, "未找到任何显示器"));
@@ -618,5 +670,24 @@ mod tests {
         let bad_pixels = checked_pixels(0, 10).unwrap_err();
         assert_eq!(bad_pixels.code, INVALID_ARGUMENT);
         assert!(!bad_pixels.retryable);
+    }
+
+    #[test]
+    fn capture_timeout_yields_structured_hung_error() {
+        // 正常路径:快速闭包原样返回。
+        let ok = run_capture_with_timeout(500, || Ok::<_, ToolError>(42_u32)).unwrap();
+        assert_eq!(ok, 42);
+        // 卡死路径:超过限时返回 WINDOW_HUNG,worker 自行退出后不留额外句柄。
+        let start = std::time::Instant::now();
+        let err = run_capture_with_timeout(50, || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok::<_, ToolError>(())
+        })
+        .unwrap_err();
+        assert_eq!(err.code, WINDOW_HUNG);
+        assert!(err.retryable);
+        assert!(start.elapsed() < std::time::Duration::from_millis(250));
+        // 等 worker 自然退出,避免测试进程残留线程。
+        std::thread::sleep(std::time::Duration::from_millis(400));
     }
 }

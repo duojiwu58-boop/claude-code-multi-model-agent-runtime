@@ -4,12 +4,13 @@ use serde_json::{json, Value};
 use windows::{
     core::BOOL,
     Win32::{
-        Foundation::{HWND, LPARAM, POINT, RECT},
+        Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
         Graphics::Gdi::ClientToScreen,
         UI::WindowsAndMessaging::{
             EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowRect,
-            GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-            SetForegroundWindow, SetWindowPos, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
+            GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible,
+            SendMessageTimeoutW, SetForegroundWindow, SetWindowPos, SMTO_ABORTIFHUNG,
+            SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, WM_GETTEXT,
         },
     },
 };
@@ -55,13 +56,35 @@ pub fn foreground_hwnd() -> HWND {
     unsafe { GetForegroundWindow() }
 }
 
+/// 标题获取超时:挂起窗口必须在限定时间内放弃,枚举绝不能卡死服务。
+const TITLE_QUERY_TIMEOUT_MS: u32 = 500;
+
+/// 标题读取不走 `GetWindowTextW`:它对其他进程窗口内部发 WM_GETTEXT,
+/// 目标线程挂起时调用方也会被拖死。改用 SendMessageTimeoutW + SMTO_ABORTIFHUNG,
+/// 挂起窗口的标题为空字符串,枚举照常完成。
 fn window_title(hwnd: HWND) -> String {
     let mut buf = [0u16; 512];
-    let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
-    if len <= 0 {
+    let result = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_GETTEXT,
+            WPARAM(buf.len()),
+            LPARAM(buf.as_mut_ptr() as isize),
+            SMTO_ABORTIFHUNG,
+            TITLE_QUERY_TIMEOUT_MS,
+            None,
+        )
+    };
+    if result.0 <= 0 {
         return String::new();
     }
-    String::from_utf16_lossy(&buf[..len as usize])
+    let len = result.0 as usize;
+    String::from_utf16_lossy(&buf[..len])
+}
+
+/// 目标窗口是否无响应(消息队列挂起)。截图等进入目标线程的操作必须先预检。
+pub fn is_window_hung(hwnd: HWND) -> bool {
+    unsafe { IsHungAppWindow(hwnd) }.as_bool()
 }
 
 fn window_class(hwnd: HWND) -> String {

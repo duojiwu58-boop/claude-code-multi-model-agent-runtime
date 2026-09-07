@@ -17,6 +17,12 @@ native Computer Use executor.
 | `screenshot_all` | Full-screen capture per monitor, each returned as a PNG plus a label. |
 | `resize_window` | Resize a precisely identified target window (optional move), subject to the target's own minimum size. |
 | `window_activate` | Request an exact hwnd to the foreground for manual comparison or layout inspection; Windows focus protection may reject it, and no input is sent. |
+| `pixel_scan_line` | Merge a vertical client-area pixel column into color bands for layout assertions (panel boundaries, control heights). |
+| `pixel_find_color` | Count pixels matching a color in a client-area region and return the minimum bounding box. |
+| `send_input` | Drive mouse/keyboard input into a window's client area; foreground-gated, whole-batch validated before emission. |
+| `inspect_element_at` | UIA hit-test at a client-area point; returns the accessibility element's control type, name, class, automation id, bounding rectangle, and keyboard focusability. |
+| `inspect_focused_element` | UIA properties of the currently keyboard-focused element; no window argument. |
+| `get_diagnostics` | Service self-check: version, uptime, request/error stats by tool and error code, GDI/USER handle counts, recent error ring. |
 
 Window targeting offers exactly one of: `hwnd` (decimal string, or `0x`/`0X`-prefixed hexadecimal,
 accepted since the hex-parse fix), `title` (title substring), or `pid` (the largest visible window
@@ -142,6 +148,25 @@ still held when execution fails are released automatically. Scheduled delays are
 seconds per batch. This is the only tool with significant side effects besides `resize_window`;
 invoke it only in trusted conversations.
 
+### `inspect_element_at`
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `hwnd` | string | Exact handle, or `@active` |
+| `x` / `y` | integer | Probe point (client-area, physical pixels) |
+
+UIA hit-test at the given client-area point: converts it to screen coordinates and calls
+`ElementFromPoint`, then reports the accessibility element's control type (name plus numeric UIA
+id), name, class name, automation id, bounding rectangle (physical pixels), and keyboard
+focusability. If another window covers the point, the occluding element is returned (screen
+as-is). Chromium-based apps may materialize their accessibility tree lazily; a first query can
+yield only the `RenderWidgetHostHWND` layer.
+
+### `inspect_focused_element`
+
+No parameters. Returns the UIA properties of the system's currently keyboard-focused element.
+Apps without a UIA provider fail with `UIA_UNAVAILABLE`.
+
 ## HWND formats
 
 hwnd values are decoded as decimal by default; a `0x`/`0X` prefix selects radix-16 parsing, with a
@@ -156,9 +181,10 @@ current Windows foreground HWND and never does fuzzy title matching.
 - `screenshot_all` guarantees unaltered output for up to three UHD 4K (3840×2160) displays with a
   total budget of 24,883,200 pixels. Above the budget every monitor is scaled by the same ratio and
   the result reports original and actual sizes.
-- `PrintWindow` is not guaranteed for GPU-accelerated, protected, or unresponsive windows; on a
-  black screen or failure, use another observation method — the tool never degrades to a full-screen
-  capture.
+- `PrintWindow` is not guaranteed for GPU-accelerated, protected, or unresponsive windows.
+  Near-black output (or a failed `PrintWindow`) automatically falls back to on-screen sampling of
+  the same rectangle; the response text then carries a `fallback=` annotation and occluded areas
+  appear as currently displayed.
 
 This toolset is for window observation, layout verification, and UI driving. Mouse/keyboard
 input (`send_input`) changes real desktop state, so it is gated by a foreground check and

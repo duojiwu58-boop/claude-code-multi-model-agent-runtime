@@ -25,6 +25,8 @@ pub const CAPTURE_FAILED: &str = "CAPTURE_FAILED";
 pub const LIMIT_EXCEEDED: &str = "LIMIT_EXCEEDED";
 /// 输入执行期失败(SetCursorPos 等)。可重试。
 pub const INPUT_FAILED: &str = "INPUT_FAILED";
+/// UIA 服务不可用或元素属性读取失败(COM 初始化失败、目标未实现 UIA 提供程序)。可重试。
+pub const UIA_UNAVAILABLE: &str = "UIA_UNAVAILABLE";
 /// 不可预期内部错误(panic 路径)。应上报维护者。
 pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
 
@@ -39,6 +41,7 @@ fn retryable_by_code(code: &str) -> bool {
             | ACTIVATION_DENIED
             | CAPTURE_FAILED
             | INPUT_FAILED
+            | UIA_UNAVAILABLE
     )
 }
 
@@ -88,6 +91,7 @@ mod tests {
             ACTIVATION_DENIED,
             CAPTURE_FAILED,
             INPUT_FAILED,
+            UIA_UNAVAILABLE,
         ] {
             assert!(ToolError::new(code, "x").retryable, "{code} 应可重试");
         }

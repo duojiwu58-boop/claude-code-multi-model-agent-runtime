@@ -27,6 +27,10 @@ pub const TOOL_ACTIVATE: &str = "window_activate";
 pub const TOOL_PIXEL_SCAN_LINE: &str = "pixel_scan_line";
 pub const TOOL_PIXEL_FIND_COLOR: &str = "pixel_find_color";
 pub const TOOL_SEND_INPUT: &str = "send_input";
+/// UIA 命中测试:返回客户区某点的无障碍元素属性。
+pub const TOOL_INSPECT_ELEMENT_AT: &str = "inspect_element_at";
+/// UIA 聚焦查询:返回系统当前键盘聚焦元素属性。
+pub const TOOL_INSPECT_FOCUSED: &str = "inspect_focused_element";
 /// 诊断自检工具:版本、运行时长、请求/错误统计、GDI 句柄数与最近错误记录。
 pub const TOOL_GET_DIAGNOSTICS: &str = "get_diagnostics";
 
@@ -565,6 +569,27 @@ pub fn tools_list() -> Value {
             }
         },
         {
+            "name": TOOL_INSPECT_ELEMENT_AT,
+            "description": "在窗口客户区指定坐标做 UIA 命中测试,返回该点的无障碍元素属性:控件类型(含 UIA 类型码)、名称、类名、AutomationId、屏幕包围矩形(物理像素)、是否可键盘聚焦。坐标均为相对客户区的物理像素,内部转屏幕坐标执行 ElementFromPoint;该点被其他窗口遮挡时按屏幕现状返回遮挡方元素。Chromium 类应用的无障碍树可能惰性激活,首次查询可能只剩 RenderWidgetHostHWND 层。",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "hwnd": {"type": "string", "description": "精确窗口句柄，或 @active"},
+                    "x": {"type": "integer", "description": "检查点（客户区 X）"},
+                    "y": {"type": "integer", "description": "检查点（客户区 Y）"}
+                },
+                "required": ["hwnd", "x", "y"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": TOOL_INSPECT_FOCUSED,
+            "description": "读取系统当前键盘聚焦元素的 UIA 属性(控件类型/名称/类名/AutomationId/屏幕包围矩形/是否可键盘聚焦),无需指定窗口。目标应用未实现 UIA 提供程序时返回 UIA_UNAVAILABLE。",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
             "name": TOOL_GET_DIAGNOSTICS,
             "description": "服务自检:版本、运行时长、请求/错误统计(按工具与错误码分组)、当前 GDI/USER 句柄数与最近错误记录。无参数。",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
@@ -625,6 +650,10 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
         TOOL_PIXEL_SCAN_LINE => pixel_scan_line(resolve_explicit_hwnd(args)?, args),
         TOOL_PIXEL_FIND_COLOR => pixel_find_color(resolve_explicit_hwnd(args)?, args),
         TOOL_SEND_INPUT => send_input(resolve_explicit_hwnd(args)?, args),
+        TOOL_INSPECT_ELEMENT_AT => {
+            crate::backend::uia::inspect_element_at(resolve_explicit_hwnd(args)?, args)
+        }
+        TOOL_INSPECT_FOCUSED => crate::backend::uia::inspect_focused_element(),
         TOOL_GET_DIAGNOSTICS => crate::diagnostics::diagnostics_payload(),
         _ => Err(ToolError::new(
             INVALID_ARGUMENT,
@@ -668,6 +697,8 @@ mod tests {
             TOOL_PIXEL_SCAN_LINE,
             TOOL_PIXEL_FIND_COLOR,
             TOOL_SEND_INPUT,
+            TOOL_INSPECT_ELEMENT_AT,
+            TOOL_INSPECT_FOCUSED,
             TOOL_GET_DIAGNOSTICS,
         ] {
             assert!(names.contains(&expected), "缺少工具 {expected}");
@@ -708,6 +739,26 @@ mod tests {
             input["inputSchema"]["properties"]["actions"]["maxItems"],
             MAX_INPUT_ACTIONS
         );
+        // UIA 命中测试要求 hwnd 精确指定 + 客户区坐标
+        let inspect = tools
+            .iter()
+            .find(|tool| tool["name"] == TOOL_INSPECT_ELEMENT_AT)
+            .unwrap();
+        let inspect_required: Vec<&str> = inspect["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(inspect_required, vec!["hwnd", "x", "y"]);
+        // 聚焦查询无参数;两者 schema 均无 oneOf(客户端兼容约束)
+        let focused = tools
+            .iter()
+            .find(|tool| tool["name"] == TOOL_INSPECT_FOCUSED)
+            .unwrap();
+        assert!(focused["inputSchema"].get("properties").is_some());
+        assert!(inspect["inputSchema"].get("oneOf").is_none());
+        assert!(focused["inputSchema"].get("oneOf").is_none());
     }
 
     #[test]

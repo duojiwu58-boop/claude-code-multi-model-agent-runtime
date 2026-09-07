@@ -3,6 +3,30 @@
 本项目遵循向后兼容演进:工具 schema 只增不删,错误响应保留 MCP 惯用形状
 (content[text] + isError) 并新增机器可读字段。错误码一旦发布保持稳定(只增不改)。
 
+## [0.3.0] - 2026-09-08
+
+### 新增
+
+- **UIA 无障碍树查询**:
+  - `inspect_element_at(hwnd, x, y)`:客户区坐标命中测试,返回该点无障碍元素的
+    控件类型(名称 + UIA 类型码)/名称/类名/AutomationId/屏幕包围矩形/是否可键盘聚焦;
+  - `inspect_focused_element()`:系统当前键盘聚焦元素的同套属性,无需指定窗口。
+- 库内首个 COM 使用点:初始化限定在 worker 线程按调用完成,查询复用通用限时
+  执行原语(`run_with_timeout`,与截图共用),目标进程挂起时限时返回 WINDOW_HUNG。
+- 新错误码 `UIA_UNAVAILABLE`(COM 初始化失败/目标未实现 UIA 提供程序,可重试)。
+
+### 变更
+
+- `capture` 的超时原语泛化为 `run_with_timeout`,截图与 UIA 查询共用同一
+  线程泄漏边界说明。
+- 工具总数 10 → 12。
+
+### 验证
+
+- 单元测试 29 项;真实 GUI E2E 主套件 36 项(新增确定性 WinForms 按钮探针:
+  独立进程 + STA 线程 + Application.Run 消息泵,按钮置于客户区几何中心,
+  断言与 DPI 缩放无关)+ 挂起窗口 7 项;clippy -D warnings 零告警。
+
 ## [0.2.1] - 2026-09-08
 
 ### 新增

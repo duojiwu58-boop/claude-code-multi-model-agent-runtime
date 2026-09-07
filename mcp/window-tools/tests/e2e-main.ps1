@@ -165,10 +165,74 @@ try {
   Check 'resize 640x480' ((-not $rz2.result.isError) -and $pr2.window_rect.width -eq 640 -and $pr2.window_rect.height -eq 480) ("outer=" + $pr2.window_rect.width + "x" + $pr2.window_rect.height)
   $np.Kill()
 
+  # --- UIA inspect on a deterministic WinForms probe ---
+  # 独立进程 + C# STA 线程 + Application.Run 消息泵:UIA 提供程序是跨进程 COM,
+  # 目标必须泵消息才能响应(不同于 e2e-hung 的挂起窗口)。按钮置于客户区几何中心,
+  # 命中点取服务器返回的物理客户区中心,与 DPI 缩放/虚拟化无关。
+  $probeScript = @'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -TypeDefinition @"
+using System;
+using System.Windows.Forms;
+using System.Drawing;
+public static class UiaProbe {
+    public static void Start() {
+        var t = new System.Threading.Thread(() => {
+            var f = new Form();
+            f.Text = "UIA_E2E_PROBE";
+            f.TopMost = true;
+            f.ClientSize = new Size(420, 260);
+            var b = new Button();
+            b.Text = "UIA_OK_probe";
+            b.Size = new Size(160, 48);
+            b.Location = new Point(130, 106);
+            f.Controls.Add(b);
+            f.Show();
+            Console.WriteLine(f.Handle.ToInt64());
+            Console.Out.Flush();
+            Application.Run(f);
+        });
+        t.IsBackground = true;
+        t.SetApartmentState(System.Threading.ApartmentState.STA);
+        t.Start();
+    }
+}
+"@ -ReferencedAssemblies 'System.Windows.Forms','System.Drawing'
+[UiaProbe]::Start()
+while ($true) { Start-Sleep -Seconds 60 }
+'@
+  $probeFile = Join-Path $env:TEMP 'wt-uia-probe.ps1'
+  Set-Content -Path $probeFile -Value $probeScript -Encoding UTF8
+  $probeOut = Join-Path $env:TEMP 'wt-uia-out.txt'
+  $probeProc = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',$probeFile -PassThru -RedirectStandardOutput $probeOut
+  Start-Sleep -Milliseconds 2500
+  $lwf = Send-Tool 'list_windows' @{ pid=$probeProc.Id; title='UIA_E2E_PROBE' }
+  $pf = Tool-Payload $lwf
+  Check 'find uia probe window' ($pf -and $pf.count -ge 1) ("hwnd=" + $pf.windows[0].hwnd)
+  if ($pf -and $pf.count -ge 1) {
+    $fh = [string]$pf.windows[0].hwnd
+    $rf = Send-Tool 'get_window_rect' @{ hwnd=$fh }
+    $prf = Tool-Payload $rf
+    # 工具坐标为客户区局部物理像素:中心点 = 客户区宽高各半
+    $cx = [int]($prf.client_rect.width / 2)
+    $cy = [int]($prf.client_rect.height / 2)
+    $insp = Send-Tool 'inspect_element_at' @{ hwnd=$fh; x=$cx; y=$cy }
+    $pi = Tool-Payload $insp
+    Check 'inspect_element_at center hits button' ($null -ne $pi -and $pi.element.control_type_id -eq 50000 -and $pi.element.name -eq 'UIA_OK_probe') ("type=" + $pi.element.control_type + " name=" + $pi.element.name + " focusable=" + $pi.element.keyboard_focusable)
+    $inspO = Send-Tool 'inspect_element_at' @{ hwnd=$fh; x=($prf.client_rect.width + 50); y=10 }
+    Check 'inspect_element_at out-of-range rejected' ($inspO.result.isError) $inspO.result.content[0].text
+    $foc = Send-Tool 'inspect_focused_element' @{}
+    $pfo = Tool-Payload $foc
+    Check 'inspect_focused_element returns an element' ($null -ne $pfo -and $pfo.element.control_type -ne 'Unknown') ("type=" + $pfo.element.control_type + " name=" + $pfo.element.name)
+  }
+  if (!$probeProc.HasExited) { Stop-Process -Id $probeProc.Id -Force -ErrorAction SilentlyContinue }
+  Remove-Item $probeFile, $probeOut -Force -ErrorAction SilentlyContinue
+
   Write-Output ""
   Write-Output ("RESULT: " + $pass + " passed, " + $fail + " failed")
 } finally {
   if (!$proc.HasExited) { $proc.Kill(); $null = $proc.WaitForExit(2000) }
   Get-Process winver -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  if ($null -ne $probeProc -and !$probeProc.HasExited) { Stop-Process -Id $probeProc.Id -Force -ErrorAction SilentlyContinue }
 }
 if ($fail -gt 0) { exit 1 } else { exit 0 }

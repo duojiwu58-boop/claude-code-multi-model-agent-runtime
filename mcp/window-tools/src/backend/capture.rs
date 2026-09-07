@@ -16,7 +16,8 @@ use windows::{
 };
 
 use crate::error::{
-    ToolError, CAPTURE_FAILED, INVALID_ARGUMENT, LIMIT_EXCEEDED, WINDOW_HUNG, WINDOW_NOT_VISIBLE,
+    ToolError, CAPTURE_FAILED, INTERNAL_ERROR, INVALID_ARGUMENT, LIMIT_EXCEEDED, WINDOW_HUNG,
+    WINDOW_NOT_VISIBLE,
 };
 
 use super::window::{client_rect_of, is_window_hung, rect_of};
@@ -43,18 +44,31 @@ pub fn run_capture_with_timeout<T: Send + 'static>(
     timeout_ms: u64,
     capture: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
 ) -> Result<T, ToolError> {
+    run_with_timeout(timeout_ms, capture, |ms| {
+        ToolError::new(
+            WINDOW_HUNG,
+            format!("截图操作超过 {ms}ms 未完成，目标窗口可能无响应"),
+        )
+    })
+}
+
+/// 通用限时执行原语:独立线程运行 + 限时等待,截图与 UIA 查询共用。
+/// 超时后 worker 无法被终止,可能继续阻塞并泄漏当次资源(进程退出回收),
+/// 边界与 [`run_capture_with_timeout`] 相同。
+pub fn run_with_timeout<T: Send + 'static>(
+    timeout_ms: u64,
+    op: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
+    timeout_error: impl FnOnce(u64) -> ToolError,
+) -> Result<T, ToolError> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(capture());
+        let _ = tx.send(op());
     });
     match rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)) {
         Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(ToolError::new(
-            WINDOW_HUNG,
-            format!("截图操作超过 {timeout_ms}ms 未完成，目标窗口可能无响应"),
-        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(timeout_error(timeout_ms)),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(ToolError::new(CAPTURE_FAILED, "截图线程异常退出"))
+            Err(ToolError::new(INTERNAL_ERROR, "执行线程异常退出"))
         }
     }
 }

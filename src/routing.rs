@@ -220,7 +220,7 @@ async fn anthropic_messages(
             ));
             let provider_file = active_profile.file_name.clone();
             let response = forward_anthropic_profile(active_profile, &headers, request).await;
-            return attach_bridge_diagnostics(response, &provider_file, &diagnostics);
+            attach_bridge_diagnostics(response, &provider_file, &diagnostics)
         }
         ProviderTransport::OpenAiChat => {
             let mut diagnostics = request_override_diagnostics;
@@ -233,7 +233,7 @@ async fn anthropic_messages(
             let response =
                 forward_openai_profile(active_profile, request, state.thought_signatures.clone())
                     .await;
-            return attach_bridge_diagnostics(response, &provider_file, &diagnostics);
+            attach_bridge_diagnostics(response, &provider_file, &diagnostics)
         }
         ProviderTransport::OpenAiResponses => {
             let mut diagnostics = request_override_diagnostics;
@@ -249,7 +249,7 @@ async fn anthropic_messages(
                 state.interaction_continuations.clone(),
             )
             .await;
-            return attach_bridge_diagnostics(response, &provider_file, &diagnostics);
+            attach_bridge_diagnostics(response, &provider_file, &diagnostics)
         }
         ProviderTransport::GeminiInteractions => {
             let mut active_profile = active_profile;
@@ -293,7 +293,7 @@ async fn anthropic_messages(
                 state.interaction_continuations.clone(),
             )
             .await;
-            return attach_bridge_diagnostics(response, &provider_file, &diagnostics);
+            attach_bridge_diagnostics(response, &provider_file, &diagnostics)
         }
         ProviderTransport::LocalGemini => {
             return forward_local_gemini_profile(&state, &active_profile, request).await;

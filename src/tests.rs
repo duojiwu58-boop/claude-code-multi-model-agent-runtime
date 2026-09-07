@@ -9717,8 +9717,10 @@ async fn profile_probe_does_not_switch_active_profile_or_store_interactions() {
         }),
     )
     .await;
-    let mut capabilities = OpenAiCapabilities::default();
-    capabilities.responses_stateful = true;
+    let capabilities = OpenAiCapabilities {
+        responses_stateful: true,
+        ..Default::default()
+    };
     let mut selected = probe_profile(
         "selected.json",
         ProviderTransport::OpenAiResponses,

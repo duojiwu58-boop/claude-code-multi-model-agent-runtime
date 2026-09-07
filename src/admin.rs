@@ -17,7 +17,7 @@ fn redact_url_credentials_if_url(value: &str) -> String {
 // small: a probe sends a one-token non-streaming request and reports the
 // round-trip result, so 30 seconds is far beyond any healthy upstream answer.
 const PROFILE_PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-const PROFILE_PROBE_BODY_LIMIT: usize = 1 * 1024 * 1024;
+const PROFILE_PROBE_BODY_LIMIT: usize = 1024 * 1024;
 const PROFILE_PROBE_MAX_TOKENS: u64 = 1;
 const PROFILE_PROBE_RESPONSE_CHARS: usize = 600;
 

@@ -441,6 +441,36 @@ fn client_rect_of(hwnd: HWND) -> Result<RECT, String> {
     })
 }
 
+/// GDI 句柄 RAII 守卫:正常错误路径与 panic 展开路径都保证释放,
+/// 配合协议层 catch_unwind 隔离使采集函数在崩溃时也不泄漏 GDI 句柄。
+/// 释放方式必须与获取方式配对:GetDC(None) 的屏幕 DC 用 ReleaseDC,
+/// CreateCompatibleDC 的内存 DC 用 DeleteDC,位图用 DeleteObject。
+/// Drop 顺序为声明逆序(内存 DC → 位图 → 屏幕 DC):DeleteDC 不删除选入对象,
+/// 随后 DeleteObject 在该 DC 已不存在时仍能成功释放位图。
+enum GdiHandle {
+    ScreenDc(HDC),
+    MemDc(HDC),
+    Bitmap(HBITMAP),
+}
+
+impl Drop for GdiHandle {
+    fn drop(&mut self) {
+        unsafe {
+            match self {
+                GdiHandle::ScreenDc(hdc) => {
+                    let _ = ReleaseDC(None, *hdc);
+                }
+                GdiHandle::MemDc(hdc) => {
+                    let _ = DeleteDC(*hdc);
+                }
+                GdiHandle::Bitmap(hbm) => {
+                    let _ = DeleteObject(HGDIOBJ(hbm.0));
+                }
+            }
+        }
+    }
+}
+
 fn capture_window(hwnd: HWND, client_only: bool) -> Result<(Vec<u8>, RECT), String> {
     let rect = if client_only {
         client_rect_of(hwnd)?
@@ -469,21 +499,17 @@ fn capture_window(hwnd: HWND, client_only: bool) -> Result<(Vec<u8>, RECT), Stri
     if hdc_screen.0.is_null() {
         return Err("GetDC 未返回屏幕设备上下文".into());
     }
+    let _screen_dc = GdiHandle::ScreenDc(hdc_screen);
     let hbm = unsafe { CreateCompatibleBitmap(hdc_screen, width, height) };
     if hbm.0.is_null() {
-        unsafe {
-            let _ = ReleaseDC(None, hdc_screen);
-        }
         return Err("CreateCompatibleBitmap 未能分配窗口截图位图".into());
     }
+    let _bitmap = GdiHandle::Bitmap(hbm);
     let hdc_mem = unsafe { CreateCompatibleDC(Some(hdc_screen)) };
     if hdc_mem.0.is_null() {
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(hbm.0));
-            let _ = ReleaseDC(None, hdc_screen);
-        }
         return Err("CreateCompatibleDC 未能创建窗口截图设备上下文".into());
     }
+    let _mem_dc = GdiHandle::MemDc(hdc_mem);
 
     let flags = if client_only {
         PW_CLIENTONLY
@@ -491,11 +517,6 @@ fn capture_window(hwnd: HWND, client_only: bool) -> Result<(Vec<u8>, RECT), Stri
         PW_RENDERFULLCONTENT
     };
     let png = render_window_png(hwnd, hdc_mem, hbm, width, height, flags);
-    unsafe {
-        let _ = DeleteDC(hdc_mem);
-        let _ = DeleteObject(HGDIOBJ(hbm.0));
-        let _ = ReleaseDC(None, hdc_screen);
-    }
     png.map(|bytes| (bytes, rect))
 }
 
@@ -615,6 +636,7 @@ fn capture_all_monitors() -> Result<Vec<MonitorShot>, String> {
     if hdc_screen.0.is_null() {
         return Err("GetDC 未返回屏幕设备上下文".into());
     }
+    let _screen_dc = GdiHandle::ScreenDc(hdc_screen);
 
     let mut results = Vec::new();
     for (index, m) in monitors.iter().enumerate() {
@@ -662,9 +684,6 @@ fn capture_all_monitors() -> Result<Vec<MonitorShot>, String> {
             }),
         }
     }
-    unsafe {
-        let _ = ReleaseDC(None, hdc_screen);
-    }
     Ok(results)
 }
 
@@ -694,14 +713,15 @@ fn capture_rect_from_screen(
     if hbm.0.is_null() {
         return Err("CreateCompatibleBitmap 未能分配屏幕截图位图".into());
     }
+    let _bitmap = GdiHandle::Bitmap(hbm);
     let hdc_mem = unsafe { CreateCompatibleDC(Some(hdc_screen)) };
     if hdc_mem.0.is_null() {
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(hbm.0));
-        }
         return Err("CreateCompatibleDC 未能创建屏幕截图设备上下文".into());
     }
-    let old = unsafe { SelectObject(hdc_mem, HGDIOBJ(hbm.0)) };
+    let _mem_dc = GdiHandle::MemDc(hdc_mem);
+    unsafe {
+        let _ = SelectObject(hdc_mem, HGDIOBJ(hbm.0));
+    }
 
     let mut bmi = unsafe { std::mem::zeroed::<BITMAPINFO>() };
     bmi.bmiHeader = BITMAPINFOHEADER {
@@ -751,7 +771,7 @@ fn capture_rect_from_screen(
             Err(Error::from_win32())
         }
     };
-    let result = if let Err(e) = copied {
+    if let Err(e) = copied {
         Err(format!("屏幕像素复制失败: {e}"))
     } else {
         let lines = unsafe {
@@ -774,14 +794,7 @@ fn capture_rect_from_screen(
             }
             encode_png(output_width as u32, output_height as u32, &rgba)
         }
-    };
-
-    unsafe {
-        let _ = SelectObject(hdc_mem, old);
-        let _ = DeleteDC(hdc_mem);
-        let _ = DeleteObject(HGDIOBJ(hbm.0));
     }
-    result
 }
 
 fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
@@ -856,22 +869,20 @@ fn capture_client_region_bgra(
     if hdc_screen.0.is_null() {
         return Err("GetDC 未返回屏幕设备上下文".into());
     }
+    let _screen_dc = GdiHandle::ScreenDc(hdc_screen);
     let hbm = unsafe { CreateCompatibleBitmap(hdc_screen, width, height) };
     if hbm.0.is_null() {
-        unsafe {
-            let _ = ReleaseDC(None, hdc_screen);
-        }
         return Err("CreateCompatibleBitmap 未能分配扫描位图".into());
     }
+    let _bitmap = GdiHandle::Bitmap(hbm);
     let hdc_mem = unsafe { CreateCompatibleDC(Some(hdc_screen)) };
     if hdc_mem.0.is_null() {
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(hbm.0));
-            let _ = ReleaseDC(None, hdc_screen);
-        }
         return Err("CreateCompatibleDC 未能创建扫描设备上下文".into());
     }
-    let old = unsafe { SelectObject(hdc_mem, HGDIOBJ(hbm.0)) };
+    let _mem_dc = GdiHandle::MemDc(hdc_mem);
+    unsafe {
+        let _ = SelectObject(hdc_mem, HGDIOBJ(hbm.0));
+    }
 
     let mut bmi = unsafe { std::mem::zeroed::<BITMAPINFO>() };
     bmi.bmiHeader = BITMAPINFOHEADER {
@@ -898,7 +909,7 @@ fn capture_client_region_bgra(
         )
     }
     .is_ok();
-    let result = if !copied {
+    if !copied {
         Err("扫描区域像素复制失败".to_string())
     } else {
         let lines = unsafe {
@@ -917,15 +928,7 @@ fn capture_client_region_bgra(
         } else {
             Ok(bgra)
         }
-    };
-
-    unsafe {
-        let _ = SelectObject(hdc_mem, old);
-        let _ = DeleteDC(hdc_mem);
-        let _ = DeleteObject(HGDIOBJ(hbm.0));
-        let _ = ReleaseDC(None, hdc_screen);
     }
-    result
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

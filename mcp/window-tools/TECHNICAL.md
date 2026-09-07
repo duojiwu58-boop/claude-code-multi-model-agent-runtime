@@ -150,6 +150,10 @@ capture_client_region_bgra(hwnd, x, y_from, 1, y_to-y_from)
 - **失败清理**:执行途中发生错误或 unwind panic 时,RAII guard 释放本批仍按下的鼠标键/键盘键;
 - 按键名解析表:ASCII 字母/数字直通、Enter/Space/Tab/Esc/Backspace/Delete/Insert/
   Home/End/PageUp/PageDown/方向键/Ctrl/Shift/Alt/Win/F1-F24;
+- ScanCode 储备方向(未实现):当前 `keybd_event` + VK 对 Qt/Electron/IDE 等常规窗口是标准路径;
+  若未来遇到 DirectInput 独占/Raw Input/特殊 IME 等读 lParam 扫描码的冷门客户端不认键,
+  再加可选参数走 SendInput + MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) + KEYEVENTF_SCANCODE
+  (扩展键方向键/Insert/Del/Home/End/PgUp/PgDn 还需补 KEYEVENTF_EXTENDEDKEY);
 - `delay_ms`(0–5000,默认 50)作用于动作之间,也是插值步进间隔;
 - 每批最多 128 个动作,按动作间隔与 move 步进估算的计划延迟最多 60 秒,避免阻塞单线程服务。
 
@@ -185,8 +189,9 @@ fn handle_request_isolated(request: &Value) -> Option<Value> {
 - `panic_payload_message` 必须接收 **`&Box<dyn Any + Send>`** 并对 Box 直接调
   `downcast_ref`。接收 `&(dyn Any + Send)` 时,`&Box<dyn>` 经 Deref 强转后的 fat pointer
   downcast 会**静默失败**;这与 std panic hook 通过 `PanicInfo::payload()` 拿 `&dyn` 的路径不同;
-- panic 展开不会释放已取得的 GDI 句柄(hdc/hbitmap 泄漏)—— 泄漏有界且只在崩溃路径发生,
-  通过上述隔离避免级联;正常错误路径全部走 `?` + 手动释放。
+- GDI 句柄由 RAII 守卫 `GdiHandle`(ScreenDc/MemDc/Bitmap)持有:正常错误路径不再手工释放,
+  panic 展开时 Drop 同样执行,崩溃路径也零句柄泄漏。释放方式与获取方式严格配对
+  (GetDC 用 ReleaseDC、内存 DC 用 DeleteDC、位图用 DeleteObject)。
 
 ## 6. 预算与校验
 

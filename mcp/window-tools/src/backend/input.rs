@@ -15,6 +15,10 @@ use windows::{
     },
 };
 
+use crate::error::{
+    ToolError, ACTIVATION_DENIED, INVALID_ARGUMENT, INPUT_FAILED, LIMIT_EXCEEDED,
+    WINDOW_NOT_VISIBLE,
+};
 use crate::parse::json_i32;
 
 use super::window::{
@@ -27,13 +31,14 @@ pub const MAX_INPUT_SCHEDULED_DELAY_MS: u64 = 60_000;
 
 /// 解析虚拟键码：整数 0..255，或常用按键名（ASCII 字母/数字、Enter、F1..F24 等）。
 /// 只支持按键名是为了让模型可读；组合键请用多个 key_down/key_up 动作。
-fn parse_vkey(value: &Value) -> Result<u8, String> {
+fn parse_vkey(value: &Value) -> Result<u8, ToolError> {
     if let Some(n) = value.as_i64() {
-        return u8::try_from(n).map_err(|_| format!("vkey 超出 0..255 范围: {n}"));
+        return u8::try_from(n)
+            .map_err(|_| ToolError::new(INVALID_ARGUMENT, format!("vkey 超出 0..255 范围: {n}")));
     }
     let name = value
         .as_str()
-        .ok_or("vkey 必须是整数或命名按键")?
+        .ok_or_else(|| ToolError::new(INVALID_ARGUMENT, "vkey 必须是整数或命名按键"))?
         .trim()
         .to_uppercase();
     match name.as_str() {
@@ -71,7 +76,7 @@ fn parse_vkey(value: &Value) -> Result<u8, String> {
                     }
                 }
             }
-            Err(format!("未知按键名 '{name}'"))
+            Err(ToolError::new(INVALID_ARGUMENT, format!("未知按键名 '{name}'")))
         }
     }
 }
@@ -84,12 +89,15 @@ enum MouseButton {
 }
 
 impl MouseButton {
-    fn parse(raw: &str) -> Result<Self, String> {
+    fn parse(raw: &str) -> Result<Self, ToolError> {
         match raw {
             "left" => Ok(Self::Left),
             "right" => Ok(Self::Right),
             "middle" => Ok(Self::Middle),
-            _ => Err(format!("未知鼠标按钮 '{raw}'（left/right/middle）")),
+            _ => Err(ToolError::new(
+                INVALID_ARGUMENT,
+                format!("未知鼠标按钮 '{raw}'（left/right/middle）"),
+            )),
         }
     }
 
@@ -122,17 +130,18 @@ enum PreparedInputAction {
     KeyUp { vkey: u8 },
 }
 
-fn validate_client_point(x: i32, y: i32, width: i32, height: i32) -> Result<(), String> {
+fn validate_client_point(x: i32, y: i32, width: i32, height: i32) -> Result<(), ToolError> {
     if x < 0 || y < 0 || x >= width || y >= height {
-        return Err(format!(
-            "输入坐标 ({x},{y}) 超出窗口客户区 {width}x{height}"
+        return Err(ToolError::new(
+            INVALID_ARGUMENT,
+            format!("输入坐标 ({x},{y}) 超出窗口客户区 {width}x{height}"),
         ));
     }
     Ok(())
 }
 
 /// 客户区坐标 → 屏幕物理坐标,并复检坐标仍在客户区内(窗口可能在解析与执行间变化)。
-fn client_to_screen_checked(hwnd: HWND, x: i32, y: i32) -> Result<POINT, String> {
+fn client_to_screen_checked(hwnd: HWND, x: i32, y: i32) -> Result<POINT, ToolError> {
     let client = client_rect_of(hwnd)?;
     validate_client_point(x, y, client.right - client.left, client.bottom - client.top)?;
     Ok(POINT {
@@ -145,7 +154,7 @@ fn action_position(
     action: &Value,
     client_width: i32,
     client_height: i32,
-) -> Result<(i32, i32), String> {
+) -> Result<(i32, i32), ToolError> {
     let x = json_i32(action, "x", true)?.expect("required value checked above");
     let y = json_i32(action, "y", true)?.expect("required value checked above");
     validate_client_point(x, y, client_width, client_height)?;
@@ -172,14 +181,17 @@ fn prepare_input_actions(
     client_width: i32,
     client_height: i32,
     delay_ms: u64,
-) -> Result<(Vec<PreparedInputAction>, u64), String> {
+) -> Result<(Vec<PreparedInputAction>, u64), ToolError> {
     if actions.is_empty() {
-        return Err("actions 不能为空".into());
+        return Err(ToolError::new(INVALID_ARGUMENT, "actions 不能为空"));
     }
     if actions.len() > MAX_INPUT_ACTIONS {
-        return Err(format!(
-            "actions 数量不能超过 {MAX_INPUT_ACTIONS}，实际为 {}",
-            actions.len()
+        return Err(ToolError::new(
+            LIMIT_EXCEEDED,
+            format!(
+                "actions 数量不能超过 {MAX_INPUT_ACTIONS}，实际为 {}",
+                actions.len()
+            ),
         ));
     }
 
@@ -190,13 +202,16 @@ fn prepare_input_actions(
         let kind = action
             .get("kind")
             .and_then(Value::as_str)
-            .ok_or_else(|| format!("动作 {index} 必须有 kind"))?;
+            .ok_or_else(|| ToolError::new(INVALID_ARGUMENT, format!("动作 {index} 必须有 kind")))?;
         let parsed = match kind {
             "move" => {
                 let (x, y) = action_position(action, client_width, client_height)?;
                 let steps = json_i32(action, "steps", false)?.unwrap_or(1);
                 if !(1..=200).contains(&steps) {
-                    return Err(format!("动作 {index} 的 steps 必须在 1..200 范围内"));
+                    return Err(ToolError::new(
+                        INVALID_ARGUMENT,
+                        format!("动作 {index} 的 steps 必须在 1..200 范围内"),
+                    ));
                 }
                 PreparedInputAction::Move { x, y, steps }
             }
@@ -210,9 +225,9 @@ fn prepare_input_actions(
                 )?;
                 if kind == "down" {
                     if held_buttons.contains(&button) {
-                        return Err(format!(
-                            "动作 {index} 重复按下 {}，必须先释放",
-                            button.name()
+                        return Err(ToolError::new(
+                            INVALID_ARGUMENT,
+                            format!("动作 {index} 重复按下 {}，必须先释放", button.name()),
                         ));
                     }
                     held_buttons.push(button);
@@ -220,18 +235,18 @@ fn prepare_input_actions(
                 } else if kind == "up" {
                     let Some(position) = held_buttons.iter().position(|held| *held == button)
                     else {
-                        return Err(format!(
-                            "动作 {index} 释放了未在本批次按下的 {}",
-                            button.name()
+                        return Err(ToolError::new(
+                            INVALID_ARGUMENT,
+                            format!("动作 {index} 释放了未在本批次按下的 {}", button.name()),
                         ));
                     };
                     held_buttons.remove(position);
                     PreparedInputAction::Up { x, y, button }
                 } else {
                     if held_buttons.contains(&button) {
-                        return Err(format!(
-                            "动作 {index} 不能 click 已由 down 按住的 {}",
-                            button.name()
+                        return Err(ToolError::new(
+                            INVALID_ARGUMENT,
+                            format!("动作 {index} 不能 click 已由 down 按住的 {}", button.name()),
                         ));
                     }
                     PreparedInputAction::Click { x, y, button }
@@ -246,44 +261,62 @@ fn prepare_input_actions(
                 let vkey = parse_vkey(
                     action
                         .get("vkey")
-                        .ok_or_else(|| format!("动作 {index} 缺少 vkey"))?,
+                        .ok_or_else(|| ToolError::new(INVALID_ARGUMENT, format!("动作 {index} 缺少 vkey")))?,
                 )?;
                 if kind == "key_down" {
                     if held_keys.contains(&vkey) {
-                        return Err(format!("动作 {index} 重复按下 vkey 0x{vkey:02X}"));
+                        return Err(ToolError::new(
+                            INVALID_ARGUMENT,
+                            format!("动作 {index} 重复按下 vkey 0x{vkey:02X}"),
+                        ));
                     }
                     held_keys.push(vkey);
                     PreparedInputAction::KeyDown { vkey }
                 } else if kind == "key_up" {
                     let Some(position) = held_keys.iter().position(|held| *held == vkey) else {
-                        return Err(format!(
-                            "动作 {index} 释放了未在本批次按下的 vkey 0x{vkey:02X}"
+                        return Err(ToolError::new(
+                            INVALID_ARGUMENT,
+                            format!("动作 {index} 释放了未在本批次按下的 vkey 0x{vkey:02X}"),
                         ));
                     };
                     held_keys.remove(position);
                     PreparedInputAction::KeyUp { vkey }
                 } else {
                     if held_keys.contains(&vkey) {
-                        return Err(format!(
-                            "动作 {index} 不能 key_tap 已由 key_down 按住的 vkey 0x{vkey:02X}"
+                        return Err(ToolError::new(
+                            INVALID_ARGUMENT,
+                            format!(
+                                "动作 {index} 不能 key_tap 已由 key_down 按住的 vkey 0x{vkey:02X}"
+                            ),
                         ));
                     }
                     PreparedInputAction::KeyTap { vkey }
                 }
             }
-            other => return Err(format!("未知动作 kind '{other}'")),
+            other => {
+                return Err(ToolError::new(
+                    INVALID_ARGUMENT,
+                    format!("未知动作 kind '{other}'"),
+                ))
+            }
         };
         prepared.push(parsed);
     }
 
     if !held_buttons.is_empty() || !held_keys.is_empty() {
-        return Err("本批次存在未配平的 down/key_down；必须在同一批次内发送对应 up/key_up".into());
+        return Err(ToolError::new(
+            INVALID_ARGUMENT,
+            "本批次存在未配平的 down/key_down；必须在同一批次内发送对应 up/key_up",
+        ));
     }
-    let scheduled_delay =
-        scheduled_input_delay_ms(&prepared, delay_ms).ok_or("输入批次预计耗时计算溢出")?;
+    let scheduled_delay = scheduled_input_delay_ms(&prepared, delay_ms)
+        .ok_or_else(|| ToolError::new(INVALID_ARGUMENT, "输入批次预计耗时计算溢出"))?;
     if scheduled_delay > MAX_INPUT_SCHEDULED_DELAY_MS {
-        return Err(format!(
-            "输入批次计划延迟 {scheduled_delay}ms 超过上限 {MAX_INPUT_SCHEDULED_DELAY_MS}ms"
+        return Err(ToolError::new(
+            LIMIT_EXCEEDED,
+            format!(
+                "输入批次计划延迟 {scheduled_delay}ms 超过上限 {MAX_INPUT_SCHEDULED_DELAY_MS}ms"
+            ),
         ));
     }
     Ok((prepared, scheduled_delay))
@@ -345,7 +378,7 @@ fn move_cursor_steps(
     to: POINT,
     steps: i32,
     per_step_ms: u64,
-) -> Result<(), String> {
+) -> Result<(), ToolError> {
     let mut current = from;
     for step in 1..=steps {
         ensure_input_foreground(hwnd)?;
@@ -353,7 +386,8 @@ fn move_cursor_steps(
         current.x = from.x + ((f64::from(to.x) - f64::from(from.x)) * f) as i32;
         current.y = from.y + ((f64::from(to.y) - f64::from(from.y)) * f) as i32;
         unsafe {
-            SetCursorPos(current.x, current.y).map_err(|e| format!("SetCursorPos 失败: {e}"))?;
+            SetCursorPos(current.x, current.y)
+                .map_err(|e| ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}")))?;
         }
         std::thread::sleep(std::time::Duration::from_millis(per_step_ms));
     }
@@ -365,7 +399,7 @@ fn execute_prepared_actions(
     hwnd: HWND,
     prepared: &[PreparedInputAction],
     delay_ms: u64,
-) -> Result<Vec<Value>, String> {
+) -> Result<Vec<Value>, ToolError> {
     let mut reported: Vec<Value> = Vec::new();
     let mut release_guard = InputReleaseGuard::new();
     for (index, action) in prepared.iter().enumerate() {
@@ -379,7 +413,8 @@ fn execute_prepared_actions(
                 let target = client_to_screen_checked(hwnd, x, y)?;
                 let mut from = POINT { x: 0, y: 0 };
                 unsafe {
-                    GetCursorPos(&mut from).map_err(|e| format!("GetCursorPos 失败: {e}"))?;
+                    GetCursorPos(&mut from)
+                        .map_err(|e| ToolError::new(INPUT_FAILED, format!("GetCursorPos 失败: {e}")))?;
                 }
                 move_cursor_steps(hwnd, from, target, steps, delay_ms.max(10))?;
                 reported.push(json!({"kind": "move", "steps": steps}));
@@ -388,7 +423,7 @@ fn execute_prepared_actions(
                 let target = client_to_screen_checked(hwnd, x, y)?;
                 unsafe {
                     SetCursorPos(target.x, target.y)
-                        .map_err(|e| format!("SetCursorPos 失败: {e}"))?;
+                        .map_err(|e| ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}")))?;
                 }
                 release_guard.mouse_down(button);
                 release_guard.mouse_up(button);
@@ -398,7 +433,7 @@ fn execute_prepared_actions(
                 let target = client_to_screen_checked(hwnd, x, y)?;
                 unsafe {
                     SetCursorPos(target.x, target.y)
-                        .map_err(|e| format!("SetCursorPos 失败: {e}"))?;
+                        .map_err(|e| ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}")))?;
                 }
                 release_guard.mouse_down(button);
                 reported.push(json!({"kind": "down", "button": button.name()}));
@@ -407,7 +442,7 @@ fn execute_prepared_actions(
                 let target = client_to_screen_checked(hwnd, x, y)?;
                 unsafe {
                     SetCursorPos(target.x, target.y)
-                        .map_err(|e| format!("SetCursorPos 失败: {e}"))?;
+                        .map_err(|e| ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}")))?;
                 }
                 release_guard.mouse_up(button);
                 reported.push(json!({"kind": "up", "button": button.name()}));
@@ -416,7 +451,7 @@ fn execute_prepared_actions(
                 let target = client_to_screen_checked(hwnd, x, y)?;
                 unsafe {
                     SetCursorPos(target.x, target.y)
-                        .map_err(|e| format!("SetCursorPos 失败: {e}"))?;
+                        .map_err(|e| ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}")))?;
                     mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0);
                 }
                 reported.push(json!({"kind": "scroll", "delta": delta}));
@@ -441,12 +476,15 @@ fn execute_prepared_actions(
 
 /// 执行 send_input 工具:前置校验(可见性/前台/批次)→ 预校验 → 执行。
 /// 返回 MCP content 形状的结果;错误路径由调用方统一转 isError。
-pub fn send_input(hwnd: HWND, args: &Value) -> Result<Value, String> {
+pub fn send_input(hwnd: HWND, args: &Value) -> Result<Value, ToolError> {
     let entry = entry_for_hwnd(hwnd)?;
     if !entry.visible {
-        return Err(format!(
-            "窗口 hwnd={} 不可见（可能已最小化），拒绝注入输入",
-            hwnd_str(hwnd)
+        return Err(ToolError::new(
+            WINDOW_NOT_VISIBLE,
+            format!(
+                "窗口 hwnd={} 不可见（可能已最小化），拒绝注入输入",
+                hwnd_str(hwnd)
+            ),
         ));
     }
     let activate = args
@@ -455,28 +493,40 @@ pub fn send_input(hwnd: HWND, args: &Value) -> Result<Value, String> {
         .unwrap_or(false);
     if activate {
         if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
-            return Err(format!(
-                "SetForegroundWindow 拒绝激活 hwnd={}（Windows 焦点保护或窗口已失效）",
-                hwnd_str(hwnd)
+            return Err(ToolError::new(
+                ACTIVATION_DENIED,
+                format!(
+                    "SetForegroundWindow 拒绝激活 hwnd={}（Windows 焦点保护或窗口已失效）",
+                    hwnd_str(hwnd)
+                ),
             ));
         }
         if foreground_hwnd() != hwnd {
-            return Err("窗口激活请求未生效，请改用 window_activate".into());
+            return Err(ToolError::new(
+                ACTIVATION_DENIED,
+                "窗口激活请求未生效，请改用 window_activate",
+            ));
         }
     } else if foreground_hwnd() != hwnd {
-        return Err(format!(
-            "目标窗口 hwnd={} 不是前台窗口，输入将发送到其他窗口；请先调用 window_activate 或设置 activate:true",
-            hwnd_str(hwnd)
+        return Err(ToolError::new(
+            crate::error::NOT_FOREGROUND,
+            format!(
+                "目标窗口 hwnd={} 不是前台窗口，输入将发送到其他窗口；请先调用 window_activate 或设置 activate:true",
+                hwnd_str(hwnd)
+            ),
         ));
     }
 
     let actions = args
         .get("actions")
         .and_then(Value::as_array)
-        .ok_or("actions 必须是数组")?;
+        .ok_or_else(|| ToolError::new(INVALID_ARGUMENT, "actions 必须是数组"))?;
     let delay_raw = json_i32(args, "delay_ms", false)?.unwrap_or(50);
     if !(0..=5000).contains(&delay_raw) {
-        return Err("delay_ms 必须在 0..5000 范围内".into());
+        return Err(ToolError::new(
+            INVALID_ARGUMENT,
+            "delay_ms 必须在 0..5000 范围内",
+        ));
     }
     let delay_ms = delay_raw as u64;
     let client = client_rect_of(hwnd)?;
@@ -551,5 +601,17 @@ mod tests {
 
         let too_slow = [json!({"kind": "move", "x": 1, "y": 1, "steps": 200})];
         assert!(prepare_input_actions(&too_slow, 800, 600, 5000).is_err());
+    }
+
+    #[test]
+    fn batch_errors_carry_stable_codes() {
+        let err = prepare_input_actions(&[json!({"kind": "down", "x": 1, "y": 1})], 800, 600, 0)
+            .unwrap_err();
+        assert_eq!(err.code, INVALID_ARGUMENT);
+        assert!(!err.retryable);
+
+        let too_slow = [json!({"kind": "move", "x": 1, "y": 1, "steps": 200})];
+        let err = prepare_input_actions(&too_slow, 800, 600, 5000).unwrap_err();
+        assert_eq!(err.code, LIMIT_EXCEEDED);
     }
 }

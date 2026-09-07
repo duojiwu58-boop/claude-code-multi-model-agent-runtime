@@ -15,6 +15,10 @@ use windows::{
     },
 };
 
+use crate::error::{
+    ToolError, CAPTURE_FAILED, INVALID_ARGUMENT, LIMIT_EXCEEDED, WINDOW_NOT_VISIBLE,
+};
+
 use super::window::{client_rect_of, rect_of};
 
 /// 单张窗口图的硬上限：保留原始 4K，同时约束 BGRA 与 RGBA 双缓冲的峰值内存。
@@ -29,9 +33,12 @@ const PW_RENDERFULLCONTENT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(2);
 const PW_CLIENTONLY: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(1);
 
 /// 所有位图分配前先以 i64 计算面积，避免 i32 乘法溢出造成小分配/越界访问。
-pub fn checked_pixels(width: i32, height: i32) -> Result<i64, String> {
+pub fn checked_pixels(width: i32, height: i32) -> Result<i64, ToolError> {
     if width <= 0 || height <= 0 {
-        return Err(format!("截图尺寸必须为正数，实际为 {width}x{height}"));
+        return Err(ToolError::new(
+            INVALID_ARGUMENT,
+            format!("截图尺寸必须为正数，实际为 {width}x{height}"),
+        ));
     }
     Ok(i64::from(width) * i64::from(height))
 }
@@ -44,10 +51,10 @@ pub fn fit_capture_dimensions(
     height: i32,
     pixel_budget: i64,
     additional_scale: f64,
-) -> Result<(i32, i32), String> {
+) -> Result<(i32, i32), ToolError> {
     let pixels = checked_pixels(width, height)?;
     if pixel_budget <= 0 || !additional_scale.is_finite() || additional_scale <= 0.0 {
-        return Err("无效的截图像素预算".into());
+        return Err(ToolError::new(INVALID_ARGUMENT, "无效的截图像素预算"));
     }
     let dimension_scale = (f64::from(MAX_CAPTURE_DIM) / f64::from(width.max(height))).min(1.0);
     let budget_scale = ((pixel_budget as f64 / pixels as f64).sqrt()).min(1.0);
@@ -94,7 +101,7 @@ impl Drop for GdiHandle {
     }
 }
 
-pub fn capture_window(hwnd: HWND, client_only: bool) -> Result<(Vec<u8>, RECT), String> {
+pub fn capture_window(hwnd: HWND, client_only: bool) -> Result<(Vec<u8>, RECT), ToolError> {
     let rect = if client_only {
         client_rect_of(hwnd)?
     } else {
@@ -103,34 +110,46 @@ pub fn capture_window(hwnd: HWND, client_only: bool) -> Result<(Vec<u8>, RECT), 
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
     if width <= 0 || height <= 0 {
-        return Err(format!(
-            "窗口矩形为空 ({}x{}),可能已最小化(最小化窗口坐标为 -32000)",
-            width, height
+        return Err(ToolError::new(
+            WINDOW_NOT_VISIBLE,
+            format!(
+                "窗口矩形为空 ({}x{}),可能已最小化(最小化窗口坐标为 -32000)",
+                width, height
+            ),
         ));
     }
     // PrintWindow 必须以原窗口尺寸绘制，不能像屏幕 BitBlt 那样在采集阶段缩放；
     // 所以异常大的窗口明确拒绝，避免先分配巨型原始缓冲再缩小。
     let pixels = checked_pixels(width, height)?;
     if width > MAX_CAPTURE_DIM || height > MAX_CAPTURE_DIM || pixels > MAX_WINDOW_CAPTURE_PIXELS {
-        return Err(format!(
-            "窗口尺寸 {}x{} 超过截图上限（单边 {} px、总计 {} 像素）；请先用 resize_window 缩小窗口",
-            width, height, MAX_CAPTURE_DIM, MAX_WINDOW_CAPTURE_PIXELS
+        return Err(ToolError::new(
+            LIMIT_EXCEEDED,
+            format!(
+                "窗口尺寸 {}x{} 超过截图上限（单边 {} px、总计 {} 像素）；请先用 resize_window 缩小窗口",
+                width, height, MAX_CAPTURE_DIM, MAX_WINDOW_CAPTURE_PIXELS
+            ),
         ));
     }
 
     let hdc_screen = unsafe { GetDC(None) };
     if hdc_screen.0.is_null() {
-        return Err("GetDC 未返回屏幕设备上下文".into());
+        return Err(ToolError::new(CAPTURE_FAILED, "GetDC 未返回屏幕设备上下文"));
     }
     let _screen_dc = GdiHandle::ScreenDc(hdc_screen);
     let hbm = unsafe { CreateCompatibleBitmap(hdc_screen, width, height) };
     if hbm.0.is_null() {
-        return Err("CreateCompatibleBitmap 未能分配窗口截图位图".into());
+        return Err(ToolError::new(
+            CAPTURE_FAILED,
+            "CreateCompatibleBitmap 未能分配窗口截图位图",
+        ));
     }
     let _bitmap = GdiHandle::Bitmap(hbm);
     let hdc_mem = unsafe { CreateCompatibleDC(Some(hdc_screen)) };
     if hdc_mem.0.is_null() {
-        return Err("CreateCompatibleDC 未能创建窗口截图设备上下文".into());
+        return Err(ToolError::new(
+            CAPTURE_FAILED,
+            "CreateCompatibleDC 未能创建窗口截图设备上下文",
+        ));
     }
     let _mem_dc = GdiHandle::MemDc(hdc_mem);
 
@@ -151,13 +170,16 @@ fn render_window_png(
     width: i32,
     height: i32,
     flags: PRINT_WINDOW_FLAGS,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, ToolError> {
     let old = unsafe { SelectObject(hdc_mem, HGDIOBJ(hbm.0)) };
     let printed = unsafe { PrintWindow(hwnd, hdc_mem, flags) }.as_bool();
     let _ = unsafe { SelectObject(hdc_mem, old) };
 
     if !printed {
-        return Err(format!("PrintWindow 失败(flags=0x{:X})", flags.0));
+        return Err(ToolError::new(
+            CAPTURE_FAILED,
+            format!("PrintWindow 失败(flags=0x{:X})", flags.0),
+        ));
     }
 
     let mut bmi = unsafe { std::mem::zeroed::<BITMAPINFO>() };
@@ -183,7 +205,7 @@ fn render_window_png(
         )
     };
     if lines <= 0 {
-        return Err("GetDIBits 未返回任何位图行".into());
+        return Err(ToolError::new(CAPTURE_FAILED, "GetDIBits 未返回任何位图行"));
     }
 
     let mut rgba = Vec::with_capacity(bgra.len());
@@ -206,7 +228,7 @@ pub struct MonitorShot {
     pub output_width: i32,
     pub output_height: i32,
     pub png: Vec<u8>,
-    pub error: Option<String>,
+    pub error: Option<ToolError>,
 }
 
 unsafe extern "system" fn monitor_proc(
@@ -241,15 +263,15 @@ fn enum_monitors() -> Vec<MonitorRecord> {
 }
 
 /// 截取所有显示器,返回每台一张 PNG(带标签与尺寸元数据,单台失败不中断其余)。
-pub fn capture_all_monitors() -> Result<Vec<MonitorShot>, String> {
+pub fn capture_all_monitors() -> Result<Vec<MonitorShot>, ToolError> {
     let monitors = enum_monitors();
     if monitors.is_empty() {
-        return Err("未找到任何显示器".into());
+        return Err(ToolError::new(CAPTURE_FAILED, "未找到任何显示器"));
     }
     let total_pixels = monitors.iter().try_fold(0i64, |total, monitor| {
         let width = monitor.rect.right - monitor.rect.left;
         let height = monitor.rect.bottom - monitor.rect.top;
-        Ok::<_, String>(total + checked_pixels(width, height)?)
+        Ok::<_, ToolError>(total + checked_pixels(width, height)?)
     })?;
     // 三台 UHD 4K 及以下保持 1.0；更多/更大的屏幕统一缩放，避免偏屏缩放。
     let total_scale = if total_pixels > MAX_ALL_CAPTURE_PIXELS {
@@ -259,7 +281,7 @@ pub fn capture_all_monitors() -> Result<Vec<MonitorShot>, String> {
     };
     let hdc_screen = unsafe { GetDC(None) };
     if hdc_screen.0.is_null() {
-        return Err("GetDC 未返回屏幕设备上下文".into());
+        return Err(ToolError::new(CAPTURE_FAILED, "GetDC 未返回屏幕设备上下文"));
     }
     let _screen_dc = GdiHandle::ScreenDc(hdc_screen);
 
@@ -320,7 +342,7 @@ fn capture_rect_from_screen(
     output_height: i32,
     left: i32,
     top: i32,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, ToolError> {
     // source_* 是真实桌面区域，output_* 是已按预算计算的目标位图尺寸。
     // 只有尺寸不同才走 StretchBlt；正常三台 4K 情况仍是无缩放的 BitBlt。
     checked_pixels(source_width, source_height)?;
@@ -329,19 +351,28 @@ fn capture_rect_from_screen(
         || output_height > MAX_CAPTURE_DIM
         || output_pixels > MAX_WINDOW_CAPTURE_PIXELS
     {
-        return Err(format!(
-            "显示器输出尺寸 {}x{} 超出截图限制",
-            output_width, output_height
+        return Err(ToolError::new(
+            LIMIT_EXCEEDED,
+            format!(
+                "显示器输出尺寸 {}x{} 超出截图限制",
+                output_width, output_height
+            ),
         ));
     }
     let hbm = unsafe { CreateCompatibleBitmap(hdc_screen, output_width, output_height) };
     if hbm.0.is_null() {
-        return Err("CreateCompatibleBitmap 未能分配屏幕截图位图".into());
+        return Err(ToolError::new(
+            CAPTURE_FAILED,
+            "CreateCompatibleBitmap 未能分配屏幕截图位图",
+        ));
     }
     let _bitmap = GdiHandle::Bitmap(hbm);
     let hdc_mem = unsafe { CreateCompatibleDC(Some(hdc_screen)) };
     if hdc_mem.0.is_null() {
-        return Err("CreateCompatibleDC 未能创建屏幕截图设备上下文".into());
+        return Err(ToolError::new(
+            CAPTURE_FAILED,
+            "CreateCompatibleDC 未能创建屏幕截图设备上下文",
+        ));
     }
     let _mem_dc = GdiHandle::MemDc(hdc_mem);
     unsafe {
@@ -397,7 +428,7 @@ fn capture_rect_from_screen(
         }
     };
     if let Err(e) = copied {
-        Err(format!("屏幕像素复制失败: {e}"))
+        Err(ToolError::new(CAPTURE_FAILED, format!("屏幕像素复制失败: {e}")))
     } else {
         let lines = unsafe {
             GetDIBits(
@@ -411,7 +442,7 @@ fn capture_rect_from_screen(
             )
         };
         if lines <= 0 {
-            Err("GetDIBits 未返回任何位图行".into())
+            Err(ToolError::new(CAPTURE_FAILED, "GetDIBits 未返回任何位图行"))
         } else {
             let mut rgba = Vec::with_capacity(bgra.len());
             for px in bgra.chunks_exact(4) {
@@ -422,7 +453,7 @@ fn capture_rect_from_screen(
     }
 }
 
-fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, ToolError> {
     let mut out = Vec::new();
     {
         let mut encoder = png::Encoder::new(&mut out, width, height);
@@ -430,10 +461,10 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder
             .write_header()
-            .map_err(|e| format!("PNG 编码失败: {e}"))?;
+            .map_err(|e| ToolError::new(CAPTURE_FAILED, format!("PNG 编码失败: {e}")))?;
         writer
             .write_image_data(rgba)
-            .map_err(|e| format!("PNG 写图像失败: {e}"))?;
+            .map_err(|e| ToolError::new(CAPTURE_FAILED, format!("PNG 写图像失败: {e}")))?;
     }
     Ok(out)
 }
@@ -446,15 +477,21 @@ pub fn capture_client_region_bgra(
     y: i32,
     width: i32,
     height: i32,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, ToolError> {
     if width <= 0 || height <= 0 {
-        return Err(format!("扫描区域尺寸必须为正数，实际为 {width}x{height}"));
+        return Err(ToolError::new(
+            INVALID_ARGUMENT,
+            format!("扫描区域尺寸必须为正数，实际为 {width}x{height}"),
+        ));
     }
     let pixels = checked_pixels(width, height)?;
     if pixels > MAX_WINDOW_CAPTURE_PIXELS {
-        return Err(format!(
-            "扫描区域 {width}x{height} 超过上限（{} 像素）",
-            MAX_WINDOW_CAPTURE_PIXELS
+        return Err(ToolError::new(
+            LIMIT_EXCEEDED,
+            format!(
+                "扫描区域 {width}x{height} 超过上限（{} 像素）",
+                MAX_WINDOW_CAPTURE_PIXELS
+            ),
         ));
     }
     let client = client_rect_of(hwnd)?;
@@ -467,24 +504,33 @@ pub fn capture_client_region_bgra(
         || region_right > i64::from(client_width)
         || region_bottom > i64::from(client_height)
     {
-        return Err(format!(
-            "扫描区域 ({x},{y}) {width}x{height} 超出窗口客户区 {client_width}x{client_height}"
+        return Err(ToolError::new(
+            INVALID_ARGUMENT,
+            format!(
+                "扫描区域 ({x},{y}) {width}x{height} 超出窗口客户区 {client_width}x{client_height}"
+            ),
         ));
     }
 
     let hdc_screen = unsafe { GetDC(None) };
     if hdc_screen.0.is_null() {
-        return Err("GetDC 未返回屏幕设备上下文".into());
+        return Err(ToolError::new(CAPTURE_FAILED, "GetDC 未返回屏幕设备上下文"));
     }
     let _screen_dc = GdiHandle::ScreenDc(hdc_screen);
     let hbm = unsafe { CreateCompatibleBitmap(hdc_screen, width, height) };
     if hbm.0.is_null() {
-        return Err("CreateCompatibleBitmap 未能分配扫描位图".into());
+        return Err(ToolError::new(
+            CAPTURE_FAILED,
+            "CreateCompatibleBitmap 未能分配扫描位图",
+        ));
     }
     let _bitmap = GdiHandle::Bitmap(hbm);
     let hdc_mem = unsafe { CreateCompatibleDC(Some(hdc_screen)) };
     if hdc_mem.0.is_null() {
-        return Err("CreateCompatibleDC 未能创建扫描设备上下文".into());
+        return Err(ToolError::new(
+            CAPTURE_FAILED,
+            "CreateCompatibleDC 未能创建扫描设备上下文",
+        ));
     }
     let _mem_dc = GdiHandle::MemDc(hdc_mem);
     unsafe {
@@ -517,7 +563,7 @@ pub fn capture_client_region_bgra(
     }
     .is_ok();
     if !copied {
-        Err("扫描区域像素复制失败".to_string())
+        Err(ToolError::new(CAPTURE_FAILED, "扫描区域像素复制失败"))
     } else {
         let lines = unsafe {
             GetDIBits(
@@ -531,7 +577,10 @@ pub fn capture_client_region_bgra(
             )
         };
         if lines <= 0 {
-            Err("GetDIBits 未返回任何扫描像素行".into())
+            Err(ToolError::new(
+                CAPTURE_FAILED,
+                "GetDIBits 未返回任何扫描像素行",
+            ))
         } else {
             Ok(bgra)
         }
@@ -560,5 +609,14 @@ mod tests {
             fit_capture_dimensions(3840, 2160, MAX_WINDOW_CAPTURE_PIXELS, scale).unwrap();
         assert!(checked_pixels(width, height).unwrap() * 4 <= MAX_ALL_CAPTURE_PIXELS);
         assert!(width < 3840 && height < 2160);
+    }
+
+    #[test]
+    fn capture_errors_carry_stable_codes() {
+        let too_big = fit_capture_dimensions(3840, 2160, 1_000, 1.0);
+        assert!(too_big.is_ok());
+        let bad_pixels = checked_pixels(0, 10).unwrap_err();
+        assert_eq!(bad_pixels.code, INVALID_ARGUMENT);
+        assert!(!bad_pixels.retryable);
     }
 }

@@ -10,6 +10,9 @@ use crate::backend::{
     input::send_input,
     window::{collect_windows, entry_for_hwnd, foreground_hwnd, hwnd_num, hwnd_str, WindowEntry},
 };
+use crate::error::{
+    ToolError, INTERNAL_ERROR, INVALID_ARGUMENT, WINDOW_NOT_FOUND, WINDOW_NOT_VISIBLE,
+};
 use crate::parse::{json_i32, json_u32, parse_hex_color, parse_hwnd_str};
 
 pub const TOOL_LIST: &str = "list_windows";
@@ -29,7 +32,7 @@ const MAX_SCAN_BANDS: usize = 256;
 // 工具实现
 // ---------------------------------------------------------------------------
 
-pub fn list_windows(args: &Value) -> Result<Value, String> {
+pub fn list_windows(args: &Value) -> Result<Value, ToolError> {
     let title = args.get("title").and_then(Value::as_str).unwrap_or("");
     let class = args.get("class").and_then(Value::as_str).unwrap_or("");
     let pid = json_u32(args, "pid")?;
@@ -89,7 +92,7 @@ pub fn list_windows(args: &Value) -> Result<Value, String> {
         "count": rows.len(),
         "windows": rows
     }))
-    .map_err(|e| format!("JSON 序列化失败: {e}"))?;
+    .map_err(|e| ToolError::new(INTERNAL_ERROR, format!("JSON 序列化失败: {e}")))?;
     Ok(json!({"content": [{"type": "text", "text": text}]}))
 }
 
@@ -97,7 +100,7 @@ pub fn list_windows(args: &Value) -> Result<Value, String> {
 // 目标窗口解析: hwnd / title / pid 三选一
 // ---------------------------------------------------------------------------
 
-fn resolve_target(args: &Value) -> Result<HWND, String> {
+fn resolve_target(args: &Value) -> Result<HWND, ToolError> {
     let has_hwnd = args.get("hwnd").is_some();
     let has_title = args
         .get("title")
@@ -107,7 +110,10 @@ fn resolve_target(args: &Value) -> Result<HWND, String> {
     let selector_count = usize::from(has_hwnd) + usize::from(has_title) + usize::from(has_pid);
     // 模糊标题、PID 与 HWND 叠加会掩盖调用者意图；强制唯一定位方式。
     if selector_count != 1 {
-        return Err("必须且只能提供一种定位方式：hwnd / title / pid".into());
+        return Err(ToolError::new(
+            INVALID_ARGUMENT,
+            "必须且只能提供一种定位方式：hwnd / title / pid",
+        ));
     }
 
     if let Some(hs) = args.get("hwnd") {
@@ -116,11 +122,14 @@ fn resolve_target(args: &Value) -> Result<HWND, String> {
             if s.trim().eq_ignore_ascii_case("@active") {
                 let hwnd = foreground_hwnd();
                 if hwnd.0.is_null() {
-                    return Err("当前没有可用的前台窗口".into());
+                    return Err(ToolError::new(WINDOW_NOT_FOUND, "当前没有可用的前台窗口"));
                 }
                 let entry = entry_for_hwnd(hwnd)?;
                 if !entry.visible {
-                    return Err("当前前台窗口不可见，无法作为 @active 目标".into());
+                    return Err(ToolError::new(
+                        WINDOW_NOT_VISIBLE,
+                        "当前前台窗口不可见，无法作为 @active 目标",
+                    ));
                 }
                 return Ok(hwnd);
             }
@@ -128,7 +137,10 @@ fn resolve_target(args: &Value) -> Result<HWND, String> {
         } else if let Some(n) = hs.as_i64() {
             n
         } else {
-            return Err("hwnd 必须是十进制字符串或整数".into());
+            return Err(ToolError::new(
+                INVALID_ARGUMENT,
+                "hwnd 必须是十进制字符串或整数",
+            ));
         };
         let hwnd = HWND(raw as isize as *mut core::ffi::c_void);
         entry_for_hwnd(hwnd)?;
@@ -154,10 +166,13 @@ fn resolve_target(args: &Value) -> Result<HWND, String> {
         visible_entries
     };
     if pool.is_empty() {
-        return Err(format!(
-            "未找到匹配窗口 (title='{title}', pid={})。可先运行 list_windows 查句柄",
-            pid.map(|p| p.to_string())
-                .unwrap_or_else(|| "-".to_string())
+        return Err(ToolError::new(
+            WINDOW_NOT_FOUND,
+            format!(
+                "未找到匹配窗口 (title='{title}', pid={})。可先运行 list_windows 查句柄",
+                pid.map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            ),
         ));
     }
     // 前台窗口优先,否则取面积最大的
@@ -171,18 +186,24 @@ fn resolve_target(args: &Value) -> Result<HWND, String> {
     });
     let best = &pool[0];
     if !best.visible {
-        return Err(format!(
-            "匹配到窗口但不可见: hwnd={} title='{}' 。请改用 hwnd 精确指定",
-            best.hwnd, best.title
+        return Err(ToolError::new(
+            WINDOW_NOT_VISIBLE,
+            format!(
+                "匹配到窗口但不可见: hwnd={} title='{}' 。请改用 hwnd 精确指定",
+                best.hwnd, best.title
+            ),
         ));
     }
     Ok(HWND(best.hwnd as *mut core::ffi::c_void))
 }
 
 /// 带副作用或单查工具不接受模糊标题/PID，避免调用方在多窗口场景误操作。
-fn resolve_explicit_hwnd(args: &Value) -> Result<HWND, String> {
+fn resolve_explicit_hwnd(args: &Value) -> Result<HWND, ToolError> {
     if args.get("hwnd").is_none() || args.get("title").is_some() || args.get("pid").is_some() {
-        return Err("此工具必须只提供 hwnd（可为 @active），不接受 title 或 pid".into());
+        return Err(ToolError::new(
+            INVALID_ARGUMENT,
+            "此工具必须只提供 hwnd（可为 @active），不接受 title 或 pid",
+        ));
     }
     resolve_target(args)
 }
@@ -256,16 +277,16 @@ fn merge_color_bands(colors: &[(u8, u8, u8)], tolerance: u8, min_band: usize) ->
 
 /// 在窗口客户区内沿 x 指定的垂直列扫描屏幕像素，输出颜色带列表。
 /// 用于布局验证：面板边界、控件高度、占位空隙一类的断言。
-fn pixel_scan_line(hwnd: HWND, args: &Value) -> Result<Value, String> {
+fn pixel_scan_line(hwnd: HWND, args: &Value) -> Result<Value, ToolError> {
     let x = json_i32(args, "x", true)?.expect("required value checked above");
     let y_from = json_i32(args, "y_from", true)?.expect("required value checked above");
     let y_to = json_i32(args, "y_to", true)?.expect("required value checked above");
     if y_to <= y_from {
-        return Err("y_to 必须大于 y_from".into());
+        return Err(ToolError::new(INVALID_ARGUMENT, "y_to 必须大于 y_from"));
     }
     let scan_height = y_to
         .checked_sub(y_from)
-        .ok_or("y_to - y_from 超出 32 位整数范围")?;
+        .ok_or_else(|| ToolError::new(INVALID_ARGUMENT, "y_to - y_from 超出 32 位整数范围"))?;
     let tolerance = json_i32(args, "tolerance", false)?
         .unwrap_or(2)
         .clamp(0, 255) as u8;
@@ -315,11 +336,11 @@ fn pixel_scan_line(hwnd: HWND, args: &Value) -> Result<Value, String> {
 }
 
 /// 在窗口客户区的矩形区域内查找与目标颜色匹配的像素，返回计数与最小包围盒。
-fn pixel_find_color(hwnd: HWND, args: &Value) -> Result<Value, String> {
+fn pixel_find_color(hwnd: HWND, args: &Value) -> Result<Value, ToolError> {
     let color_arg = args
         .get("color")
         .and_then(Value::as_str)
-        .ok_or("color 参数缺失（#RRGGBB 格式）")?;
+        .ok_or_else(|| ToolError::new(INVALID_ARGUMENT, "color 参数缺失（#RRGGBB 格式）"))?;
     let (r, g, b) = parse_hex_color(color_arg)?;
     let tolerance = json_i32(args, "tolerance", false)?
         .unwrap_or(0)
@@ -534,7 +555,7 @@ pub fn tools_list() -> Value {
     ]})
 }
 
-pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, String> {
+pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
     match name {
         TOOL_LIST => list_windows(args),
         TOOL_GET_RECT => crate::backend::window::get_window_rect(resolve_explicit_hwnd(args)?),
@@ -581,7 +602,7 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, String> {
         TOOL_PIXEL_SCAN_LINE => pixel_scan_line(resolve_explicit_hwnd(args)?, args),
         TOOL_PIXEL_FIND_COLOR => pixel_find_color(resolve_explicit_hwnd(args)?, args),
         TOOL_SEND_INPUT => send_input(resolve_explicit_hwnd(args)?, args),
-        _ => Err(format!("未知工具 '{name}'")),
+        _ => Err(ToolError::new(INVALID_ARGUMENT, format!("未知工具 '{name}'"))),
     }
 }
 

@@ -6,6 +6,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use serde_json::{json, Value};
 
+use crate::error::ToolError;
 use crate::tools;
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -18,10 +19,14 @@ fn jsonrpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}})
 }
 
-fn mcp_tool_error(message: impl Into<String>) -> Value {
+/// 工具错误响应:保留 MCP 惯用形状(content[text] + isError),
+/// 同时新增 `error_code`/`retryable` 供调用方按错误契约分支决策。向后兼容。
+fn mcp_tool_error(error: ToolError) -> Value {
     json!({
-        "content": [{"type": "text", "text": message.into()}],
-        "isError": true
+        "content": [{"type": "text", "text": error.message}],
+        "isError": true,
+        "error_code": error.code,
+        "retryable": error.retryable
     })
 }
 
@@ -69,7 +74,7 @@ fn handle_request(request: &Value) -> Option<Value> {
                 .unwrap_or_else(|| json!({}));
             match tools::handle_tool_call(name, &args) {
                 Ok(result) => jsonrpc_result(id, result),
-                Err(message) => jsonrpc_result(id, mcp_tool_error(message)),
+                Err(error) => jsonrpc_result(id, mcp_tool_error(error)),
             }
         }
         _ => jsonrpc_error(id, -32601, "Method not found"),
@@ -145,6 +150,21 @@ pub fn serve_stdio() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_errors_keep_mcp_shape_and_add_error_code() {
+        // 错误响应必须保留 content[text]+isError(旧调用方),并新增错误契约字段。
+        let request = json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "get_window_rect", "arguments": {}}
+        });
+        let response = handle_request(&request).unwrap();
+        let result = &response["result"];
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"].as_str().unwrap().contains("hwnd"));
+        assert_eq!(result["error_code"], crate::error::INVALID_ARGUMENT);
+        assert_eq!(result["retryable"], false);
+    }
 
     #[test]
     fn isolates_panic_into_jsonrpc_error() {

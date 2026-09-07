@@ -14,6 +14,7 @@ use windows::{
     },
 };
 
+use crate::error::{ToolError, ACTIVATION_DENIED, INVALID_ARGUMENT, LIMIT_EXCEEDED, NOT_FOREGROUND, WINDOW_NOT_FOUND};
 use crate::parse::json_i32;
 
 use super::capture::MAX_CAPTURE_DIM;
@@ -116,21 +117,23 @@ pub fn collect_windows() -> Vec<WindowEntry> {
     all
 }
 
-pub fn rect_of(hwnd: HWND) -> Result<RECT, String> {
+pub fn rect_of(hwnd: HWND) -> Result<RECT, ToolError> {
     let mut rect = RECT {
         left: 0,
         top: 0,
         right: 0,
         bottom: 0,
     };
-    unsafe { GetWindowRect(hwnd, &mut rect) }.map_err(|e| format!("GetWindowRect 失败: {e}"))?;
+    unsafe { GetWindowRect(hwnd, &mut rect) }
+        .map_err(|e| ToolError::new(WINDOW_NOT_FOUND, format!("GetWindowRect 失败: {e}")))?;
     Ok(rect)
 }
 
 /// 将客户区左上/右下坐标转换成虚拟桌面物理坐标，供 `client_only` 返回一致的屏幕矩形。
-pub fn client_rect_of(hwnd: HWND) -> Result<RECT, String> {
+pub fn client_rect_of(hwnd: HWND) -> Result<RECT, ToolError> {
     let mut client = RECT::default();
-    unsafe { GetClientRect(hwnd, &mut client) }.map_err(|e| format!("GetClientRect 失败: {e}"))?;
+    unsafe { GetClientRect(hwnd, &mut client) }
+        .map_err(|e| ToolError::new(WINDOW_NOT_FOUND, format!("GetClientRect 失败: {e}")))?;
     let mut top_left = POINT {
         x: client.left,
         y: client.top,
@@ -140,10 +143,10 @@ pub fn client_rect_of(hwnd: HWND) -> Result<RECT, String> {
         y: client.bottom,
     };
     if !unsafe { ClientToScreen(hwnd, &mut top_left) }.as_bool() {
-        return Err("ClientToScreen(左上) 失败".into());
+        return Err(ToolError::new(WINDOW_NOT_FOUND, "ClientToScreen(左上) 失败"));
     }
     if !unsafe { ClientToScreen(hwnd, &mut bottom_right) }.as_bool() {
-        return Err("ClientToScreen(右下) 失败".into());
+        return Err(ToolError::new(WINDOW_NOT_FOUND, "ClientToScreen(右下) 失败"));
     }
     Ok(RECT {
         left: top_left.x,
@@ -154,7 +157,7 @@ pub fn client_rect_of(hwnd: HWND) -> Result<RECT, String> {
 }
 
 /// 单个窗口的条目快照（含可见性/最小化状态），供选择器解析与查询工具使用。
-pub fn entry_for_hwnd(hwnd: HWND) -> Result<WindowEntry, String> {
+pub fn entry_for_hwnd(hwnd: HWND) -> Result<WindowEntry, ToolError> {
     let rect = rect_of(hwnd)?;
     let mut pid = 0u32;
     unsafe {
@@ -175,13 +178,16 @@ pub fn entry_for_hwnd(hwnd: HWND) -> Result<WindowEntry, String> {
 }
 
 /// 输入注入前的前台校验:目标已不是前台窗口时拒绝,避免输入落到其他窗口。
-pub fn ensure_input_foreground(hwnd: HWND) -> Result<(), String> {
+pub fn ensure_input_foreground(hwnd: HWND) -> Result<(), ToolError> {
     let foreground = foreground_hwnd();
     if foreground != hwnd {
-        return Err(format!(
-            "输入执行前目标窗口失去前台状态：前台 hwnd={}，目标 hwnd={}",
-            hwnd_str(foreground),
-            hwnd_str(hwnd)
+        return Err(ToolError::new(
+            NOT_FOREGROUND,
+            format!(
+                "输入执行前目标窗口失去前台状态：前台 hwnd={}，目标 hwnd={}",
+                hwnd_str(foreground),
+                hwnd_str(hwnd)
+            ),
         ));
     }
     Ok(())
@@ -189,14 +195,17 @@ pub fn ensure_input_foreground(hwnd: HWND) -> Result<(), String> {
 
 /// 调整窗口尺寸(可选移动)。所有外部数值先经 json_i32 验证。
 /// 返回应用后的外框,调用方负责组装 MCP 响应。
-pub fn resize_window(hwnd: HWND, args: &Value) -> Result<Value, String> {
+pub fn resize_window(hwnd: HWND, args: &Value) -> Result<Value, ToolError> {
     let width = json_i32(args, "width", true)?.expect("required value checked above");
     let height = json_i32(args, "height", true)?.expect("required value checked above");
     if width < 40 || height < 40 {
-        return Err("width/height 不能小于 40".into());
+        return Err(ToolError::new(INVALID_ARGUMENT, "width/height 不能小于 40"));
     }
     if width > MAX_CAPTURE_DIM || height > MAX_CAPTURE_DIM {
-        return Err(format!("width/height 不能超过 {}", MAX_CAPTURE_DIM));
+        return Err(ToolError::new(
+            LIMIT_EXCEEDED,
+            format!("width/height 不能超过 {}", MAX_CAPTURE_DIM),
+        ));
     }
     let before = rect_of(hwnd)?;
     let x = json_i32(args, "x", false)?.unwrap_or(before.left);
@@ -212,7 +221,7 @@ pub fn resize_window(hwnd: HWND, args: &Value) -> Result<Value, String> {
             SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE,
         )
     }
-    .map_err(|e| format!("SetWindowPos 失败: {e}"))?;
+    .map_err(|e| ToolError::new(WINDOW_NOT_FOUND, format!("SetWindowPos 失败: {e}")))?;
     let after = rect_of(hwnd)?;
     let text = json!({
         "hwnd": hwnd_str(hwnd),
@@ -223,7 +232,7 @@ pub fn resize_window(hwnd: HWND, args: &Value) -> Result<Value, String> {
 }
 
 /// 返回单一窗口的外框与客户区，避免在窗口很多时让模型重复读取完整列表。
-pub fn get_window_rect(hwnd: HWND) -> Result<Value, String> {
+pub fn get_window_rect(hwnd: HWND) -> Result<Value, ToolError> {
     let entry = entry_for_hwnd(hwnd)?;
     let client = client_rect_of(hwnd)?;
     Ok(json!({
@@ -245,20 +254,26 @@ pub fn get_window_rect(hwnd: HWND) -> Result<Value, String> {
 
 /// 请求 Windows 将一个精确 HWND 放到前台。Windows 焦点窃取保护可能拒绝该请求；
 /// 失败时明确返回错误，而不是假装截图已聚焦。
-pub fn window_activate(hwnd: HWND) -> Result<Value, String> {
+pub fn window_activate(hwnd: HWND) -> Result<Value, ToolError> {
     entry_for_hwnd(hwnd)?;
     if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
-        return Err(format!(
-            "SetForegroundWindow 拒绝激活 hwnd={}（Windows 焦点限制或窗口已失效）",
-            hwnd_str(hwnd)
+        return Err(ToolError::new(
+            ACTIVATION_DENIED,
+            format!(
+                "SetForegroundWindow 拒绝激活 hwnd={}（Windows 焦点限制或窗口已失效）",
+                hwnd_str(hwnd)
+            ),
         ));
     }
     let foreground = foreground_hwnd();
     if foreground != hwnd {
-        return Err(format!(
-            "窗口激活请求未生效：前台 hwnd={}，目标 hwnd={}",
-            hwnd_str(foreground),
-            hwnd_str(hwnd)
+        return Err(ToolError::new(
+            ACTIVATION_DENIED,
+            format!(
+                "窗口激活请求未生效：前台 hwnd={}，目标 hwnd={}",
+                hwnd_str(foreground),
+                hwnd_str(hwnd)
+            ),
         ));
     }
     Ok(json!({"content": [{"type": "text", "text": json!({

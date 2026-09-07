@@ -128,7 +128,16 @@ impl Drop for GdiHandle {
     }
 }
 
-pub fn capture_window(hwnd: HWND, client_only: bool) -> Result<(Vec<u8>, RECT), ToolError> {
+/// 窗口截图结果:PNG 数据、屏幕矩形与回退标注。
+/// `fallback=Some(...)` 表示 PrintWindow 路径未产出可用图像,已改用屏幕采样,
+/// 内容是窗口矩形区域在当前屏幕上的实际显示(遮挡与阴影按屏幕现状)。
+pub struct WindowCapture {
+    pub png: Vec<u8>,
+    pub rect: RECT,
+    pub fallback: Option<&'static str>,
+}
+
+pub fn capture_window(hwnd: HWND, client_only: bool) -> Result<WindowCapture, ToolError> {
     // 挂起预检在主线程完成(快速内核查询),挂起窗口直接给结构化错误,
     // 绝不进入 PrintWindow——那是把 WM_PRINT 投递进目标线程的阻塞调用。
     if is_window_hung(hwnd) {
@@ -151,7 +160,7 @@ fn hwnd_num_str(hwnd: HWND) -> String {
     (hwnd.0 as isize).to_string()
 }
 
-fn capture_window_inner(hwnd: HWND, client_only: bool) -> Result<(Vec<u8>, RECT), ToolError> {
+fn capture_window_inner(hwnd: HWND, client_only: bool) -> Result<WindowCapture, ToolError> {
     let rect = if client_only {
         client_rect_of(hwnd)?
     } else {
@@ -208,12 +217,37 @@ fn capture_window_inner(hwnd: HWND, client_only: bool) -> Result<(Vec<u8>, RECT)
     } else {
         PW_RENDERFULLCONTENT
     };
-    let png = render_window_png(hwnd, hdc_mem, hbm, width, height, flags);
-    png.map(|bytes| (bytes, rect))
+    match print_window_bgra(hwnd, hdc_mem, hbm, width, height, flags) {
+        Ok(bgra) if !bgra_looks_black(&bgra) => {
+            let png = bgra_to_rgba_png(width, height, &bgra)?;
+            Ok(WindowCapture {
+                png,
+                rect,
+                fallback: None,
+            })
+        }
+        printed => {
+            // GPU 加速窗口的 PrintWindow 常产出近纯黑,或直接失败:
+            // 回退屏幕采样(与像素扫描工具同源,免疫 PrintWindow 黑屏)。
+            let reason = if printed.is_ok() {
+                "screen (PrintWindow 近纯黑)"
+            } else {
+                "screen (PrintWindow 失败)"
+            };
+            let png = capture_rect_from_screen(
+                hdc_screen, width, height, width, height, rect.left, rect.top,
+            )?;
+            Ok(WindowCapture {
+                png,
+                rect,
+                fallback: Some(reason),
+            })
+        }
+    }
 }
 
-/// PrintWindow(PW_RENDERFULLCONTENT) → 32bpp DIB → BGRA→RGBA → PNG
-fn render_window_png(
+/// PrintWindow → 32bpp DIB,返回自上而下的原始 BGRA(由调用方检测黑屏后再编码)。
+fn print_window_bgra(
     hwnd: HWND,
     hdc_mem: HDC,
     hbm: HBITMAP,
@@ -257,7 +291,33 @@ fn render_window_png(
     if lines <= 0 {
         return Err(ToolError::new(CAPTURE_FAILED, "GetDIBits 未返回任何位图行"));
     }
+    Ok(bgra)
+}
 
+/// 近纯黑检测:PrintWindow 对 GPU 加速窗口常产出全黑/透明帧。
+/// 亮度 < BLACK_PIXEL_THRESHOLD 的像素占比超过 BLACK_RATIO 即判定为不可用。
+/// 注意:兼容位图经 GetDIBits 转 32bpp 后 alpha 通道不可靠,只按 RGB 判定。
+const BLACK_PIXEL_THRESHOLD: u8 = 8;
+const BLACK_RATIO: f64 = 0.98;
+
+fn bgra_looks_black(bgra: &[u8]) -> bool {
+    if bgra.len() < 4 {
+        return true;
+    }
+    let mut dark = 0u64;
+    for px in bgra.chunks_exact(4) {
+        if px[2] < BLACK_PIXEL_THRESHOLD
+            && px[1] < BLACK_PIXEL_THRESHOLD
+            && px[0] < BLACK_PIXEL_THRESHOLD
+        {
+            dark += 1;
+        }
+    }
+    dark as f64 / (bgra.len() / 4) as f64 > BLACK_RATIO
+}
+
+/// BGRA → RGBA → PNG(窗口与屏幕两条采集路径共用)。
+fn bgra_to_rgba_png(width: i32, height: i32, bgra: &[u8]) -> Result<Vec<u8>, ToolError> {
     let mut rgba = Vec::with_capacity(bgra.len());
     for px in bgra.chunks_exact(4) {
         rgba.extend_from_slice(&[px[2], px[1], px[0], 0xFF]); // BGRA → RGBA
@@ -502,11 +562,7 @@ fn capture_rect_from_screen(
         if lines <= 0 {
             Err(ToolError::new(CAPTURE_FAILED, "GetDIBits 未返回任何位图行"))
         } else {
-            let mut rgba = Vec::with_capacity(bgra.len());
-            for px in bgra.chunks_exact(4) {
-                rgba.extend_from_slice(&[px[2], px[1], px[0], 0xFF]);
-            }
-            encode_png(output_width as u32, output_height as u32, &rgba)
+            bgra_to_rgba_png(output_width, output_height, &bgra)
         }
     }
 }
@@ -695,5 +751,19 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_millis(250));
         // 等 worker 自然退出,避免测试进程残留线程。
         std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+
+    #[test]
+    fn detects_near_black_printwindow_output() {
+        let all_black = vec![0u8; 100 * 4]; // RGB 全 0(alpha 无关,只看 RGB)
+        assert!(bgra_looks_black(&all_black));
+        // 99% 黑 + 1 个亮点仍判黑(比例 > 0.98)
+        let mut sparse = vec![0u8; 100 * 4];
+        sparse[..4].copy_from_slice(&[255, 255, 255, 255]);
+        assert!(bgra_looks_black(&sparse));
+        // 亮度 16 ≥ 阈值 8,不算黑
+        let bright = vec![16u8; 100 * 4];
+        assert!(!bgra_looks_black(&bright));
+        assert!(bgra_looks_black(&[]));
     }
 }

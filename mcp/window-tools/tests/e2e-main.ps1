@@ -52,13 +52,17 @@ try {
   $lw = Send-Tool 'list_windows' @{ limit=50 }
   $p = Tool-Payload $lw
   Check 'list_windows' ($p -and $p.count -gt 0) ("windows=" + $p.count)
+  $lwAll = Send-Tool 'list_windows' @{ limit=50; interactive_only=$false }
+  $pAll = Tool-Payload $lwAll
+  Check 'list_windows interactive_only narrows default' ($pAll.count -ge $p.count) ("interactive=" + $p.count + " all-visible=" + $pAll.count)
   Write-Output ("      sample: class=" + $p.windows[0].class + " hwnd=" + $p.windows[0].hwnd + " visible=" + $p.windows[0].visible)
   $lwP = Send-Tool 'list_windows' @{ pid=[int]$p.windows[0].pid; visible_only=$true }
   Check 'list_windows pid-filter' ($null -ne (Tool-Payload $lwP)) ("matches=" + (Tool-Payload $lwP).count)
   $lwT = Send-Tool 'list_windows' @{ title='__no_such_window__zz' }
   Check 'list_windows title-filter empty' ((Tool-Payload $lwT).count -eq 0) "empty as expected"
   $lwL = Send-Tool 'list_windows' @{ limit=501 }
-  Write-Output ("      limit=501 -> isError=" + $lwL.result.isError + " : " + $lwL.result.content[0].text)
+  $pl = Tool-Payload $lwL
+  Check 'list_windows limit clamp 501->500' ((-not $lwL.result.isError) -and $pl.count -le 500) ("count=" + $pl.count)
 
   # --- get_window_rect ---
   $gr = Send-Tool 'get_window_rect' @{ hwnd='@active' }
@@ -89,6 +93,9 @@ try {
   $lwn = Send-Tool 'list_windows' @{ pid=$np.Id }
   $pn = Tool-Payload $lwn
   Check 'find winver window' ($pn -and $pn.count -gt 0) ("pid=" + $np.Id + " hwnd=" + $pn.windows[0].hwnd)
+  $null = $np.Refresh()
+  $titleFull = $np.MainWindowTitle
+  Check 'list_windows full title' ($pn.windows[0].title -eq $titleFull -and $titleFull.Length -ge 2) ("title=" + $pn.windows[0].title + " expected=" + $titleFull)
   $nh = [string]$pn.windows[0].hwnd
 
   $rz = Send-Tool 'resize_window' @{ hwnd=$nh; width=500; height=400 }

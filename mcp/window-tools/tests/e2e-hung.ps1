@@ -78,8 +78,9 @@ try {
   Check 'hang-window maker really hangs' $hungFlag "IsHungAppWindow=true"
 
   # 2) 枚举不卡:挂起窗口在桌面时 list_windows 必须限时完成
+  # (挂起窗口标题不可读,会被默认 interactive_only 启发式过滤;此处显式关掉以断言枚举本身)
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  $lw = Send-Tool 'list_windows' @{ pid=$hangProc.Id }
+  $lw = Send-Tool 'list_windows' @{ pid=$hangProc.Id; interactive_only=$false }
   $sw.Stop()
   $lp = $lw.result.content[0].text | ConvertFrom-Json
   $found = $lp.count -ge 1

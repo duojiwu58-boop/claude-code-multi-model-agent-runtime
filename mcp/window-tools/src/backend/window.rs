@@ -7,10 +7,10 @@ use windows::{
         Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
         Graphics::Gdi::ClientToScreen,
         UI::WindowsAndMessaging::{
-            EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowRect,
-            GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible,
-            SendMessageTimeoutW, SetForegroundWindow, SetWindowPos, SMTO_ABORTIFHUNG,
-            SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, WM_GETTEXT,
+            EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowLongPtrW,
+            GetWindowRect, GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible,
+            SendMessageTimeoutW, SetForegroundWindow, SetWindowPos, GWL_EXSTYLE, SMTO_ABORTIFHUNG,
+            SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, WM_GETTEXT, WS_EX_TOOLWINDOW,
         },
     },
 };
@@ -31,6 +31,8 @@ pub struct WindowEntry {
     pub class: String,
     pub visible: bool,
     pub minimized: bool,
+    /// 扩展样式(WS_EX_* 位),供交互窗口启发式过滤(如排除 WS_EX_TOOLWINDOW)。
+    pub ex_style: u32,
     pub left: i32,
     pub top: i32,
     pub width: i32,
@@ -65,9 +67,13 @@ const TITLE_QUERY_TIMEOUT_MS: u32 = 500;
 /// 标题读取不走 `GetWindowTextW`:它对其他进程窗口内部发 WM_GETTEXT,
 /// 目标线程挂起时调用方也会被拖死。改用 SendMessageTimeoutW + SMTO_ABORTIFHUNG,
 /// 挂起窗口的标题为空字符串,枚举照常完成。
+///
+/// 注意:SendMessageTimeoutW 的返回 LRESULT 只是"发送是否成功"(成功=1),
+/// WM_GETTEXT 实际拷贝的字符数在 lpdwResult 里,二者不可混淆。
 fn window_title(hwnd: HWND) -> String {
     let mut buf = [0u16; 512];
-    let result = unsafe {
+    let mut len = 0usize;
+    let ok = unsafe {
         SendMessageTimeoutW(
             hwnd,
             WM_GETTEXT,
@@ -75,13 +81,13 @@ fn window_title(hwnd: HWND) -> String {
             LPARAM(buf.as_mut_ptr() as isize),
             SMTO_ABORTIFHUNG,
             TITLE_QUERY_TIMEOUT_MS,
-            None,
+            Some(&mut len),
         )
     };
-    if result.0 <= 0 {
+    if ok.0 <= 0 {
         return String::new();
     }
-    let len = result.0 as usize;
+    let len = len.min(buf.len() - 1);
     String::from_utf16_lossy(&buf[..len])
 }
 
@@ -117,6 +123,7 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         bottom: 0,
     };
     let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
     out.push(WindowEntry {
         hwnd: hwnd_num(hwnd),
         pid,
@@ -124,6 +131,7 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL 
         class: window_class(hwnd),
         visible,
         minimized: entry_minimized(hwnd),
+        ex_style,
         left: rect.left,
         top: rect.top,
         width: rect.right - rect.left,
@@ -141,6 +149,18 @@ pub fn collect_windows() -> Vec<WindowEntry> {
         );
     }
     all
+}
+
+/// 人类可交互窗口启发式:排除输入法候选框、DWM 骨架、托盘隐藏宿主等噪点窗口。
+/// 尺寸阈值为物理像素;工具窗口(WS_EX_TOOLWINDOW)与无标题窗口默认不算交互目标。
+/// 仅用于 list_windows 的默认过滤,不影响按 hwnd/title/pid 的精确选择。
+pub fn entry_is_interactive(entry: &WindowEntry) -> bool {
+    entry.visible
+        && !entry.minimized
+        && entry.width >= 100
+        && entry.height >= 100
+        && entry.ex_style & WS_EX_TOOLWINDOW.0 == 0
+        && !entry.title.is_empty()
 }
 
 pub fn rect_of(hwnd: HWND) -> Result<RECT, ToolError> {
@@ -195,6 +215,7 @@ pub fn entry_for_hwnd(hwnd: HWND) -> Result<WindowEntry, ToolError> {
     unsafe {
         let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
     }
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
     Ok(WindowEntry {
         hwnd: hwnd_num(hwnd),
         pid,
@@ -202,6 +223,7 @@ pub fn entry_for_hwnd(hwnd: HWND) -> Result<WindowEntry, ToolError> {
         class: window_class(hwnd),
         visible: unsafe { IsWindowVisible(hwnd) }.as_bool(),
         minimized: entry_minimized(hwnd),
+        ex_style,
         left: rect.left,
         top: rect.top,
         width: rect.right - rect.left,
@@ -312,4 +334,51 @@ pub fn window_activate(hwnd: HWND) -> Result<Value, ToolError> {
         "hwnd": hwnd_str(hwnd),
         "activated": true
     }).to_string()}]}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interactive_heuristic_filters_noise_windows() {
+        let base = WindowEntry {
+            hwnd: 1,
+            pid: 2,
+            title: "Editor".to_string(),
+            class: "x".to_string(),
+            visible: true,
+            minimized: false,
+            ex_style: 0,
+            left: 0,
+            top: 0,
+            width: 800,
+            height: 600,
+        };
+        assert!(entry_is_interactive(&base));
+        assert!(!entry_is_interactive(&WindowEntry {
+            width: 99,
+            ..base.clone()
+        }));
+        assert!(!entry_is_interactive(&WindowEntry {
+            height: 99,
+            ..base.clone()
+        }));
+        assert!(!entry_is_interactive(&WindowEntry {
+            minimized: true,
+            ..base.clone()
+        }));
+        assert!(!entry_is_interactive(&WindowEntry {
+            title: String::new(),
+            ..base.clone()
+        }));
+        assert!(!entry_is_interactive(&WindowEntry {
+            visible: false,
+            ..base.clone()
+        }));
+        assert!(!entry_is_interactive(&WindowEntry {
+            ex_style: WS_EX_TOOLWINDOW.0,
+            ..base
+        }));
+    }
 }

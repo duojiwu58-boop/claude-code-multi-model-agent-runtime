@@ -8,7 +8,10 @@ use windows::Win32::Foundation::HWND;
 use crate::backend::{
     capture::{capture_all_monitors, capture_client_region_bgra, capture_window},
     input::send_input,
-    window::{collect_windows, entry_for_hwnd, foreground_hwnd, hwnd_num, hwnd_str, WindowEntry},
+    window::{
+        collect_windows, entry_for_hwnd, entry_is_interactive, foreground_hwnd, hwnd_num, hwnd_str,
+        WindowEntry,
+    },
 };
 use crate::error::{
     ToolError, INTERNAL_ERROR, INVALID_ARGUMENT, WINDOW_NOT_FOUND, WINDOW_NOT_VISIBLE,
@@ -42,6 +45,10 @@ pub fn list_windows(args: &Value) -> Result<Value, ToolError> {
         .get("visible_only")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let interactive_only = args
+        .get("interactive_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
@@ -63,6 +70,9 @@ pub fn list_windows(args: &Value) -> Result<Value, ToolError> {
     }
     if visible_only {
         entries.retain(|e| e.visible);
+    }
+    if interactive_only {
+        entries.retain(entry_is_interactive);
     }
     entries.sort_by(|a, b| {
         // 可见优先,不可标题为空,面积从大到小
@@ -412,7 +422,8 @@ pub fn tools_list() -> Value {
                     "class": {"type": "string", "description": "窗口类名子串过滤(忽略大小写)"},
                     "pid": {"type": "integer", "description": "按进程 PID 过滤"},
                     "visible_only": {"type": "boolean", "description": "只返回可见窗口,默认 true"},
-                    "limit": {"type": "integer", "description": "最多返回条数,默认 100,上限 500"}
+                    "interactive_only": {"type": "boolean", "description": "只返回人类可交互窗口(启发式:非最小化、≥100x100、非工具窗口、有标题),默认 true;false 返回全部(含输入法/托盘/DWM 骨架等噪点窗口)"},
+                    "limit": {"type": "integer", "description": "最多返回条数,默认 100,上限 500,超出按 500 钳制"}
                 },
                 "additionalProperties": false
             }
@@ -432,7 +443,7 @@ pub fn tools_list() -> Value {
         },
         {
             "name": TOOL_SCREENSHOT_WINDOW,
-            "description": "截取指定窗口的渲染内容。client_only=false（默认）包含标题栏和边框；true 仅截客户区。hwnd 可为 @active；其余定位必须且只能用 hwnd / title / pid 之一。单窗口最高 1200 万像素，超限请先 resize_window。部分 GPU 加速、受保护或无响应窗口可能无法截图。",
+            "description": "截取指定窗口的渲染内容。client_only=false（默认）包含标题栏和边框；true 仅截客户区。hwnd 可为 @active；其余定位必须且只能用 hwnd / title / pid 之一。单窗口最高 1200 万像素，超限请先 resize_window。PrintWindow 输出近纯黑(部分 GPU 加速窗口)或失败时自动回退屏幕采样，被遮挡区域按屏幕当前显示内容。",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
@@ -442,7 +453,6 @@ pub fn tools_list() -> Value {
                     "pid": {"type": "integer", "description": "窗口所属进程 PID"},
                     "client_only": {"type": "boolean", "description": "仅截客户区，默认 false"}
                 },
-                "oneOf": [{"required": ["hwnd"]}, {"required": ["title"]}, {"required": ["pid"]}],
                 "additionalProperties": false
             }
         },
@@ -573,15 +583,20 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
                 .get("client_only")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let (png, rect) = capture_window(hwnd, client_only)?;
+            let capture = capture_window(hwnd, client_only)?;
+            let fallback = capture
+                .fallback
+                .map(|reason| format!(" fallback={reason}"))
+                .unwrap_or_default();
             Ok(json!({
                 "content": [
                     {"type": "text", "text": format!(
-                        "窗口截图: hwnd={} client_only={} 矩形=({},{}) {}x{} 图像={} bytes",
-                        hwnd_str(hwnd), client_only, rect.left, rect.top,
-                        rect.right - rect.left, rect.bottom - rect.top, png.len()
+                        "窗口截图: hwnd={} client_only={} 矩形=({},{}) {}x{} 图像={} bytes{}",
+                        hwnd_str(hwnd), client_only, capture.rect.left, capture.rect.top,
+                        capture.rect.right - capture.rect.left,
+                        capture.rect.bottom - capture.rect.top, capture.png.len(), fallback
                     )},
-                    {"type": "image", "data": B64.encode(&png), "mimeType": "image/png"}
+                    {"type": "image", "data": B64.encode(&capture.png), "mimeType": "image/png"}
                 ]
             }))
         }
@@ -665,8 +680,16 @@ mod tests {
             screenshot["inputSchema"]["properties"]["client_only"]["type"],
             "boolean"
         );
+        // 客户端 schema 兼容:Claude Code 会静默丢弃含 oneOf 的工具;
+        // 定位排他性由 resolve_target 运行时强制,schema 不声明 required/oneOf。
+        assert!(screenshot["inputSchema"].get("oneOf").is_none());
+        assert!(screenshot["inputSchema"].get("required").is_none());
         let list = tools.iter().find(|tool| tool["name"] == TOOL_LIST).unwrap();
         assert_eq!(list["inputSchema"]["properties"]["class"]["type"], "string");
+        assert_eq!(
+            list["inputSchema"]["properties"]["interactive_only"]["type"],
+            "boolean"
+        );
         // 新扫描工具要求 hwnd 精确指定
         for name in [TOOL_PIXEL_SCAN_LINE, TOOL_PIXEL_FIND_COLOR, TOOL_SEND_INPUT] {
             let scan = tools.iter().find(|tool| tool["name"] == name).unwrap();

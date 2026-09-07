@@ -559,7 +559,8 @@ Google 文本 annotations 则原样保存在
   映射；`none` 会关闭 thinking 并移除 budget，非 `none` 值会把客户端的 disabled thinking 改为
   adaptive thinking；省略时严格保持原行为。该字段只控制发给上游的推理强度，不能覆盖 Claude Code
   客户端的上下文窗口、自动压缩阈值或代理编排。管理 API 会在 profile 顶层返回有效值。
-- `proxy`：可选，仅用于这个 Provider；省略表示直连。
+- `proxy`：可选，仅用于这个 Provider；省略表示直连。模型中心的“测试选中模型”探测会按此代理发出，
+  并在结果中显示实际使用的代理模式/URL（LocalGemini profile 沿用当前 Gemini 传输代理）。
 - `enabled`：可选，默认 `true`。设为 `false` 后保留文件但不显示该配置。
 - `vision`：可选，默认 `{"mode":"native"}`，即图片仍由当前 Provider 原生处理。
   对无视觉能力的模型可设为 `{"mode":"proxy"}`；此时默认由本地 Gemini
@@ -759,4 +760,9 @@ Claude Code 会话。源码开发使用 `scripts\start-bridge.ps1` 时，脚本�
 设置至少 32 字符的 `GEMINI_BRIDGE_LOCAL_TOKEN`，或让 `GEMINI_BRIDGE_LOCAL_TOKEN_FILE`
 指向受保护的令牌文件。
 除本机诊断用的 `/health` 和 `/v1/models` 外，Messages、Responses、Token Count、MCP 与
-全部 `/admin/*` 路由都需要 `Authorization: Bearer <local-token>`。
+全部 `/admin/*` 路由都需要 `Authorization: Bearer <local-token>`。模型中心的“测试选中模型”
+调用 `POST /admin/profiles/test`，负载为 `{"file": "<profile 文件名>"}`。该探测以只读方式
+解析所选 profile，按它自己的传输、上游 URL、模型、凭据与有效代理发出一次真实的最小推理
+（非流式、1 token、关闭 Thinking），返回 `status`、`latency_ms`、`transport`、
+`upstream_status` 与 `network` 分段耗时（`proxy_mode`/`proxy_url`、`response_headers_ms`、
+`first_byte_ms`、`response_body_ms`、`total_ms`）；`proxy_url` 与一切凭据在返回前都会脱敏。

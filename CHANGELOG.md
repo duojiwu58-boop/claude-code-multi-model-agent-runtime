@@ -7,7 +7,15 @@ All notable changes to **Claude Code Multi-Model Agent Runtime** will be documen
 
 ## English
 
-## [Unreleased]
+## [v0.9.0] - 2026-09-07
+
+### Model Connectivity Diagnostics and Model Center Probe
+
+- Added `POST /admin/profiles/test`: the bridge resolves a provider profile by file name and runs one real, non-streaming, 1-token minimum inference (thinking disabled) through the profile's own transport, upstream URL, model, credentials, and proxy-configured client — so a highlighted-but-not-active profile can be validated without switching or persisting the active model or racing live requests. Probes are side-effect free: Responses stores and Gemini interaction continuation caches are disabled for the probe, and a 30-second total budget (plus a 1 MiB body bound) covers the whole attempt including body reads.
+- Reported per-probe network breakdown: `proxy_mode`/`proxy_url` (proxy URL userinfo redacted), `response_headers_ms`, `first_byte_ms`, `response_body_ms`, and `total_ms`. The response-headers phase deliberately includes DNS, connect, proxy tunnel, TLS, retries, and upstream queue time, so a reused connection is not misreported as a standalone connect time. LocalGemini profiles probe through the current Gemini transport proxy.
+- Structured error reporting: probe failures carry a stable `stage` (`resolve`/`auth`/`request`/`upstream`/`response`/`timeout`/`protocol`/`bridge`/…) plus an upstream-sourced message, and every credential value known to the probe plus URL userinfo is stripped before any text reaches the caller; the modeled sequence is documented and the GUI-localized stage names and messages are anchored to these stable identifiers.
+- The Windows Model Center now exposes a **Test selected model** button: the probe runs on a worker thread with its own in-flight state, disabling only the Test button and refusing duplicate probes while the rest of the window stays interactive, and results are posted back to the UI thread. The Chinese status label next to the model-list header shows the pass latency or the failed stage/message, and the runtime log records full Chinese entries (bridge-owned messages localized, upstream text preserved verbatim) with the network breakdown.
+- Expanded the locked Rust regression suite to include probe routing, proxy-mode selection, credential redaction, stage mapping, localized-error anchors, and GUI-probe state verification via `verify-gui-probe-state.ps1`.
 
 ### Anthropic Surface Completeness for Qwen Routes
 
@@ -15,6 +23,11 @@ All notable changes to **Claude Code Multi-Model Agent Runtime** will be documen
 - Fixed Qwen native Anthropic reasoning policy sending `output_config.effort` and `thinking.budget_tokens` together. The Qwen upstream rejects `reasoning_effort` and `thinking_budget` in one request; since the forwarded effort already encodes the requested depth, the budget is now dropped after the `max_tokens` headroom check whenever effort is forwarded.
 - `/v1/messages/count_tokens` estimates now exclude the bridge's injected identity text, so reported counts reflect the client's own payload instead of a fixed overhead; native Kimi and Gemini counting paths are unchanged.
 - Added a router fallback: probed Anthropic surfaces the upstream providers do not offer (`/v1/messages/batches`, `/v1/files`, `/v1/organizations`), retired Text Completions, and OpenAI-style `/v1/chat/completions` now return HTTP 501 with an Anthropic-shaped error body explaining the gap instead of a bare 404; unknown paths return a JSON `not_found_error`.
+
+### Additional Changes Since the v0.8.0 Tag
+
+- Completed the Computer Use host integration refactor committed after the v0.8.0 tag: the host lifecycle is fully handled by the installer-registered local stdio MCP server, the service no longer owns Host management code paths, the Model Center drops the obsolete host-control UI, and the uninstaller removes the Host directory under the pre-UAC user's LocalAppData. Binaries built from this tag carry the same behavior the v0.8.0 release notes describe.
+- Added the `mcp-window-tools` 0x-prefixed HWND parse fix: hexadecimal handles containing A–F now parse correctly instead of failing as invalid decimal handles.
 
 ## [v0.8.0] - 2026-09-03
 
@@ -340,7 +353,15 @@ All notable changes to **Claude Code Multi-Model Agent Runtime** will be documen
 
 ## 中文
 
-## [未发布]
+## [v0.9.0] - 2026-09-07
+
+### 模型连通性诊断与模型中心探测
+
+- 新增 `POST /admin/profiles/test`：桥接器按文件名解析 provider profile，并通过该 profile 自身的传输、上游 URL、模型、凭据与带代理 HTTP 客户端发出一次真实的、非流式的 1-token 最小推理（关闭 Thinking），这样高亮但未激活的 profile 也能验证，不需要切换或持久化激活模型，也不会与实时请求竞争。探测无副作用：期间禁用 Responses store 与 Gemini Interactions 续接缓存，整个尝试（含响应体读取）受 30 秒总预算与 1 MiB 响应体上限约束。
+- 每次探测返回网络分阶段明细：`proxy_mode`/`proxy_url`（代理 URL 的 userinfo 已脱敏）、`response_headers_ms`、`first_byte_ms`、`response_body_ms` 与 `total_ms`。连接/响应头阶段刻意包含 DNS、建连、代理隧道、TLS、重试与上游排队时间，连接复用时不会被误报成单独的“连接耗时”。LocalGemini profile 沿当前 Gemini 传输代理探测。
+- 结构化错误报告：探测失败携带稳定 `stage`（`resolve`/`auth`/`request`/`upstream`/`response`/`timeout`/`protocol`/`bridge` 等）与上游原始消息；返回给调用方之前会剥离该探测已知的每个凭据值及 URL userinfo。文档化阶段序列，GUI 的中文阶段名与文案都锚定在这些稳定标识上。
+- Windows 模型中心新增 **测试选中模型** 按钮：探测在独立在途状态的工作线程执行，只禁用“测试”按钮并拒绝重复探测，窗口其余部分保持可交互，结果经 UI 线程回发。模型列表标题右侧的中文状态标签显示通过延迟或失败阶段/消息，运行日志写入完整中文条目（桥接器自有文案已本地化，上游原文原样保留）并附带网络明细。
+- 锁定 Rust 回归测试扩展到覆盖探测路由、代理模式选择、凭据脱敏、阶段映射、本地化文案锚点，并用 `verify-gui-probe-state.ps1` 验证 GUI 探测状态。
 
 ### Qwen 路由的 Anthropic 接口面完善
 
@@ -348,6 +369,11 @@ All notable changes to **Claude Code Multi-Model Agent Runtime** will be documen
 - 修复 Qwen 原生 Anthropic 推理策略同时下发 `output_config.effort` 与 `thinking.budget_tokens` 的问题。Qwen 上游拒绝在同一请求中同时携带 `reasoning_effort` 与 `thinking_budget`；由于转发的 effort 已表达请求的深度，现在在 `max_tokens` 余量检查之后删除 budget。
 - `/v1/messages/count_tokens` 的本地估算不再计入桥接器注入的身份说明文本，报告值只反映客户端自身负载，不再带有固定虚增；Kimi 与 Gemini 的原生计数路径保持不变。
 - 新增路由回退：对上游不提供的 Anthropic 端点（`/v1/messages/batches`、`/v1/files`、`/v1/organizations`）、已退役的 Text Completions 以及 OpenAI 风格的 `/v1/chat/completions`，返回 HTTP 501 与 Anthropic 风格错误体说明原因，替代裸 404；未知路径返回 JSON `not_found_error`。
+
+### v0.8.0 标签之后的补充变更
+
+- 完成 v0.8.0 标签之后提交的 Computer Use 主机集成重构：主机生命周期完全由安装器注册的本地 stdio MCP Server 管理，服务不再保留主机管理代码路径，模型中心移除已废弃的主机控制界面，卸载器会按 UAC 前用户的 LocalAppData 清理主机目录。本标签构建出的二进制即 v0.8.0 发布说明所描述的行为。
+- 新增 `mcp-window-tools` 的 0x 前缀 HWND 解析修复：含 A–F 的十六进制句柄现在能正确解析，不再报“无效十进制/十六进制句柄”。
 
 ## [v0.8.0] - 2026-09-03
 

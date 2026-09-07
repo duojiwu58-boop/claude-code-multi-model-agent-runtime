@@ -140,7 +140,10 @@ fn extract_result(response: &Value, tool: Option<&str>) -> (Option<String>, Opti
 /// 每个请求做统计埋点与分级日志;诊断输出绝不进入 stdout。
 pub fn serve_stdio() {
     crate::log::init_from_env();
-    crate::log_warn!("window-tools v{} serving on stdio", env!("CARGO_PKG_VERSION"));
+    crate::log_warn!(
+        "window-tools v{} serving on stdio",
+        env!("CARGO_PKG_VERSION")
+    );
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
@@ -214,7 +217,10 @@ mod tests {
         let response = handle_request(&request).unwrap();
         let result = &response["result"];
         assert_eq!(result["isError"], true);
-        assert!(result["content"][0]["text"].as_str().unwrap().contains("hwnd"));
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("hwnd"));
         assert_eq!(result["error_code"], crate::error::INVALID_ARGUMENT);
         assert_eq!(result["retryable"], false);
     }

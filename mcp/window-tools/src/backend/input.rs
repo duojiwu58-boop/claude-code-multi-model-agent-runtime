@@ -1,22 +1,20 @@
 //! 鼠标/键盘输入注入:批次预校验、配平约束、RAII 失败释放与插值执行。
 
 use serde_json::{json, Value};
-use windows::{
-    Win32::{
-        Foundation::{HWND, POINT},
-        UI::{
-            Input::KeyboardAndMouse::{
-                keybd_event, mouse_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN,
-                MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
-                MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSE_EVENT_FLAGS,
-            },
-            WindowsAndMessaging::{GetCursorPos, SetCursorPos, SetForegroundWindow},
+use windows::Win32::{
+    Foundation::{HWND, POINT},
+    UI::{
+        Input::KeyboardAndMouse::{
+            keybd_event, mouse_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN,
+            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+            MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSE_EVENT_FLAGS,
         },
+        WindowsAndMessaging::{GetCursorPos, SetCursorPos, SetForegroundWindow},
     },
 };
 
 use crate::error::{
-    ToolError, ACTIVATION_DENIED, INVALID_ARGUMENT, INPUT_FAILED, LIMIT_EXCEEDED,
+    ToolError, ACTIVATION_DENIED, INPUT_FAILED, INVALID_ARGUMENT, LIMIT_EXCEEDED,
     WINDOW_NOT_VISIBLE,
 };
 use crate::parse::json_i32;
@@ -76,7 +74,10 @@ fn parse_vkey(value: &Value) -> Result<u8, ToolError> {
                     }
                 }
             }
-            Err(ToolError::new(INVALID_ARGUMENT, format!("未知按键名 '{name}'")))
+            Err(ToolError::new(
+                INVALID_ARGUMENT,
+                format!("未知按键名 '{name}'"),
+            ))
         }
     }
 }
@@ -258,11 +259,9 @@ fn prepare_input_actions(
                 PreparedInputAction::Scroll { x, y, delta }
             }
             "key_tap" | "key_down" | "key_up" => {
-                let vkey = parse_vkey(
-                    action
-                        .get("vkey")
-                        .ok_or_else(|| ToolError::new(INVALID_ARGUMENT, format!("动作 {index} 缺少 vkey")))?,
-                )?;
+                let vkey = parse_vkey(action.get("vkey").ok_or_else(|| {
+                    ToolError::new(INVALID_ARGUMENT, format!("动作 {index} 缺少 vkey"))
+                })?)?;
                 if kind == "key_down" {
                     if held_keys.contains(&vkey) {
                         return Err(ToolError::new(
@@ -413,8 +412,9 @@ fn execute_prepared_actions(
                 let target = client_to_screen_checked(hwnd, x, y)?;
                 let mut from = POINT { x: 0, y: 0 };
                 unsafe {
-                    GetCursorPos(&mut from)
-                        .map_err(|e| ToolError::new(INPUT_FAILED, format!("GetCursorPos 失败: {e}")))?;
+                    GetCursorPos(&mut from).map_err(|e| {
+                        ToolError::new(INPUT_FAILED, format!("GetCursorPos 失败: {e}"))
+                    })?;
                 }
                 move_cursor_steps(hwnd, from, target, steps, delay_ms.max(10))?;
                 reported.push(json!({"kind": "move", "steps": steps}));
@@ -422,8 +422,9 @@ fn execute_prepared_actions(
             PreparedInputAction::Click { x, y, button } => {
                 let target = client_to_screen_checked(hwnd, x, y)?;
                 unsafe {
-                    SetCursorPos(target.x, target.y)
-                        .map_err(|e| ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}")))?;
+                    SetCursorPos(target.x, target.y).map_err(|e| {
+                        ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}"))
+                    })?;
                 }
                 release_guard.mouse_down(button);
                 release_guard.mouse_up(button);
@@ -432,8 +433,9 @@ fn execute_prepared_actions(
             PreparedInputAction::Down { x, y, button } => {
                 let target = client_to_screen_checked(hwnd, x, y)?;
                 unsafe {
-                    SetCursorPos(target.x, target.y)
-                        .map_err(|e| ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}")))?;
+                    SetCursorPos(target.x, target.y).map_err(|e| {
+                        ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}"))
+                    })?;
                 }
                 release_guard.mouse_down(button);
                 reported.push(json!({"kind": "down", "button": button.name()}));
@@ -441,8 +443,9 @@ fn execute_prepared_actions(
             PreparedInputAction::Up { x, y, button } => {
                 let target = client_to_screen_checked(hwnd, x, y)?;
                 unsafe {
-                    SetCursorPos(target.x, target.y)
-                        .map_err(|e| ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}")))?;
+                    SetCursorPos(target.x, target.y).map_err(|e| {
+                        ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}"))
+                    })?;
                 }
                 release_guard.mouse_up(button);
                 reported.push(json!({"kind": "up", "button": button.name()}));
@@ -450,8 +453,9 @@ fn execute_prepared_actions(
             PreparedInputAction::Scroll { x, y, delta } => {
                 let target = client_to_screen_checked(hwnd, x, y)?;
                 unsafe {
-                    SetCursorPos(target.x, target.y)
-                        .map_err(|e| ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}")))?;
+                    SetCursorPos(target.x, target.y).map_err(|e| {
+                        ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}"))
+                    })?;
                     mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, 0);
                 }
                 reported.push(json!({"kind": "scroll", "delta": delta}));

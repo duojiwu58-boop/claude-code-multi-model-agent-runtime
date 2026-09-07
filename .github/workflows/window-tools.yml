@@ -1,0 +1,29 @@
+name: window-tools
+
+on:
+  push:
+    paths:
+      - 'mcp/window-tools/**'
+      - '.github/workflows/window-tools.yml'
+  pull_request:
+    paths:
+      - 'mcp/window-tools/**'
+      - '.github/workflows/window-tools.yml'
+
+jobs:
+  gate:
+    name: fmt + clippy + test + build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt
+        run: cargo fmt --manifest-path mcp/window-tools/Cargo.toml -- --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --manifest-path mcp/window-tools/Cargo.toml --all-targets -- -D warnings
+      - name: unit tests
+        run: cargo test --manifest-path mcp/window-tools/Cargo.toml
+      - name: release build
+        run: cargo build --release --manifest-path mcp/window-tools/Cargo.toml

@@ -134,7 +134,10 @@ pub fn capture_window(hwnd: HWND, client_only: bool) -> Result<(Vec<u8>, RECT), 
     if is_window_hung(hwnd) {
         return Err(ToolError::new(
             WINDOW_HUNG,
-            format!("窗口 hwnd={} 无响应，拒绝截图；等待窗口恢复或选择其他目标", hwnd_num_str(hwnd)),
+            format!(
+                "窗口 hwnd={} 无响应，拒绝截图；等待窗口恢复或选择其他目标",
+                hwnd_num_str(hwnd)
+            ),
         ));
     }
     // HWND 是裸指针包装,不满足 Send;以 isize 跨界传递,worker 内重建。
@@ -480,7 +483,10 @@ fn capture_rect_from_screen(
         }
     };
     if let Err(e) = copied {
-        Err(ToolError::new(CAPTURE_FAILED, format!("屏幕像素复制失败: {e}")))
+        Err(ToolError::new(
+            CAPTURE_FAILED,
+            format!("屏幕像素复制失败: {e}"),
+        ))
     } else {
         let lines = unsafe {
             GetDIBits(

@@ -611,7 +611,10 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
         TOOL_PIXEL_FIND_COLOR => pixel_find_color(resolve_explicit_hwnd(args)?, args),
         TOOL_SEND_INPUT => send_input(resolve_explicit_hwnd(args)?, args),
         TOOL_GET_DIAGNOSTICS => crate::diagnostics::diagnostics_payload(),
-        _ => Err(ToolError::new(INVALID_ARGUMENT, format!("未知工具 '{name}'"))),
+        _ => Err(ToolError::new(
+            INVALID_ARGUMENT,
+            format!("未知工具 '{name}'"),
+        )),
     }
 }
 

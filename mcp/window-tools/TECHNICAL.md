@@ -9,24 +9,24 @@
 以 **stdio + 换行分隔 JSON-RPC 2.0** 提供窗口观察、布局验证与 UI 驱动工具。
 进程为 **PerMonitorV2 DPI 感知**,与 claude-computer-host 的协议约定一致。
 
-代码分四层(`src/main.rs` 单文件,约 2250 行):
+代码分层(2026-09-08 起为 lib + 薄 bin,模块边界见 `src/lib.rs` 文档):
 
 ```
-协议层    main → handle_request_isolated        initialize / ping / tools/list / tools/call
-          └─ catch_unwind(AssertUnwindSafe(handle_request))   ← 单请求 panic unwind 隔离
-          └─ jsonrpc_result / jsonrpc_error / mcp_tool_error
-
-分发层    handle_tool_call(name, args)          按工具名分发;统一 isError 文本块约定
-
-工具层    list_windows / get_window_rect / screenshot_window / screenshot_all /
-          resize_window / window_activate / pixel_scan_line / pixel_find_color / send_input
-
-解析层    resolve_target / resolve_explicit_hwnd  目标窗口统一定位
-          parse_hwnd_str / json_i32 / json_u32   输入校验(防静默截断)
+protocol.rs  handle_request → handle_request_isolated      initialize / ping / tools/list / tools/call
+             └─ catch_unwind(AssertUnwindSafe(handle_request))   ← 单请求 panic unwind 隔离
+             └─ serve_stdio:每请求统计埋点 + 分级日志(stdout 绝不写诊断)
+tools.rs     工具目录/调度/选择器解析 + 工具 schema(tools_list)
+backend/     window.rs(枚举/矩形/resize/activate) capture.rs(GDI 采集/预算/RAII/超时)
+             input.rs(输入批次预校验/执行/释放守卫)
+parse.rs     纯解析原语:json_i32 / json_u32 / parse_hwnd_str / parse_hex_color
+error.rs     稳定错误契约:ToolError { code, message, retryable }
+log.rs       分级日志(stderr / WT_LOG_FILE,WT_LOG_LEVEL 控级)
+diagnostics.rs 运行统计/错误环形缓冲/GDI 自检(get_diagnostics 工具)
 ```
 
 运行模型:**单线程、无内部会话状态、顺序处理**。每个 stdin 行是一个完整请求,处理完再写一行响应。
 窗口布局与全局鼠标/键盘状态属于进程外部状态,不在“无内部会话状态”的含义内。
+例外:截图采集在 **worker 线程**执行并限时等待(见 §5.3),但同一时刻仍只有一个请求在处理。
 
 ## 2. 坐标与 DPI 模型
 
@@ -193,6 +193,57 @@ fn handle_request_isolated(request: &Value) -> Option<Value> {
   panic 展开时 Drop 同样执行,崩溃路径也零句柄泄漏。释放方式与获取方式严格配对
   (GetDC 用 ReleaseDC、内存 DC 用 DeleteDC、位图用 DeleteObject)。
 
+### 5.3 错误契约(2026-09-08 起)
+
+工具错误响应保留 MCP 惯用形状并**新增**机器可读字段(向后兼容,只增不改):
+
+```json
+{"content":[{"type":"text","text":"中文明细"}],"isError":true,
+ "error_code":"NOT_FOREGROUND","retryable":true}
+```
+
+| code | retryable | 触发场景 |
+|---|---|---|
+| INVALID_ARGUMENT | 否 | 参数缺失/越界/格式错误/批次未配平 |
+| WINDOW_NOT_FOUND | 是 | 句柄失效、GetWindowRect 失败、无匹配窗口 |
+| WINDOW_NOT_VISIBLE | 是 | 窗口最小化/不可见、空截图矩形 |
+| WINDOW_HUNG | 是 | IsHungAppWindow 预检命中、截图超时 |
+| NOT_FOREGROUND | 是 | 输入注入目标非前台(执行期复检) |
+| ACTIVATION_DENIED | 是 | SetForegroundWindow 被焦点保护拒绝 |
+| CAPTURE_FAILED | 是 | GDI 资源/PrintWindow/GetDIBits/PNG 编码失败 |
+| LIMIT_EXCEEDED | 否 | 尺寸/像素/批次/计划延迟超预算 |
+| INPUT_FAILED | 是 | SetCursorPos/GetCursorPos 等执行期失败 |
+| INTERNAL_ERROR | 否 | 内部不可预期(JSON 序列化失败等) |
+
+`retryable` 由 `error.rs` 单一码表推导,保证全路径语义一致。码一旦发布保持稳定(只增不改)。
+
+### 5.4 活性保障(2026-09-08 起)
+
+挂起窗口(消息队列无响应)绝不能卡死单线程服务,三层防护:
+
+1. **标题读取**不走 `GetWindowTextW`(对其他进程窗口内部发 WM_GETTEXT,目标线程挂起时
+   调用方被拖死):改用 `SendMessageTimeoutW(WM_GETTEXT, 500ms, SMTO_ABORTIFHUNG)`,
+   挂起窗口标题为空,枚举照常完成;
+2. **截图预检**:`capture_window` 先 `IsHungAppWindow`,命中直接返回 WINDOW_HUNG,
+   绝不进入 PrintWindow(把 WM_PRINT 投递进目标线程的阻塞调用);
+3. **硬超时**:采集在 worker 线程执行,`run_capture_with_timeout`(15s)限时等待,
+   超时返回 WINDOW_HUNG 继续服务。边界:Rust 无法终止线程,超时后 worker 可能仍卡在
+   PrintWindow(线程与当次句柄泄漏,进程退出回收)——预检已把概率压到趋近于零,剩余是
+   驱动级卡死的极端场景。
+
+坑位:winver 等普通窗口 IsHungAppWindow 恒为 false;真实挂起窗口的制造法见
+`tests/e2e-hung.ps1`(独立 STA 线程创建窗口后 busy-sleep 从不取消息)。
+
+### 5.5 可观测性(2026-09-08 起)
+
+- **日志**:stderr 为唯一即时通道,stdout 保持纯协议。级别 `WT_LOG_LEVEL`
+  (error|warn|info|debug,默认 warn);`WT_LOG_FILE` 可选落盘。info 级每请求一行
+  `method tool -> code in Nms`。初始化:日志配置读取放 `serve_stdio` 开头。
+- **自检**:`get_diagnostics` 工具(只增不删的 schema)返回版本、uptime、请求/方法/工具/
+  错误码统计、GDI/USER 句柄自检(`GetGuiResources`)、最近 20 条错误环形缓冲。
+- **排障流**:默认 warn 级零成本;异常时 `WT_LOG_LEVEL=info` 重启会话即可拿到逐请求轨迹,
+  再以 `get_diagnostics` 看错误分布与句柄数(GDI 恒增是泄漏信号,正常采集后回落为 0)。
+
 ## 6. 预算与校验
 
 | 常量 | 值 | 用途 |
@@ -220,7 +271,7 @@ fn handle_request_isolated(request: &Value) -> Option<Value> {
 target/x86_64-pc-windows-msvc/release/mcp-window-tools.exe
 ```
 
-### 7.2 测试(14 项)
+### 7.2 测试(25 项单元 + 36 项 E2E)
 
 | 组 | 覆盖 |
 |---|---|
@@ -230,21 +281,27 @@ target/x86_64-pc-windows-msvc/release/mcp-window-tools.exe
 | 按键名 | 字母/数字/F 键/方向键/非法值/越界整数 |
 | 输入批次 | 客户区坐标、down/up 配平、动作数与计划时长限制、schema 发布 |
 | panic 隔离 | 负载提取(三种形态)、隔离后保留请求 id、正常路径不受影响 |
-| 工具清单 | 9 工具齐全、新工具 schema 约束(必填 hwnd、annotations) |
+| 工具清单 | 10 工具齐全、新工具 schema 约束(必填 hwnd、annotations) |
+| 错误契约 | 错误码稳定性、retryable 码表推导、双轨响应形状 |
+| 活性 | 截图超时返回 WINDOW_HUNG、worker 边界行为 |
+| 可观测性 | 诊断字段完整性、错误环形缓冲容量与淘汰顺序、日志级别解析 |
+
+单元测试 25 项;真实 GUI E2E 套件已入库:`tests/run-e2e.ps1`
+(主套件 29 项 + 真实挂起窗口套件 7 项,需要交互桌面,本地门禁运行)。
 
 ### 7.3 部署
 
 ```powershell
-# 1) 杀旧进程(文件占用:Device or resource busy)
-taskkill /IM claude-mcp-window-tools.exe /F
-# 2) 备份 + 覆盖
-Copy-Item ...\claude-mcp-window-tools.exe "...\claude-mcp-window-tools.exe.backup-yyyyMMdd-HHmmss"
-Copy-Item target\x86_64-pc-windows-msvc\release\mcp-window-tools.exe `
-  "C:\Program Files\ClaudeCodeBridge\claude-mcp-window-tools.exe"
+# 一条命令:构建 → 冒烟 → 杀旧进程 → 备份 → 覆盖(脚本已入库)
+pwsh -File mcp/window-tools/deploy.ps1
 ```
 
-注册在 `~/.claude.json` 的 `mcpServers.window-tools`(stdio,直接指向上述路径);
-**重开会话才加载**(Claude Code 会话启动时连 MCP)。
+注册在 `~/.claude.json` 的 `mcpServers.window-tools`(stdio,直接指向
+`C:\Program Files\ClaudeCodeBridge\claude-mcp-window-tools.exe`);
+Claude Code 在下一次工具调用时会**自动重连** MCP(2026-09-08 实测),无需重启会话。
+
+CI 门禁:`.github/workflows/window-tools.yml`(fmt --check / clippy -D warnings /
+单元测试 / release 构建),触发条件为该目录或 workflow 自身变更。
 
 ## 8. windows-rs 0.61 签名陷阱(写代码前先 grep 源码确认)
 

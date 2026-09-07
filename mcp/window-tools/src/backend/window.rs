@@ -15,7 +15,10 @@ use windows::{
     },
 };
 
-use crate::error::{ToolError, ACTIVATION_DENIED, INVALID_ARGUMENT, LIMIT_EXCEEDED, NOT_FOREGROUND, WINDOW_NOT_FOUND};
+use crate::error::{
+    ToolError, ACTIVATION_DENIED, INVALID_ARGUMENT, LIMIT_EXCEEDED, NOT_FOREGROUND,
+    WINDOW_NOT_FOUND,
+};
 use crate::parse::json_i32;
 
 use super::capture::MAX_CAPTURE_DIM;
@@ -166,10 +169,16 @@ pub fn client_rect_of(hwnd: HWND) -> Result<RECT, ToolError> {
         y: client.bottom,
     };
     if !unsafe { ClientToScreen(hwnd, &mut top_left) }.as_bool() {
-        return Err(ToolError::new(WINDOW_NOT_FOUND, "ClientToScreen(左上) 失败"));
+        return Err(ToolError::new(
+            WINDOW_NOT_FOUND,
+            "ClientToScreen(左上) 失败",
+        ));
     }
     if !unsafe { ClientToScreen(hwnd, &mut bottom_right) }.as_bool() {
-        return Err(ToolError::new(WINDOW_NOT_FOUND, "ClientToScreen(右下) 失败"));
+        return Err(ToolError::new(
+            WINDOW_NOT_FOUND,
+            "ClientToScreen(右下) 失败",
+        ));
     }
     Ok(RECT {
         left: top_left.x,

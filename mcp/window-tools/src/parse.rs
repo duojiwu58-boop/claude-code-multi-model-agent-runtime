@@ -39,15 +39,24 @@ pub fn json_u32(args: &Value, key: &str) -> Result<Option<u32>, ToolError> {
 /// 解析 hwnd 字符串:带 0x/0X 前缀按十六进制,否则按十进制。
 /// 之前的实现只是剥掉前缀后仍按十进制 parse,含 A-F 的十六进制句柄必然失败。
 pub fn parse_hwnd_str(raw: &str, display: &str) -> Result<i64, ToolError> {
-    let invalid = || ToolError::new(INVALID_ARGUMENT, format!("hwnd '{display}' 不是有效的十进制/十六进制句柄"));
+    let invalid = || {
+        ToolError::new(
+            INVALID_ARGUMENT,
+            format!("hwnd '{display}' 不是有效的十进制/十六进制句柄"),
+        )
+    };
     let trimmed = raw.trim();
     if let Some(hex) = trimmed
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
     {
         let value = u64::from_str_radix(hex, 16).map_err(|_| invalid())?;
-        i64::try_from(value)
-            .map_err(|_| ToolError::new(INVALID_ARGUMENT, format!("hwnd '{display}' 超出 64 位句柄范围")))
+        i64::try_from(value).map_err(|_| {
+            ToolError::new(
+                INVALID_ARGUMENT,
+                format!("hwnd '{display}' 超出 64 位句柄范围"),
+            )
+        })
     } else {
         trimmed.parse::<i64>().map_err(|_| invalid())
     }
@@ -63,8 +72,9 @@ pub fn parse_hex_color(raw: &str) -> Result<(u8, u8, u8), ToolError> {
         ));
     }
     let hex_byte = |range: std::ops::Range<usize>| {
-        u8::from_str_radix(&s[range], 16)
-            .map_err(|_| ToolError::new(INVALID_ARGUMENT, format!("颜色 '{raw}' 含非法十六进制字符")))
+        u8::from_str_radix(&s[range], 16).map_err(|_| {
+            ToolError::new(INVALID_ARGUMENT, format!("颜色 '{raw}' 含非法十六进制字符"))
+        })
     };
     Ok((hex_byte(0..2)?, hex_byte(2..4)?, hex_byte(4..6)?))
 }

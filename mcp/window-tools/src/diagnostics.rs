@@ -7,7 +7,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use serde_json::{json, Value};
-use windows::Win32::System::Threading::{GetCurrentProcess, GetGuiResources, GET_GUI_RESOURCES_FLAGS};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetGuiResources, GET_GUI_RESOURCES_FLAGS,
+};
 
 use crate::error::ToolError;
 
@@ -158,10 +160,26 @@ pub fn reset_for_test() {
     state.total_requests.store(0, Ordering::Relaxed);
     state.total_tool_calls.store(0, Ordering::Relaxed);
     state.total_errors.store(0, Ordering::Relaxed);
-    state.tool_calls.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.methods.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.error_codes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    state.last_errors.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    state
+        .tool_calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    state
+        .methods
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    state
+        .error_codes
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    state
+        .last_errors
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 #[cfg(test)]
@@ -172,7 +190,11 @@ mod tests {
     fn payload_shape_and_error_ring_behavior() {
         reset_for_test();
         record_request("tools/call", Some("list_windows"), None);
-        record_request("tools/call", Some("get_window_rect"), Some("WINDOW_NOT_FOUND"));
+        record_request(
+            "tools/call",
+            Some("get_window_rect"),
+            Some("WINDOW_NOT_FOUND"),
+        );
         record_tool_error("get_window_rect", "WINDOW_NOT_FOUND", "无效句柄");
         let payload = diagnostics_payload().unwrap();
         let text = payload["content"][0]["text"].as_str().unwrap();

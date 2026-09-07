@@ -72,9 +72,7 @@ type
     FLogPanel: TPanel;
     FLogTitleLabel: TLabel;
     FLogMemo: TMemo;
-    FComputerPanel: TPanel;
-    FComputerTitleLabel: TLabel;
-    FComputerStatusLabel: TLabel;
+    FLogSplitter: TSplitter;
     FStatusBar: TStatusBar;
     FRefreshButton: TButton;
     FSwitchButton: TButton;
@@ -348,6 +346,7 @@ begin
   FLogPanel.AlignWithMargins := True;
   FLogPanel.Margins.SetBounds(0, 12, 0, 0);
   FLogPanel.Height := 126;
+  FLogPanel.Constraints.MinHeight := FLogPanel.Height;
   FLogPanel.BevelOuter := bvNone;
   FLogPanel.Color := clWhite;
   FLogPanel.ParentBackground := False;
@@ -371,30 +370,13 @@ begin
   FLogMemo.Font.Name := 'Cascadia Mono';
   FLogMemo.Font.Size := 9;
 
-  FComputerPanel := TPanel.Create(Self);
-  FComputerPanel.Parent := FContentPanel;
-  FComputerPanel.Align := alBottom;
-  FComputerPanel.AlignWithMargins := True;
-  FComputerPanel.Margins.SetBounds(0, 12, 0, 0);
-  FComputerPanel.Height := 88;
-  FComputerPanel.BevelOuter := bvNone;
-  FComputerPanel.Color := clWhite;
-  FComputerPanel.ParentBackground := False;
-
-  FComputerTitleLabel := TLabel.Create(Self);
-  FComputerTitleLabel.Parent := FComputerPanel;
-  FComputerTitleLabel.SetBounds(16, 12, 240, 24);
-  FComputerTitleLabel.Caption := 'Computer Use（只读状态）';
-  FComputerTitleLabel.Font.Style := [fsBold];
-  FComputerTitleLabel.Font.Size := 11;
-
-  FComputerStatusLabel := TLabel.Create(Self);
-  FComputerStatusLabel.Parent := FComputerPanel;
-  FComputerStatusLabel.SetBounds(16, 44, 500, 28);
-  FComputerStatusLabel.AutoSize := False;
-  FComputerStatusLabel.WordWrap := True;
-  FComputerStatusLabel.Caption := 'Computer Use 由 Claude Code 自动启动本地 Host。' +
-    '浏览器会话、Desktop 选窗和安全审批均在 Host 原生窗口中处理，本面板仅作说明。';
+  FLogSplitter := TSplitter.Create(Self);
+  FLogSplitter.Parent := FContentPanel;
+  FLogSplitter.Align := alBottom;
+  FLogSplitter.Height := 5;
+  FLogSplitter.Color := $00F5F5F5;
+  FLogSplitter.Cursor := crSizeNS;
+  FLogSplitter.MinSize := FLogPanel.Height;
 
   FListPanel := TPanel.Create(Self);
   FListPanel.Parent := FContentPanel;
@@ -523,10 +505,6 @@ begin
     FStatusBar.Panels[0].Width := FStatusBar.ClientWidth * 2 div 5;
     FStatusBar.Panels[1].Width := FStatusBar.ClientWidth * 3 div 10;
   end;
-
-  if Assigned(FComputerStatusLabel) and Assigned(FComputerPanel) then
-    FComputerStatusLabel.Width :=
-      FComputerPanel.ClientWidth - FComputerStatusLabel.Left - 16;
 
   if Assigned(FTestButton) and Assigned(FTestResultLabel) and
      Assigned(FListPanel) then

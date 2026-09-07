@@ -2,7 +2,7 @@
 name = "mcp-window-tools"
 version = "0.1.0"
 edition = "2021"
-description = "通用窗口/截图工具集 (stdio MCP for Claude Code): 窗口枚举、窗口截图、全屏截图、调整窗口尺寸"
+description = "通用 Windows GUI 工具集 (stdio MCP for Claude Code): 窗口观察、布局验证与安全输入驱动"
 license = "GPL-3.0-only"
 
 [dependencies]
@@ -14,5 +14,7 @@ windows = { version = "=0.61.3", features = [
     "Win32_Graphics_Gdi",
     "Win32_Storage_Xps",
     "Win32_UI_HiDpi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }

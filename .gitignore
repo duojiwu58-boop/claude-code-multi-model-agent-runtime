@@ -32,3 +32,7 @@ __history/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local Claude agent instructions, not part of the repository
+/CLAUDE.md
+

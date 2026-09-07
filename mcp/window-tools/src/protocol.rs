@@ -112,15 +112,43 @@ fn handle_request_isolated(request: &Value) -> Option<Value> {
     }
 }
 
+/// 从响应中提取结果码与错误信息,供统计与日志使用。
+/// 返回 (code, message):工具错误取 error_code 字段,JSON-RPC 错误取 error.code。
+fn extract_result(response: &Value, tool: Option<&str>) -> (Option<String>, Option<String>) {
+    if let Some(result) = response.get("result") {
+        if result.get("isError").and_then(Value::as_bool) == Some(true) {
+            let code = result
+                .get("error_code")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let message = result["content"][0]["text"].as_str().map(str::to_owned);
+            if let (Some(code), Some(message), Some(tool)) = (&code, &message, tool) {
+                crate::diagnostics::record_tool_error(tool, code, message);
+            }
+            return (code, message);
+        }
+    }
+    if let Some(error) = response.get("error") {
+        let code = Some(format!("JSONRPC_{}", error["code"]));
+        let message = error["message"].as_str().map(str::to_owned);
+        return (code, message);
+    }
+    (None, None)
+}
+
 /// stdio 主循环:逐行读取 JSON-RPC 请求并写回响应,直到 stdin 关闭或 stdout 写入失败。
+/// 每个请求做统计埋点与分级日志;诊断输出绝不进入 stdout。
 pub fn serve_stdio() {
+    crate::log::init_from_env();
+    crate::log_warn!("window-tools v{} serving on stdio", env!("CARGO_PKG_VERSION"));
+
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("Cannot read MCP stdin: {e}");
+                crate::log_error!("Cannot read MCP stdin: {e}");
                 break;
             }
         };
@@ -131,12 +159,37 @@ pub fn serve_stdio() {
             Ok(r) => r,
             Err(e) => {
                 let response = jsonrpc_error(Value::Null, -32700, format!("Parse error: {e}"));
+                crate::log_error!("parse error: {e}");
                 let _ = writeln!(stdout, "{response}");
                 let _ = stdout.flush();
                 continue;
             }
         };
-        if let Some(response) = handle_request_isolated(&request) {
+        let started = std::time::Instant::now();
+        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+        let tool = request
+            .pointer("/params/name")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let response = handle_request_isolated(&request);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let (code, message) = response
+            .as_ref()
+            .map(|r| extract_result(r, tool.as_deref()))
+            .unwrap_or_default();
+        crate::diagnostics::record_request(method, tool.as_deref(), code.as_deref());
+        match (&code, &tool) {
+            (Some(code), Some(tool)) => crate::log_error!(
+                "{method} {tool} -> {code} in {elapsed_ms}ms: {}",
+                message.unwrap_or_default()
+            ),
+            (Some(code), None) => {
+                crate::log_error!("{method} -> {code} in {elapsed_ms}ms")
+            }
+            (None, Some(tool)) => crate::log_info!("{method} {tool} ok in {elapsed_ms}ms"),
+            (None, None) => crate::log_info!("{method} ok in {elapsed_ms}ms"),
+        }
+        if let Some(response) = response {
             if writeln!(stdout, "{response}")
                 .and_then(|_| stdout.flush())
                 .is_err()

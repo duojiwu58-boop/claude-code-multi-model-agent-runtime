@@ -24,6 +24,8 @@ pub const TOOL_ACTIVATE: &str = "window_activate";
 pub const TOOL_PIXEL_SCAN_LINE: &str = "pixel_scan_line";
 pub const TOOL_PIXEL_FIND_COLOR: &str = "pixel_find_color";
 pub const TOOL_SEND_INPUT: &str = "send_input";
+/// 诊断自检工具:版本、运行时长、请求/错误统计、GDI 句柄数与最近错误记录。
+pub const TOOL_GET_DIAGNOSTICS: &str = "get_diagnostics";
 
 const MAX_WINDOWS_LIMIT: usize = 500;
 const MAX_SCAN_BANDS: usize = 256;
@@ -551,6 +553,12 @@ pub fn tools_list() -> Value {
                 "required": ["hwnd", "actions"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": TOOL_GET_DIAGNOSTICS,
+            "description": "服务自检:版本、运行时长、请求/错误统计(按工具与错误码分组)、当前 GDI/USER 句柄数与最近错误记录。无参数。",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }
     ]})
 }
@@ -602,6 +610,7 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
         TOOL_PIXEL_SCAN_LINE => pixel_scan_line(resolve_explicit_hwnd(args)?, args),
         TOOL_PIXEL_FIND_COLOR => pixel_find_color(resolve_explicit_hwnd(args)?, args),
         TOOL_SEND_INPUT => send_input(resolve_explicit_hwnd(args)?, args),
+        TOOL_GET_DIAGNOSTICS => crate::diagnostics::diagnostics_payload(),
         _ => Err(ToolError::new(INVALID_ARGUMENT, format!("未知工具 '{name}'"))),
     }
 }
@@ -641,6 +650,7 @@ mod tests {
             TOOL_PIXEL_SCAN_LINE,
             TOOL_PIXEL_FIND_COLOR,
             TOOL_SEND_INPUT,
+            TOOL_GET_DIAGNOSTICS,
         ] {
             assert!(names.contains(&expected), "缺少工具 {expected}");
         }

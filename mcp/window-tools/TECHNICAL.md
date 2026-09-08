@@ -101,7 +101,8 @@ GetWindowRect/ClientToScreen → CreateCompatibleBitmap(原尺寸) → CreateCom
 ### 4.2a screenshot_window(WGC 路径, v0.4.0 / v0.5.0)
 
 ```
-rect 预检 → 全局缓存 Mutex → 设备缓存(硬件→WARP,只建一次)
+IsIconic 预检(最小化 → WINDOW_NOT_VISIBLE,v0.6.1)→ rect 预检
+→ 全局缓存 Mutex → 设备缓存(硬件→WARP,只建一次)
 → 会话缓存(键 = hwnd, client_only, incremental;LRU 上限 4;IsWindow 清理)
 → 新会话:互操作 CreateForWindow → 自由线程帧池(2 缓冲)→ 会话
   → 增量会话禁光标捕获 → StartCapture → 首帧轮询(100ms×10s 预算)
@@ -124,10 +125,16 @@ rect 预检 → 全局缓存 Mutex → 设备缓存(硬件→WARP,只建一次)
   而非客户端基线,会漏报;像素差分不依赖帧历史,任何间隔下都精确。
 - **差分确定性**:增量会话 `SetIsCursorCaptureEnabled(false)`——光标移动不产帧,
   否则"无变化"判定被光标污染。
+- **尺寸变化检测(v0.6.1)**:帧纹理固定于建池时的 item 尺寸,窗口调整大小后
+  纹理不变,只有 `ContentSize()` 跟随变化(实测 640x480 窗口 tex 恒 422x292、
+  ContentSize 626x473);重建触发以 ContentSize 为准(纹理与 ContentSize 不符
+  同样触发),恢复/最小化动画期的瞬时 ContentSize(如 146x28)由 2 次尝试
+  上限自愈。
 - 线程模型:进程内 MTA 唯一,缓存对象跨 worker 线程直接访问合法;并发由缓存
   Mutex 串行化(等待以毫秒计)。WinRT `IDirect3DDevice` 封装不缓存(无 Send,
   转换实测 ~0ms),建会话时现取。
-- 会话边界(承接 v0.4.0):最小化不产帧(轮询+硬超时)、DRM 被拒或黑区、
+- 会话边界:最小化确定性拒绝(v0.6.1,IsIconic → WINDOW_NOT_VISIBLE——尺寸预检
+  拦不住最小化:GetWindowRect 位置 -32000 但尺寸仍为正)、DRM 被拒或黑区、
   系统级 CaptureSession 并发上限(缓存 4 主动规避)、Win10 无去边框。
 
 ### 4.3 screenshot_all
@@ -309,7 +316,7 @@ fn handle_request_isolated(request: &Value) -> Option<Value> {
 target/x86_64-pc-windows-msvc/release/mcp-window-tools.exe
 ```
 
-### 7.2 测试(38 项单元 + 54 项 E2E;各版本精确计数见 CHANGELOG)
+### 7.2 测试(42 项单元 + 76 项 E2E(主 69 + 挂起 7);各版本精确计数见 CHANGELOG)
 
 | 组 | 覆盖 |
 |---|---|

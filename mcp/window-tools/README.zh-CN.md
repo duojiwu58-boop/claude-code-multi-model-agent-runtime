@@ -52,12 +52,19 @@
 | `title` | string | — | 窗口标题子串 |
 | `pid` | integer | — | 窗口所属进程 PID |
 | `client_only` | boolean | `false` | 仅截客户区，不含标题栏与边框 |
+| `method` | string | `auto` | 采集方式：`auto`=PrintWindow，近纯黑或失败先试 WGC 合成帧再回退屏幕采样；`wgc`=直接走 Windows Graphics Capture GPU 合成帧（实验） |
+| `incremental` | boolean | `false` | 增量差分（实验，仅 `method=wgc` 有效）：首次调用返回基线全帧，后续只返回相对上次的变化区域图像，无变化时仅返回文本 |
 
-`hwnd` / `title` / `pid` 必须且只能提供一个。
+`hwnd` / `title` / `pid` 必须且只能提供一个。最小化窗口对两种采集方式都确定性返回
+`WINDOW_NOT_VISIBLE`（快速结构化错误）。
 
 ### `screenshot_all`
 
-无参数。每台显示器一张 PNG，并返回各显示器标签。
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `method` | string | `auto` | 采集方式：`auto`=屏幕 BitBlt（不含光标）；`wgc`=Windows Graphics Capture 合成帧（实验，含光标） |
+
+每台显示器一张 PNG，并返回各显示器标签。
 
 ### `resize_window`
 

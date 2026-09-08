@@ -61,12 +61,20 @@ Returns the frame rectangle and the client-area rectangle in screen coordinates.
 | `title` | string | — | Window title substring |
 | `pid` | integer | — | Window's process PID |
 | `client_only` | boolean | `false` | Client area only, excluding title bar and borders |
+| `method` | string | `auto` | Capture method: `auto`=PrintWindow, tries WGC then falls back to screen sampling on near-black/failure; `wgc`=Windows Graphics Capture GPU-composited frame (experimental) |
+| `incremental` | boolean | `false` | Incremental diff (experimental, `method=wgc` only): first call returns the full baseline frame, later calls return only changed-region images, text-only when unchanged |
 
-Exactly one of `hwnd` / `title` / `pid` is required.
+Exactly one of `hwnd` / `title` / `pid` is required. Minimized windows are
+deterministically rejected with `WINDOW_NOT_VISIBLE` under both methods (fast
+structured error).
 
 ### `screenshot_all`
 
-No parameters. One PNG per monitor, plus the label of each display.
+| Parameter | Type | Default | Notes |
+|---|---|---|---|
+| `method` | string | `auto` | Capture method: `auto`=screen BitBlt (no cursor); `wgc`=Windows Graphics Capture composited frame (experimental, includes cursor) |
+
+One PNG per monitor, plus the label of each display.
 
 ### `resize_window`
 

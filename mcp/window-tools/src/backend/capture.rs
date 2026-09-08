@@ -12,6 +12,7 @@ use windows::{
             HGDIOBJ, HMONITOR, MONITORINFO, SRCCOPY,
         },
         Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS},
+        UI::WindowsAndMessaging::IsIconic,
     },
 };
 
@@ -199,6 +200,17 @@ fn hwnd_num_str(hwnd: HWND) -> String {
 }
 
 fn capture_window_inner(hwnd: HWND, client_only: bool) -> Result<WindowCapture, ToolError> {
+    // 最小化窗口确定性拒绝:GetWindowRect 对最小化窗口返回 (-32000,-32000)
+    // 位置但尺寸仍为正,尺寸预检拦不住;WGC 缓存会话还会复用最小化前的旧帧。
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        return Err(ToolError::new(
+            WINDOW_NOT_VISIBLE,
+            format!(
+                "窗口 hwnd={} 已最小化，拒绝截图；恢复窗口后重试",
+                hwnd_num_str(hwnd)
+            ),
+        ));
+    }
     let rect = if client_only {
         client_rect_of(hwnd)?
     } else {

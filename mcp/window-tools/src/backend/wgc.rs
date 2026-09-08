@@ -3,7 +3,9 @@
 //! 与 PrintWindow 的区别:WGC 从 DWM 合成器直接取帧,GPU 加速窗口不再出
 //! 近纯黑,也无需屏幕采样回退;被遮挡窗口照样产出完整内容。代价是全新的
 //! 依赖面(D3D11/DXGI/WinRT 互操作)与三处能力边界:
-//! - 最小化窗口不产帧(新会话首帧轮询预算 10s + 外层 15s 硬超时兜底);
+//! - 最小化窗口确定性拒绝(v0.6.1 起 IsIconic → WINDOW_NOT_VISIBLE;
+//!   GetWindowRect 对最小化窗口位置 -32000 但尺寸仍为正,尺寸预检拦不住,
+//!   缓存会话还会复用最小化前的旧帧);
 //! - DRM 保护内容被拒或黑区;
 //! - 系统级 CaptureSession 存在并发上限(本模块缓存上限 4 主动规避)。
 //!
@@ -62,7 +64,7 @@ use windows::{
                 Graphics::Capture::IGraphicsCaptureItemInterop,
             },
         },
-        UI::WindowsAndMessaging::IsWindow,
+        UI::WindowsAndMessaging::{IsIconic, IsWindow},
     },
 };
 
@@ -146,7 +148,19 @@ pub(crate) fn capture_window_wgc_cached(
     client_only: bool,
     incremental: bool,
 ) -> Result<WindowCapture, ToolError> {
-    // 尺寸预检与 GDI 路径一致:最小化窗口(矩形 -32000)直接结构化拒绝。
+    // 最小化窗口确定性拒绝:缓存会话对最小化窗口不产帧,若复用旧帧会返回
+    // 最小化前的过期内容;尺寸预检拦不住(最小化窗口矩形位置 -32000 但尺寸
+    // 仍为正),须显式检查。
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        return Err(ToolError::new(
+            WINDOW_NOT_VISIBLE,
+            format!(
+                "窗口 hwnd={} 已最小化，拒绝截图；恢复窗口后重试",
+                hwnd.0 as isize
+            ),
+        ));
+    }
+    // 尺寸预检与 GDI 路径一致:退化矩形(宽高非正)直接结构化拒绝。
     let rect = if client_only {
         client_rect_of(hwnd)?
     } else {
@@ -207,8 +221,11 @@ struct CachedSession {
     key: SessionKey,
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
-    /// 最近一帧的实际尺寸(帧 ContentSize,非 GDI 矩形)。
+    /// 最近一帧的实际尺寸(帧纹理尺寸,非 GDI 矩形)。
     size: (u32, u32),
+    /// 最近一帧的 ContentSize(捕获项当前尺寸)。帧纹理固定于建池时的
+    /// item 尺寸,窗口调整大小后只有 ContentSize 变化,尺寸变化检测以此为准。
+    content_size: (u32, u32),
     /// 上次成功读取的帧 BGRA:全帧模式无新帧时重编码复用,
     /// 增量模式作差分基线。
     last_bgra: Option<Vec<u8>>,
@@ -264,15 +281,27 @@ fn capture_cached_inner(
         }
     };
     let mut fresh = idx.is_none();
-    // 尺寸变化时重建会话(最多一次):窗口调整大小后帧尺寸与会话不符。
+    // 尺寸变化时重建会话(最多一次):帧纹理固定于建池时的 item 尺寸,
+    // 窗口调整大小后只有 ContentSize 跟随变化——以 ContentSize 为准检测;
+    // 纹理与 ContentSize 不符(建池时 item 尺寸异常)同样触发重建。
     for attempt in 0..2u8 {
         match poll_or_wait_frame(&dev, &sess, fresh)? {
-            FrameArrival::Frame { bgra, fw, fh } => {
-                if !fresh && (fw, fh) != sess.size && attempt == 0 {
+            FrameArrival::Frame {
+                bgra,
+                fw,
+                fh,
+                cw,
+                ch,
+            } => {
+                let content_changed = !fresh && (cw, ch) != sess.content_size;
+                let tex_mismatch = (fw, fh) != (cw, ch);
+                if attempt == 0 && (content_changed || tex_mismatch) {
                     crate::log_info!(
-                        "wgc-cache: 帧尺寸变化 {}x{} -> {}x{},重建会话",
-                        sess.size.0,
-                        sess.size.1,
+                        "wgc-cache: 帧尺寸变化 {}x{} -> {}x{} (tex {}x{}),重建会话",
+                        sess.content_size.0,
+                        sess.content_size.1,
+                        cw,
+                        ch,
                         fw,
                         fh
                     );
@@ -281,6 +310,7 @@ fn capture_cached_inner(
                     continue;
                 }
                 sess.size = (fw, fh);
+                sess.content_size = (cw, ch);
                 let result = build_result(&mut sess, bgra, fw, fh, incremental, rect);
                 if result.is_ok() {
                     sess.last_used = Instant::now();
@@ -303,8 +333,35 @@ fn capture_cached_inner(
 }
 
 enum FrameArrival {
-    Frame { bgra: Vec<u8>, fw: u32, fh: u32 },
+    Frame {
+        bgra: Vec<u8>,
+        fw: u32,
+        fh: u32,
+        /// 帧 ContentSize:捕获项当前尺寸,尺寸变化检测的依据
+        /// (帧纹理固定于建池尺寸,窗口调整后纹理不变)。
+        cw: u32,
+        ch: u32,
+    },
     None,
+}
+
+/// 帧就位:读纹理 BGRA + ContentSize,组装 FrameArrival。
+fn frame_arrival(
+    dev: &CachedDevice,
+    frame: &Direct3D11CaptureFrame,
+) -> Result<FrameArrival, ToolError> {
+    let (bgra, fw, fh) = frame_to_bgra(dev, frame)?;
+    let (cw, ch) = frame
+        .ContentSize()
+        .map(|s| (s.Width as u32, s.Height as u32))
+        .unwrap_or((fw, fh));
+    Ok(FrameArrival::Frame {
+        bgra,
+        fw,
+        fh,
+        cw,
+        ch,
+    })
 }
 
 /// 取帧:新会话等待首帧(10s 预算,与 v0.4.0 行为一致);既有会话立即取帧,
@@ -319,19 +376,16 @@ fn poll_or_wait_frame(
     if fresh {
         let frame = wait_first_frame(&sess.pool, POLL_BUDGET_MS)?;
         let _guard = FrameGuard(frame);
-        let (bgra, fw, fh) = frame_to_bgra(dev, &_guard.0)?;
-        return Ok(FrameArrival::Frame { bgra, fw, fh });
+        return frame_arrival(dev, &_guard.0);
     }
     if let Some(frame) = try_next_frame(&sess.pool)? {
         let _guard = FrameGuard(frame);
-        let (bgra, fw, fh) = frame_to_bgra(dev, &_guard.0)?;
-        return Ok(FrameArrival::Frame { bgra, fw, fh });
+        return frame_arrival(dev, &_guard.0);
     }
     std::thread::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS));
     if let Some(frame) = try_next_frame(&sess.pool)? {
         let _guard = FrameGuard(frame);
-        let (bgra, fw, fh) = frame_to_bgra(dev, &_guard.0)?;
-        return Ok(FrameArrival::Frame { bgra, fw, fh });
+        return frame_arrival(dev, &_guard.0);
     }
     Ok(FrameArrival::None)
 }
@@ -696,6 +750,7 @@ fn create_session(
         pool,
         session,
         size: (size.Width as u32, size.Height as u32),
+        content_size: (size.Width as u32, size.Height as u32),
         last_bgra: None,
         last_used: Instant::now(),
     })
@@ -943,7 +998,7 @@ mod tests {
 
     #[test]
     fn diff_single_region_returns_exact_box() {
-        let mut a = frame(16, 8, 0);
+        let a = frame(16, 8, 0);
         let mut b = a.clone();
         // 改 (x=4..=6, y=2..=3) 像素
         for y in 2..4 {
@@ -958,10 +1013,10 @@ mod tests {
 
     #[test]
     fn diff_two_distant_regions_yields_two_bands() {
-        let mut a = frame(32, 32, 0);
+        let a = frame(32, 32, 0);
         let mut b = a.clone();
         for x in 0..4 {
-            let top = (1 * 32 + x) * 4;
+            let top = (32 + x) * 4;
             let bottom = (30 * 32 + x) * 4;
             b[top] = 9;
             b[bottom] = 9;
@@ -975,7 +1030,7 @@ mod tests {
     #[test]
     fn diff_many_bands_coalesces_to_bounding_box() {
         // 每两行一个变化带(第 0,2,...,18 行),带数 > max_regions → 合并为外接盒
-        let mut a = frame(8, 20, 0);
+        let a = frame(8, 20, 0);
         let mut b = a.clone();
         for y in (0..20).step_by(2) {
             b[(y * 8) * 4] = 1;

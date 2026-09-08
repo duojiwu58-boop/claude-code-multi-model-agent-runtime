@@ -447,7 +447,7 @@ pub fn tools_list() -> Value {
         },
         {
             "name": TOOL_SCREENSHOT_WINDOW,
-            "description": "截取指定窗口的渲染内容。client_only=false（默认）包含标题栏和边框；true 仅截客户区。hwnd 可为 @active；其余定位必须且只能用 hwnd / title / pid 之一。单窗口最高 1200 万像素，超限请先 resize_window。method=auto（默认）时 PrintWindow 输出近纯黑(部分 GPU 加速窗口)或失败先试 WGC 合成帧(实验)，仍不可用再回退屏幕采样，被遮挡区域按屏幕当前显示内容；method=wgc 直接走 Windows Graphics Capture GPU 合成帧(实验)，被遮挡窗口也产出完整内容，但最小化窗口不产帧(等待超时)、DRM 保护内容被拒或黑区，且边框策略随系统版本不同(Win10 不支持去边框)。incremental=true(仅 method=wgc，实验)启用增量差分：首次调用返回完整基线帧，后续调用只返回相对上次的变化区域图像(文本列出帧坐标矩形)，无变化时仅返回文本零图像；会话跨调用缓存：有变化时约 10-30ms，静态窗口约 100ms(等待确认无新帧)。响应文本 fallback= 标注 PrintWindow 未产出时的实际来源(wgc / screen)。",
+            "description": "截取指定窗口的渲染内容。client_only=false（默认）包含标题栏和边框；true 仅截客户区。hwnd 可为 @active；其余定位必须且只能用 hwnd / title / pid 之一。单窗口最高 1200 万像素，超限请先 resize_window。method=auto（默认）时 PrintWindow 输出近纯黑(部分 GPU 加速窗口)或失败先试 WGC 合成帧(实验)，仍不可用再回退屏幕采样，被遮挡区域按屏幕当前显示内容；method=wgc 直接走 Windows Graphics Capture GPU 合成帧(实验)，被遮挡窗口也产出完整内容，但最小化窗口确定性返回 WINDOW_NOT_VISIBLE、DRM 保护内容被拒或黑区，且边框策略随系统版本不同(Win10 不支持去边框)。incremental=true(仅 method=wgc，实验)启用增量差分：首次调用返回完整基线帧，后续调用只返回相对上次的变化区域图像(文本列出帧坐标矩形)，无变化时仅返回文本零图像；会话跨调用缓存：有变化时约 10-30ms，静态窗口约 100ms(等待确认无新帧)。响应文本 fallback= 标注 PrintWindow 未产出时的实际来源(wgc / screen)。",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",

@@ -9,8 +9,14 @@ $psi.RedirectStandardInput = $true
 $psi.RedirectStandardOutput = $true
 $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
 $psi.CreateNoWindow = $true
-$proc = [System.Diagnostics.Process]::Start($psi)
 Add-Type -Namespace W -Name G -MemberDefinition '[DllImport("user32.dll")] public static extern uint GetGuiResources(System.IntPtr hProcess, uint uiFlags);'
+Add-Type -Namespace W -Name U -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(System.IntPtr hWnd, int nCmdShow);'
+# 服务端日志落盘:WGC 生命周期测试(LRU 淘汰/会话清扫/尺寸重建)以日志为证据
+$logPath = Join-Path $env:TEMP 'wt-e2e.log'
+Remove-Item $logPath -Force -ErrorAction SilentlyContinue
+$psi.EnvironmentVariables['WT_LOG_LEVEL'] = 'info'
+$psi.EnvironmentVariables['WT_LOG_FILE'] = $logPath
+$proc = [System.Diagnostics.Process]::Start($psi)
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $stdin = $proc.StandardInput.BaseStream
 $stdout = $proc.StandardOutput
@@ -39,6 +45,16 @@ function Tool-Payload($r) {
   $t = $r.result.content[0].text
   if ($t -is [string] -and $t.StartsWith('{')) { return ($t | ConvertFrom-Json) }
   return @{ text = $t }
+}
+function Png-Dims($content) {
+  $img = $content | Where-Object { $_.type -eq 'image' } | Select-Object -First 1
+  if ($null -eq $img) { return @(0, 0) }
+  $b = [Convert]::FromBase64String($img.data)
+  # PNG 签名 8 字节 + IHDR;宽度偏移 16、高度偏移 20,大端 u32。
+  # 注意 -shl 左操作数必须 [int]:[byte] 会在 byte 算术中回绕(1 -shl 8 = 0)。
+  $w = ([int]$b[16] -shl 24) -bor ([int]$b[17] -shl 16) -bor ([int]$b[18] -shl 8) -bor [int]$b[19]
+  $h = ([int]$b[20] -shl 24) -bor ([int]$b[21] -shl 16) -bor ([int]$b[22] -shl 8) -bor [int]$b[23]
+  return @([int]$w, [int]$h)
 }
 function Check($name, $cond, $detail) {
   if ($cond) { $script:pass++; Write-Output ("PASS  " + $name + "  " + $detail) }
@@ -292,9 +308,115 @@ while ($true) { Start-Sleep -Seconds 60 }
     $inc4 = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$true; method='wgc'; incremental=$true }
     $inc4Img = ($inc4.result.content | Where-Object { $_.type -eq 'image' }).Count
     Check 'incremental settles back to no-change' ((-not $inc4.result.isError) -and $inc4Img -eq 0) ($inc4.result.content[0].text)
+
+    # --- ① 最小化中途:缓存会话后最小化 → 确定性结构化拒绝(不挂 15s),恢复后正常 ---
+    # 背景:GetWindowRect 对最小化窗口返回 (-32000,-32000) 位置但尺寸仍为正,
+    # 尺寸预检拦不住;缓存会话还会复用最小化前的旧帧。v0.6.1 起 IsIconic 显式拒绝。
+    $null = [W.U]::ShowWindow([IntPtr][int64]$fh, 6)  # SW_MINIMIZE
+    Start-Sleep -Milliseconds 500
+    $swMin = [System.Diagnostics.Stopwatch]::StartNew()
+    $min1 = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$false; method='wgc' }
+    $swMin.Stop()
+    Check 'wgc minimized (cached session) -> structured reject fast' ($min1.result.isError -and $min1.result.error_code -eq 'WINDOW_NOT_VISIBLE' -and $swMin.Elapsed.TotalMilliseconds -lt 3000) ("code=" + $min1.result.error_code + " elapsed=" + [Math]::Round($swMin.Elapsed.TotalMilliseconds) + "ms " + $min1.result.content[0].text)
+    $minInc = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$true; method='wgc'; incremental=$true }
+    Check 'incremental minimized -> structured reject' ($minInc.result.isError -and $minInc.result.error_code -eq 'WINDOW_NOT_VISIBLE') ("code=" + $minInc.result.error_code + " " + $minInc.result.content[0].text)
+    $minAuto = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$false; method='auto' }
+    Check 'auto minimized -> structured reject' ($minAuto.result.isError -and $minAuto.result.error_code -eq 'WINDOW_NOT_VISIBLE') ("code=" + $minAuto.result.error_code + " " + $minAuto.result.content[0].text)
+    $null = [W.U]::ShowWindow([IntPtr][int64]$fh, 9)  # SW_RESTORE
+    Start-Sleep -Milliseconds 600
+    $min2 = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$false; method='wgc' }
+    Check 'wgc after restore works again' ((-not $min2.result.isError) -and $min2.result.content.Count -ge 2) ($min2.result.content[0].text)
+
+    # --- ② 会话缓存压力:同一窗口连续 50 次,句柄/内存有界 + 复用标记 ---
+    $hp = Get-Process -Id $proc.Id
+    $w50g0 = [W.G]::GetGuiResources($hp.Handle, 0)
+    $w50h0 = $hp.HandleCount
+    $w50ws0 = $hp.WorkingSet64
+    $sw50 = [System.Diagnostics.Stopwatch]::StartNew()
+    $reusedSeen = $false
+    for ($i = 0; $i -lt 50; $i++) {
+      $r = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$false; method='wgc' }
+      if ($r.result.isError) { throw ("wgc 50x iteration $i failed: " + $r.result.content[0].text) }
+      if ($r.result.content[0].text -match '复用上次帧') { $reusedSeen = $true }
+    }
+    $sw50.Stop()
+    $hp4 = Get-Process -Id $proc.Id
+    $w50g1 = [W.G]::GetGuiResources($hp4.Handle, 0)
+    $w50h1 = $hp4.HandleCount
+    $w50ws1 = $hp4.WorkingSet64
+    Check 'wgc session cache 50x handle bounded' (($w50g1 -le $w50g0 + 1) -and ($w50h1 -le $w50h0 + 3)) ("gdi " + $w50g0 + "->" + $w50g1 + ", handles " + $w50h0 + "->" + $w50h1 + ", " + [Math]::Round($sw50.Elapsed.TotalMilliseconds) + "ms/50")
+    Check 'wgc session cache 50x memory bounded' (($w50ws1 - $w50ws0) -lt 64MB) ("ws +" + [Math]::Round(($w50ws1 - $w50ws0) / 1MB, 1) + "MB")
+    Check 'wgc session reuse observed in 50x' ($reusedSeen) "复用上次帧 seen"
+
+    # --- ⑤ 尺寸变化:调整窗口后采集必须反映新尺寸(会话重建路径,E2E 首验) ---
+    $sz0 = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$false; method='wgc' }
+    $oldDims = Png-Dims $sz0.result.content
+    Check 'wgc pre-resize frame measured' ((-not $sz0.result.isError) -and $oldDims[0] -gt 100) ("frame=" + $oldDims[0] + "x" + $oldDims[1])
+    $rz5 = Send-Tool 'resize_window' @{ hwnd=$fh; width=640; height=480 }
+    Check 'probe resize to 640x480' (-not $rz5.result.isError) $rz5.result.content[0].text
+    Start-Sleep -Milliseconds 700
+    $sz1 = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$false; method='wgc' }
+    $newDims = Png-Dims $sz1.result.content
+    Check 'wgc after resize reflects new size' ((-not $sz1.result.isError) -and ([Math]::Abs($newDims[0] - 640) -le 20) -and ([Math]::Abs($newDims[1] - 480) -le 20) -and ($newDims[0] -ne $oldDims[0])) ("frame " + $oldDims[0] + "x" + $oldDims[1] + " -> " + $newDims[0] + "x" + $newDims[1] + " " + $sz1.result.content[0].text)
+
+    # --- ③ 多会话并发:5 个窗口会话(缓存上限 4)触发 LRU 淘汰,淘汰不破坏在用会话 ---
+    $lruProc = @()
+    for ($i = 0; $i -lt 5; $i++) { $lruProc += (Start-Process winver -PassThru) }
+    Start-Sleep -Milliseconds 2500
+    $lruH = @()
+    for ($i = 0; $i -lt 5; $i++) {
+      $plw = Send-Tool 'list_windows' @{ pid=$lruProc[$i].Id }
+      $plwp = Tool-Payload $plw
+      if (-not $plwp -or $plwp.count -lt 1) { throw ("lru winver $i not found") }
+      $lruH += [string]$plwp.windows[0].hwnd
+    }
+    for ($i = 0; $i -lt 5; $i++) {
+      $r = Send-Tool 'screenshot_window' @{ hwnd=$lruH[$i]; client_only=$false; method='wgc' }
+      if ($r.result.isError) { throw ("lru create $i failed: " + $r.result.content[0].text) }
+    }
+    # 第 5 个会话新建时 LRU 淘汰了最旧的 win1 → 重捕 win1 = 全新会话(无复用标记)
+    $l1 = Send-Tool 'screenshot_window' @{ hwnd=$lruH[0]; client_only=$false; method='wgc' }
+    Check 'lru evicted window recaptured fresh' ((-not $l1.result.isError) -and ($l1.result.content[0].text -notmatch '复用上次帧')) ($l1.result.content[0].text)
+    # 重捕 win1 淘汰了当时最旧的 win2 → win2 重捕同样无复用标记(淘汰级联正确)
+    $l2 = Send-Tool 'screenshot_window' @{ hwnd=$lruH[1]; client_only=$false; method='wgc' }
+    Check 'lru eviction cascades to then-oldest' ((-not $l2.result.isError) -and ($l2.result.content[0].text -notmatch '复用上次帧')) ($l2.result.content[0].text)
+    # 未被淘汰的 win5 复用缓存会话,不受两次淘汰影响
+    $l5 = Send-Tool 'screenshot_window' @{ hwnd=$lruH[4]; client_only=$false; method='wgc' }
+    Check 'lru in-use session unharmed' ((-not $l5.result.isError) -and ($l5.result.content[0].text -match '复用上次帧')) ($l5.result.content[0].text)
+
+    # --- ④ 窗口销毁中途 + 无会话最小化:结构化错误、会话清扫、服务存活 ---
+    $wp6 = Start-Process winver -PassThru
+    Start-Sleep -Milliseconds 1500
+    $plw6 = Send-Tool 'list_windows' @{ pid=$wp6.Id }
+    $plwp6 = Tool-Payload $plw6
+    $h6 = [string]$plwp6.windows[0].hwnd
+    $null = [W.U]::ShowWindow([IntPtr][int64]$h6, 6)
+    Start-Sleep -Milliseconds 400
+    $swMin2 = [System.Diagnostics.Stopwatch]::StartNew()
+    $min6 = Send-Tool 'screenshot_window' @{ hwnd=$h6; client_only=$false; method='wgc' }
+    $swMin2.Stop()
+    Check 'wgc fresh minimized -> structured reject fast' ($min6.result.isError -and $min6.result.error_code -eq 'WINDOW_NOT_VISIBLE' -and $swMin2.Elapsed.TotalMilliseconds -lt 3000) ("code=" + $min6.result.error_code + " elapsed=" + [Math]::Round($swMin2.Elapsed.TotalMilliseconds) + "ms")
+    $null = [W.U]::ShowWindow([IntPtr][int64]$h6, 9)
+    Start-Sleep -Milliseconds 500
+    $cap6 = Send-Tool 'screenshot_window' @{ hwnd=$h6; client_only=$false; method='wgc' }
+    Check 'wgc fresh restored captures ok' ((-not $cap6.result.isError) -and $cap6.result.content.Count -ge 2) ($cap6.result.content[0].text)
+    $wp6.Kill()
+    $null = $wp6.WaitForExit(3000)
+    Start-Sleep -Milliseconds 300
+    $dead = Send-Tool 'screenshot_window' @{ hwnd=$h6; client_only=$false; method='wgc' }
+    Check 'wgc destroyed window -> WINDOW_NOT_FOUND' ($dead.result.isError -and $dead.result.error_code -eq 'WINDOW_NOT_FOUND') ("code=" + $dead.result.error_code + " " + $dead.result.content[0].text)
+    $alive = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$false; method='wgc' }
+    Check 'capture alive window after destroy' ((-not $alive.result.isError) -and $alive.result.content.Count -ge 2) ($alive.result.content[0].text)
   }
   if (!$probeProc.HasExited) { Stop-Process -Id $probeProc.Id -Force -ErrorAction SilentlyContinue }
   Remove-Item $probeFile, $probeOut -Force -ErrorAction SilentlyContinue
+
+  # --- WGC 生命周期日志证据(WT_LOG_FILE 落盘) ---
+  $logText = if (Test-Path $logPath) { Get-Content -Raw -Encoding UTF8 $logPath } else { '' }
+  Check 'log: LRU eviction recorded' ($logText -match 'LRU 淘汰') "wgc-cache evict"
+  Check 'log: dead session swept' ($logText -match '清理已销毁窗口会话') "wgc-cache sweep"
+  Check 'log: session rebuild on resize recorded' ($logText -match '重建会话') "wgc-cache rebuild"
+  Remove-Item $logPath -Force -ErrorAction SilentlyContinue
 
   Write-Output ""
   Write-Output ("RESULT: " + $pass + " passed, " + $fail + " failed")

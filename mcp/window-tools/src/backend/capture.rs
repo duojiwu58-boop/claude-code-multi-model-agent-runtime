@@ -330,8 +330,8 @@ fn bgra_looks_black(bgra: &[u8]) -> bool {
     dark as f64 / (bgra.len() / 4) as f64 > BLACK_RATIO
 }
 
-/// BGRA → RGBA → PNG(窗口与屏幕两条采集路径共用)。
-fn bgra_to_rgba_png(width: i32, height: i32, bgra: &[u8]) -> Result<Vec<u8>, ToolError> {
+/// BGRA → RGBA → PNG(窗口/屏幕/WGC 三条采集路径共用)。
+pub(crate) fn bgra_to_rgba_png(width: i32, height: i32, bgra: &[u8]) -> Result<Vec<u8>, ToolError> {
     let mut rgba = Vec::with_capacity(bgra.len());
     for px in bgra.chunks_exact(4) {
         rgba.extend_from_slice(&[px[2], px[1], px[0], 0xFF]); // BGRA → RGBA

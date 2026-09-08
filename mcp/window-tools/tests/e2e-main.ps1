@@ -137,6 +137,12 @@ try {
   $swC = Send-Tool 'screenshot_window' @{ hwnd=$nh; client_only=$true }
   Check 'screenshot_window client_only' ((-not $swC.result.isError) -and $swC.result.content.Count -ge 2) ($swC.result.content[0].text + " b64len=" + $swC.result.content[1].data.Length)
 
+  # --- WGC 实验路径:GPU 合成帧,独立于 PrintWindow/屏幕采样 ---
+  $wg = Send-Tool 'screenshot_window' @{ hwnd=$nh; client_only=$false; method='wgc' }
+  Check 'screenshot_window method=wgc winver' ((-not $wg.result.isError) -and $wg.result.content.Count -ge 2 -and $wg.result.content[1].mimeType -eq 'image/png' -and $wg.result.content[1].data.StartsWith('iVBORw0KGgo')) ($wg.result.content[0].text + " b64len=" + $wg.result.content[1].data.Length)
+  $wgBad = Send-Tool 'screenshot_window' @{ hwnd=$nh; method='bogus' }
+  Check 'screenshot_window unknown method rejected' ($wgBad.result.isError) $wgBad.result.content[0].text
+
   # --- screenshot_all ---
   $sa = Send-Tool 'screenshot_all' @{}
   $imgCount = 0; $txtLines = @()
@@ -224,6 +230,18 @@ while ($true) { Start-Sleep -Seconds 60 }
     $foc = Send-Tool 'inspect_focused_element' @{}
     $pfo = Tool-Payload $foc
     Check 'inspect_focused_element returns an element' ($null -ne $pfo -and $pfo.element.control_type -ne 'Unknown') ("type=" + $pfo.element.control_type + " name=" + $pfo.element.name)
+    # --- WGC 重复采集:每次调用独立建链(D3D11 设备/帧池/会话/帧),句柄须有界 ---
+    $hp = Get-Process -Id $proc.Id
+    $wg0 = [W.G]::GetGuiResources($hp.Handle, 0)
+    $hwg0 = $hp.HandleCount
+    for ($i = 0; $i -lt 3; $i++) {
+      $wgr = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$false; method='wgc' }
+      if ($wgr.result.isError) { throw ("wgc iteration $i failed: " + $wgr.result.content[0].text) }
+    }
+    $hp3 = Get-Process -Id $proc.Id
+    $wg1 = [W.G]::GetGuiResources($hp3.Handle, 0)
+    $hwg1 = $hp3.HandleCount
+    Check 'wgc 3x capture handle bounded' (($wg1 -le $wg0 + 10) -and ($hwg1 -le $hwg0 + 25)) ("gdi " + $wg0 + "->" + $wg1 + ", handles " + $hwg0 + "->" + $hwg1)
   }
   if (!$probeProc.HasExited) { Stop-Process -Id $probeProc.Id -Force -ErrorAction SilentlyContinue }
   Remove-Item $probeFile, $probeOut -Force -ErrorAction SilentlyContinue

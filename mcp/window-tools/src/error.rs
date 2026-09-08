@@ -27,6 +27,9 @@ pub const LIMIT_EXCEEDED: &str = "LIMIT_EXCEEDED";
 pub const INPUT_FAILED: &str = "INPUT_FAILED";
 /// UIA 服务不可用或元素属性读取失败(COM 初始化失败、目标未实现 UIA 提供程序)。可重试。
 pub const UIA_UNAVAILABLE: &str = "UIA_UNAVAILABLE";
+/// WGC(Windows Graphics Capture)不可用:D3D11 设备创建失败、目标窗口受 DRM 保护、
+/// 捕获被系统拒绝或帧格式意外。环境/能力问题,重试无意义。
+pub const WGC_UNAVAILABLE: &str = "WGC_UNAVAILABLE";
 /// 不可预期内部错误(panic 路径)。应上报维护者。
 pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
 
@@ -83,6 +86,7 @@ mod tests {
         assert!(!ToolError::new(INVALID_ARGUMENT, "x").retryable);
         assert!(!ToolError::new(LIMIT_EXCEEDED, "x").retryable);
         assert!(!ToolError::new(INTERNAL_ERROR, "x").retryable);
+        assert!(!ToolError::new(WGC_UNAVAILABLE, "x").retryable);
         for code in [
             WINDOW_NOT_FOUND,
             WINDOW_NOT_VISIBLE,

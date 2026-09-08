@@ -1,6 +1,6 @@
 [package]
 name = "mcp-window-tools"
-version = "0.4.0-experimental"
+version = "0.4.1-experimental"
 edition = "2021"
 description = "通用 Windows GUI 工具集 (stdio MCP for Claude Code): 窗口观察、布局验证与安全输入驱动"
 license = "GPL-3.0-only"

@@ -142,13 +142,14 @@ impl Drop for GdiHandle {
     }
 }
 
-/// 窗口截图结果:PNG 数据、屏幕矩形与回退标注。
-/// `fallback=Some(...)` 表示 PrintWindow 路径未产出可用图像,已改用屏幕采样,
-/// 内容是窗口矩形区域在当前屏幕上的实际显示(遮挡与阴影按屏幕现状)。
+/// 窗口截图结果:PNG 数据、屏幕矩形与来源标注。
+/// `fallback=Some(...)` 表示 PrintWindow 路径未产出可用图像,实际来源改为
+/// 其他路径:`wgc (...)` = WGC 合成帧,`screen (...)` = 屏幕采样(窗口矩形
+/// 区域在屏幕上的当前显示,遮挡与阴影按屏幕现状)。
 pub struct WindowCapture {
     pub png: Vec<u8>,
     pub rect: RECT,
-    pub fallback: Option<&'static str>,
+    pub fallback: Option<String>,
 }
 
 pub fn capture_window(hwnd: HWND, client_only: bool) -> Result<WindowCapture, ToolError> {
@@ -241,23 +242,48 @@ fn capture_window_inner(hwnd: HWND, client_only: bool) -> Result<WindowCapture, 
             })
         }
         printed => {
-            // GPU 加速窗口的 PrintWindow 常产出近纯黑,或直接失败:
-            // 回退屏幕采样(与像素扫描工具同源,免疫 PrintWindow 黑屏)。
-            let reason = if printed.is_ok() {
-                "screen (PrintWindow 近纯黑)"
+            // GPU 加速窗口的 PrintWindow 常产出近纯黑,或直接失败:auto 链
+            // 先试 WGC(DWM 合成帧,免疫黑屏与被遮挡,仅非白名单路径才付出
+            // ~150-300ms 建链成本),WGC 不可用再回退屏幕采样(与像素扫描
+            // 工具同源)。WGC 失败只影响来源标注,不改变错误契约。
+            let print_reason = if printed.is_ok() {
+                "PrintWindow 近纯黑"
             } else {
-                "screen (PrintWindow 失败)"
+                "PrintWindow 失败"
             };
-            let png = capture_rect_from_screen(
-                hdc_screen, width, height, width, height, rect.left, rect.top,
-            )?;
-            Ok(WindowCapture {
-                png,
-                rect,
-                fallback: Some(reason),
-            })
+            match crate::backend::wgc::capture_window_wgc_inner(hwnd, client_only) {
+                Ok(wgc) => {
+                    crate::log_info!("capture: {print_reason},WGC 产出 {} bytes", wgc.png.len());
+                    Ok(WindowCapture {
+                        png: wgc.png,
+                        rect,
+                        fallback: Some(wgc_fallback_reason(print_reason)),
+                    })
+                }
+                Err(wgc_error) => {
+                    let png = capture_rect_from_screen(
+                        hdc_screen, width, height, width, height, rect.left, rect.top,
+                    )?;
+                    Ok(WindowCapture {
+                        png,
+                        rect,
+                        fallback: Some(screen_fallback_reason(print_reason, &wgc_error)),
+                    })
+                }
+            }
         }
     }
+}
+
+/// auto 链经 WGC 成功的来源标注。纯函数,便于单测。
+fn wgc_fallback_reason(print_reason: &str) -> String {
+    format!("wgc ({print_reason})")
+}
+
+/// auto 链 WGC 失败、屏幕采样兜底的来源标注(携带 WGC 失败原因供诊断)。
+/// 纯函数,便于单测。
+fn screen_fallback_reason(print_reason: &str, wgc_error: &ToolError) -> String {
+    format!("screen ({print_reason}; WGC 不可用: {wgc_error})")
 }
 
 /// PrintWindow → 32bpp DIB,返回自上而下的原始 BGRA(由调用方检测黑屏后再编码)。
@@ -718,6 +744,7 @@ pub fn capture_client_region_bgra(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::WGC_UNAVAILABLE;
 
     #[test]
     fn preserves_three_uhd_4k_monitors() {
@@ -779,5 +806,28 @@ mod tests {
         let bright = vec![16u8; 100 * 4];
         assert!(!bgra_looks_black(&bright));
         assert!(bgra_looks_black(&[]));
+    }
+
+    #[test]
+    fn auto_chain_annotates_wgc_and_screen_sources() {
+        // WGC 成功:标注 wgc 来源与 PrintWindow 失效原因(近纯黑/失败两态)。
+        assert_eq!(
+            wgc_fallback_reason("PrintWindow 近纯黑"),
+            "wgc (PrintWindow 近纯黑)"
+        );
+        assert_eq!(
+            wgc_fallback_reason("PrintWindow 失败"),
+            "wgc (PrintWindow 失败)"
+        );
+        // WGC 失败:标注 screen 来源并携带 WGC 失败原因供诊断。
+        let err = ToolError::new(WGC_UNAVAILABLE, "CreateForWindow 失败(窗口受 DRM 保护)");
+        assert_eq!(
+            screen_fallback_reason("PrintWindow 近纯黑", &err),
+            "screen (PrintWindow 近纯黑; WGC 不可用: CreateForWindow 失败(窗口受 DRM 保护))"
+        );
+        assert_eq!(
+            screen_fallback_reason("PrintWindow 失败", &err),
+            "screen (PrintWindow 失败; WGC 不可用: CreateForWindow 失败(窗口受 DRM 保护))"
+        );
     }
 }

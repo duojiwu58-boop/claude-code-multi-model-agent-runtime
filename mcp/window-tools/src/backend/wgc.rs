@@ -69,7 +69,7 @@ pub fn capture_window_wgc(hwnd: HWND, client_only: bool) -> Result<WindowCapture
     let raw = hwnd.0 as isize;
     run_with_timeout(
         CAPTURE_TIMEOUT_MS,
-        move || wgc_capture(HWND(raw as *mut core::ffi::c_void), client_only),
+        move || capture_window_wgc_inner(HWND(raw as *mut core::ffi::c_void), client_only),
         |ms| {
             ToolError::new(
                 WINDOW_HUNG,
@@ -79,7 +79,13 @@ pub fn capture_window_wgc(hwnd: HWND, client_only: bool) -> Result<WindowCapture
     )
 }
 
-fn wgc_capture(hwnd: HWND, client_only: bool) -> Result<WindowCapture, ToolError> {
+/// WGC 裸采集(auto 链复用):不做挂起/超时包装,由调用方保证。
+/// auto 链在 capture_window_inner 的 worker 内直接调用,外层 15s 硬超时
+/// 已覆盖首帧轮询(10s 预算);method=wgc 入口则经 capture_window_wgc 包装。
+pub(crate) fn capture_window_wgc_inner(
+    hwnd: HWND,
+    client_only: bool,
+) -> Result<WindowCapture, ToolError> {
     // 尺寸预检与 GDI 路径一致:最小化窗口(矩形 -32000)直接结构化拒绝。
     let rect = if client_only {
         client_rect_of(hwnd)?

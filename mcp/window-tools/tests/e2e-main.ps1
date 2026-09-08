@@ -136,6 +136,9 @@ try {
   Check 'screenshot_window winver' ((-not $sw.result.isError) -and $sw.result.content.Count -ge 2 -and $sw.result.content[1].mimeType -eq 'image/png' -and $sw.result.content[1].data.StartsWith('iVBORw0KGgo')) ($sw.result.content[0].text + " b64len=" + $sw.result.content[1].data.Length)
   $swC = Send-Tool 'screenshot_window' @{ hwnd=$nh; client_only=$true }
   Check 'screenshot_window client_only' ((-not $swC.result.isError) -and $swC.result.content.Count -ge 2) ($swC.result.content[0].text + " b64len=" + $swC.result.content[1].data.Length)
+  # --- auto 链来源标注契约:无回退,或标注必须是 wgc/screen 形态 ---
+  $swText = $sw.result.content[0].text
+  Check 'screenshot_window auto source annotation' ($swText -notmatch 'fallback=' -or $swText -match 'fallback=(wgc|screen) \(') $swText
 
   # --- WGC 实验路径:GPU 合成帧,独立于 PrintWindow/屏幕采样 ---
   $wg = Send-Tool 'screenshot_window' @{ hwnd=$nh; client_only=$false; method='wgc' }
@@ -242,6 +245,10 @@ while ($true) { Start-Sleep -Seconds 60 }
     $wg1 = [W.G]::GetGuiResources($hp3.Handle, 0)
     $hwg1 = $hp3.HandleCount
     Check 'wgc 3x capture handle bounded' (($wg1 -le $wg0 + 10) -and ($hwg1 -le $hwg0 + 25)) ("gdi " + $wg0 + "->" + $wg1 + ", handles " + $hwg0 + "->" + $hwg1)
+    # --- auto 链在 WinForms 窗口上完整走通,来源标注符合契约 ---
+    $fha = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$false; method='auto' }
+    $fhaText = if ($fha.result.content) { $fha.result.content[0].text } else { '' }
+    Check 'screenshot_window auto probe (chain)' ((-not $fha.result.isError) -and ($fhaText -notmatch 'fallback=' -or $fhaText -match 'fallback=(wgc|screen) \(')) $fhaText
   }
   if (!$probeProc.HasExited) { Stop-Process -Id $probeProc.Id -Force -ErrorAction SilentlyContinue }
   Remove-Item $probeFile, $probeOut -Force -ErrorAction SilentlyContinue

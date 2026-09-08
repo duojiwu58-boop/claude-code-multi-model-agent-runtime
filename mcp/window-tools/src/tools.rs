@@ -447,7 +447,7 @@ pub fn tools_list() -> Value {
         },
         {
             "name": TOOL_SCREENSHOT_WINDOW,
-            "description": "截取指定窗口的渲染内容。client_only=false（默认）包含标题栏和边框；true 仅截客户区。hwnd 可为 @active；其余定位必须且只能用 hwnd / title / pid 之一。单窗口最高 1200 万像素，超限请先 resize_window。method=auto（默认）时 PrintWindow 输出近纯黑(部分 GPU 加速窗口)或失败自动回退屏幕采样，被遮挡区域按屏幕当前显示内容；method=wgc 走 Windows Graphics Capture GPU 合成帧(实验)，被遮挡窗口也产出完整内容，但最小化窗口不产帧(等待超时)、DRM 保护内容被拒或黑区，且边框策略随系统版本不同(Win10 不支持去边框)。",
+            "description": "截取指定窗口的渲染内容。client_only=false（默认）包含标题栏和边框；true 仅截客户区。hwnd 可为 @active；其余定位必须且只能用 hwnd / title / pid 之一。单窗口最高 1200 万像素，超限请先 resize_window。method=auto（默认）时 PrintWindow 输出近纯黑(部分 GPU 加速窗口)或失败先试 WGC 合成帧(实验)，仍不可用再回退屏幕采样，被遮挡区域按屏幕当前显示内容；method=wgc 直接走 Windows Graphics Capture GPU 合成帧(实验)，被遮挡窗口也产出完整内容，但最小化窗口不产帧(等待超时)、DRM 保护内容被拒或黑区，且边框策略随系统版本不同(Win10 不支持去边框)。响应文本 fallback= 标注 PrintWindow 未产出时的实际来源(wgc / screen)。",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
@@ -456,7 +456,7 @@ pub fn tools_list() -> Value {
                     "title": {"type": "string", "description": "窗口标题子串"},
                     "pid": {"type": "integer", "description": "窗口所属进程 PID"},
                     "client_only": {"type": "boolean", "description": "仅截客户区，默认 false"},
-                    "method": {"type": "string", "enum": ["auto", "wgc"], "description": "采集方式：auto=PrintWindow+黑屏回退（默认）；wgc=Windows Graphics Capture GPU 合成帧（实验）"}
+                    "method": {"type": "string", "enum": ["auto", "wgc"], "description": "采集方式：auto=PrintWindow，近纯黑/失败先试 WGC 再回退屏幕采样（默认）；wgc=直接走 Windows Graphics Capture GPU 合成帧（实验）"}
                 },
                 "additionalProperties": false
             }

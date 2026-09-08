@@ -3,6 +3,29 @@
 本项目遵循向后兼容演进:工具 schema 只增不删,错误响应保留 MCP 惯用形状
 (content[text] + isError) 并新增机器可读字段。错误码一旦发布保持稳定(只增不改)。
 
+## [0.6.0-experimental] - 2026-09-08
+
+### 新增
+
+- **screenshot_all 的 WGC 显示器路径**:新增 `method` 参数(`auto`=屏幕 BitBlt,
+  默认,不含光标;`wgc`=Windows Graphics Capture 合成帧,实验,含光标)。
+  每台显示器一个一次性 `CreateForMonitor` 捕获会话(首帧预算 3s,不落缓存,
+  不挤占系统 CaptureSession 配额),单屏失败不中断其余;超预算时与 BitBlt
+  路径同比例 CPU 双线性缩放(纯函数 `resize_bgra`,与 StretchBlt 语义对齐)。
+
+### 变更
+
+- `capture_all_monitors` 拆出公共总预算/标签助手,两条路径共用;
+- `wait_first_frame` 预算参数化(窗口 10s / 显示器 3s——显示器无合成场景
+  应快速单屏报错,而不是把整次多屏调用拖到 15s 硬超时);
+- 响应文本每屏带 `method=` 标注。
+
+### 验证
+
+- 实测(3×2560x1440):644ms 三张全分辨率 PNG;单元测试 42 项(新增
+  resize_bgra 恒等/均值/通道对齐/非法尺寸);E2E 49+7 绿(新增
+  screenshot_all method=wgc 与未知 method 拒绝)。
+
 ## [0.5.0-experimental] - 2026-09-08
 
 ### 新增

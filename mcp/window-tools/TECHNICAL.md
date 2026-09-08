@@ -135,8 +135,12 @@ rect 预检 → 全局缓存 Mutex → 设备缓存(硬件→WARP,只建一次)
 - `EnumDisplayMonitors` 枚举逐屏;
 - 总预算 **3×UHD 4K(24,883,200 px)**:不超时保持 1.0 缩放;超过时所有屏用**同一比例**
   缩放(保持相对视觉布局一致);
-- 每屏再套单图预算;尺寸不同走 `StretchBlt`(缩放发生在采集阶段,不额外分配原图缓冲);
+- 每屏再套单图预算;尺寸不同 BitBlt 路径走 `StretchBlt`(缩放发生在采集阶段,
+  不额外分配原图缓冲);
 - 单屏失败不失败整体:错误以文本块随 PNG 一并返回。
+- **method=wgc**(v0.6.0):每屏一个一次性 `CreateForMonitor` 会话(首帧预算 3s,
+  不落缓存),帧含光标;超预算时 `resize_bgra` CPU 双线性缩放(纯函数,
+  与 StretchBlt 语义对齐)。实测 3×2560x1440 共 644ms。
 
 ### 4.4 resize_window / window_activate
 

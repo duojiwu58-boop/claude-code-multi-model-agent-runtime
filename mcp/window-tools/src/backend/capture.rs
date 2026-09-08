@@ -395,6 +395,7 @@ pub(crate) fn bgra_to_rgba_png(width: i32, height: i32, bgra: &[u8]) -> Result<V
 }
 
 struct MonitorRecord {
+    hmon: HMONITOR,
     rect: RECT,
     flags: u32,
 }
@@ -421,6 +422,7 @@ unsafe extern "system" fn monitor_proc(
     info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
     if unsafe { GetMonitorInfoW(hmon, &mut info) }.as_bool() {
         out.push(MonitorRecord {
+            hmon,
             rect: info.rcMonitor,
             flags: info.dwFlags,
         });
@@ -442,9 +444,137 @@ fn enum_monitors() -> Vec<MonitorRecord> {
 }
 
 /// 截取所有显示器,返回每台一张 PNG(带标签与尺寸元数据,单台失败不中断其余)。
+/// `method`: `auto` = 屏幕 BitBlt(默认,不含光标);`wgc` = Windows Graphics
+/// Capture 合成帧(实验,含光标;会话断开/锁定等无合成场景单屏报错)。
 /// 整体限时执行:GPU 驱动级卡死也不阻塞服务。
-pub fn capture_all_monitors() -> Result<Vec<MonitorShot>, ToolError> {
-    run_capture_with_timeout(CAPTURE_TIMEOUT_MS, capture_all_monitors_inner)
+pub fn capture_all_monitors(method: &str) -> Result<Vec<MonitorShot>, ToolError> {
+    match method {
+        "auto" => run_capture_with_timeout(CAPTURE_TIMEOUT_MS, capture_all_monitors_inner),
+        "wgc" => run_capture_with_timeout(CAPTURE_TIMEOUT_MS, capture_all_monitors_wgc_inner),
+        other => Err(ToolError::new(
+            INVALID_ARGUMENT,
+            format!("未知采集方式 '{other}'，支持 auto / wgc"),
+        )),
+    }
+}
+
+/// 总预算计算:BItBlt 与 WGC 两条路径共用(三台 UHD 4K 及以下保持 1.0)。
+fn monitors_total_scale(monitors: &[MonitorRecord]) -> Result<f64, ToolError> {
+    let total_pixels = monitors.iter().try_fold(0i64, |total, monitor| {
+        let width = monitor.rect.right - monitor.rect.left;
+        let height = monitor.rect.bottom - monitor.rect.top;
+        Ok::<_, ToolError>(total + checked_pixels(width, height)?)
+    })?;
+    Ok(if total_pixels > MAX_ALL_CAPTURE_PIXELS {
+        (MAX_ALL_CAPTURE_PIXELS as f64 / total_pixels as f64).sqrt()
+    } else {
+        1.0
+    })
+}
+
+fn monitor_label(index: usize, m: &MonitorRecord) -> String {
+    let width = m.rect.right - m.rect.left;
+    let height = m.rect.bottom - m.rect.top;
+    format!(
+        "monitor {} ({}x{} at {},{} as primary={})",
+        index + 1,
+        width,
+        height,
+        m.rect.left,
+        m.rect.top,
+        m.flags != 0
+    )
+}
+
+/// WGC 显示器路径:每台显示器一个一次性捕获会话(不落缓存),首帧预算 3s,
+/// 帧含光标。超过预算时用与 BitBlt 路径相同的统一比例 CPU 缩放。
+fn capture_all_monitors_wgc_inner() -> Result<Vec<MonitorShot>, ToolError> {
+    let monitors = enum_monitors();
+    if monitors.is_empty() {
+        return Err(ToolError::new(CAPTURE_FAILED, "未找到任何显示器"));
+    }
+    let total_scale = monitors_total_scale(&monitors)?;
+    let mut results = Vec::new();
+    for (index, m) in monitors.iter().enumerate() {
+        let width = m.rect.right - m.rect.left;
+        let height = m.rect.bottom - m.rect.top;
+        let label = monitor_label(index, m);
+        let (output_width, output_height) =
+            fit_capture_dimensions(width, height, MAX_WINDOW_CAPTURE_PIXELS, total_scale)?;
+        match crate::backend::wgc::capture_monitor_wgc(m.hmon) {
+            Ok((bgra, fw, fh)) => {
+                // 帧尺寸与显示器矩形物理像素一致;不一致时以帧为准缩放
+                // 到目标尺寸(等大时 resize 原样返回)。
+                let scaled = resize_bgra(&bgra, fw, fh, output_width as u32, output_height as u32)?;
+                let png = bgra_to_rgba_png(output_width, output_height, &scaled)?;
+                results.push(MonitorShot {
+                    label,
+                    source_width: width,
+                    source_height: height,
+                    output_width,
+                    output_height,
+                    png,
+                    error: None,
+                });
+            }
+            Err(error) => results.push(MonitorShot {
+                label,
+                source_width: width,
+                source_height: height,
+                output_width,
+                output_height,
+                png: Vec::new(),
+                error: Some(error),
+            }),
+        }
+    }
+    Ok(results)
+}
+
+/// BGRA 双线性缩放(下采样为主):WGC 显示器帧超过总预算时按统一比例缩小,
+/// 与 BitBlt 路径的 StretchBlt 语义对齐(平滑采样)。等大时原样返回。
+pub fn resize_bgra(
+    bgra: &[u8],
+    w: u32,
+    h: u32,
+    out_w: u32,
+    out_h: u32,
+) -> Result<Vec<u8>, ToolError> {
+    if w == 0 || h == 0 {
+        return Err(ToolError::new(INVALID_ARGUMENT, "缩放源尺寸必须为正数"));
+    }
+    checked_pixels(out_w as i32, out_h as i32)?;
+    if (w, h) == (out_w, out_h) {
+        return Ok(bgra.to_vec());
+    }
+    let mut out = vec![0u8; (out_w * out_h * 4) as usize];
+    let sx = w as f64 / out_w as f64;
+    let sy = h as f64 / out_h as f64;
+    for oy in 0..out_h {
+        for ox in 0..out_w {
+            // 目标像素中心映射回源坐标(半像素偏移),双线性插值。
+            let fx = (ox as f64 + 0.5) * sx - 0.5;
+            let fy = (oy as f64 + 0.5) * sy - 0.5;
+            let x0 = fx.floor().max(0.0) as u32;
+            let y0 = fy.floor().max(0.0) as u32;
+            let x1 = (x0 + 1).min(w - 1);
+            let y1 = (y0 + 1).min(h - 1);
+            let dx = (fx - x0 as f64).clamp(0.0, 1.0);
+            let dy = (fy - y0 as f64).clamp(0.0, 1.0);
+            let px = |x: u32, y: u32, c: usize| bgra[((y * w + x) * 4) as usize + c] as f64;
+            let o = ((oy * out_w + ox) * 4) as usize;
+            for c in 0..4 {
+                let p00 = px(x0, y0, c);
+                let p10 = px(x1, y0, c);
+                let p01 = px(x0, y1, c);
+                let p11 = px(x1, y1, c);
+                let top = p00 + (p10 - p00) * dx;
+                let bottom = p01 + (p11 - p01) * dx;
+                out[o + c] = (top + (bottom - top) * dy).round() as u8;
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn capture_all_monitors_inner() -> Result<Vec<MonitorShot>, ToolError> {
@@ -452,17 +582,8 @@ fn capture_all_monitors_inner() -> Result<Vec<MonitorShot>, ToolError> {
     if monitors.is_empty() {
         return Err(ToolError::new(CAPTURE_FAILED, "未找到任何显示器"));
     }
-    let total_pixels = monitors.iter().try_fold(0i64, |total, monitor| {
-        let width = monitor.rect.right - monitor.rect.left;
-        let height = monitor.rect.bottom - monitor.rect.top;
-        Ok::<_, ToolError>(total + checked_pixels(width, height)?)
-    })?;
     // 三台 UHD 4K 及以下保持 1.0；更多/更大的屏幕统一缩放，避免偏屏缩放。
-    let total_scale = if total_pixels > MAX_ALL_CAPTURE_PIXELS {
-        (MAX_ALL_CAPTURE_PIXELS as f64 / total_pixels as f64).sqrt()
-    } else {
-        1.0
-    };
+    let total_scale = monitors_total_scale(&monitors)?;
     let hdc_screen = unsafe { GetDC(None) };
     if hdc_screen.0.is_null() {
         return Err(ToolError::new(CAPTURE_FAILED, "GetDC 未返回屏幕设备上下文"));
@@ -473,15 +594,7 @@ fn capture_all_monitors_inner() -> Result<Vec<MonitorShot>, ToolError> {
     for (index, m) in monitors.iter().enumerate() {
         let width = m.rect.right - m.rect.left;
         let height = m.rect.bottom - m.rect.top;
-        let label = format!(
-            "monitor {} ({}x{} at {},{} as primary={})",
-            index + 1,
-            width,
-            height,
-            m.rect.left,
-            m.rect.top,
-            m.flags != 0
-        );
+        let label = monitor_label(index, m);
         // 对每台再套单图预算；这里会在 StretchBlt 期间直接生成缩小位图，
         // 不会为超大原图额外分配一个完整的像素缓冲。
         let (output_width, output_height) =
@@ -802,6 +915,50 @@ mod tests {
         let bad_pixels = checked_pixels(0, 10).unwrap_err();
         assert_eq!(bad_pixels.code, INVALID_ARGUMENT);
         assert!(!bad_pixels.retryable);
+    }
+
+    #[test]
+    fn resize_identity_returns_original_bytes() {
+        let src = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(resize_bgra(&src, 2, 1, 2, 1).unwrap(), src);
+    }
+
+    #[test]
+    fn resize_2x2_to_1x1_averages_all_pixels() {
+        // 半像素偏移映射:fx=fy=0.5 → 四像素均值
+        let src: Vec<u8> = vec![
+            0, 100, 10, 110, 200, 40, 30, 90, 4, 104, 14, 114, 204, 44, 34, 94,
+        ];
+        let out = resize_bgra(&src, 2, 2, 1, 1).unwrap();
+        assert_eq!(out.len(), 4);
+        for c in 0..4 {
+            let avg = ((src[c] as f64 + src[4 + c] as f64 + src[8 + c] as f64 + src[12 + c] as f64)
+                / 4.0)
+                .round() as u8;
+            assert_eq!(out[c], avg, "channel {c}");
+        }
+    }
+
+    #[test]
+    fn resize_downsample_preserves_channel_alignment() {
+        // 4x1 → 2x1:每两像素均值,通道对齐
+        let src: Vec<u8> = vec![
+            10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160,
+        ];
+        let out = resize_bgra(&src, 4, 1, 2, 1).unwrap();
+        assert_eq!(out.len(), 8);
+        assert_eq!(out[0], 30); // (10+50)/2
+        assert_eq!(out[1], 40);
+        assert_eq!(out[2], 50);
+        assert_eq!(out[3], 60);
+        assert_eq!(out[4], 110); // (90+130)/2
+        assert_eq!(out[7], 140);
+    }
+
+    #[test]
+    fn resize_rejects_zero_source_dimensions() {
+        let err = resize_bgra(&[], 0, 1, 1, 1).unwrap_err();
+        assert_eq!(err.code, INVALID_ARGUMENT);
     }
 
     #[test]

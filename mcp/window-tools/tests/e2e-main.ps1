@@ -151,6 +151,14 @@ try {
   $imgCount = 0; $txtLines = @()
   foreach ($c in $sa.result.content) { if ($c.type -eq 'image') { $imgCount++ } else { $txtLines += $c.text } }
   Check 'screenshot_all' ((-not $sa.result.isError) -and $imgCount -ge 1) ("images=" + $imgCount + " monitors-text: " + ($txtLines -join ' | ').Substring(0, [Math]::Min(160, ($txtLines -join ' | ').Length)))
+  # --- screenshot_all WGC 显示器路径:每屏一次 CreateForMonitor 会话(含光标) ---
+  $saw = Send-Tool 'screenshot_all' @{ method='wgc' }
+  $sawImg = 0; $sawTxt = @()
+  foreach ($c in $saw.result.content) { if ($c.type -eq 'image') { $sawImg++ } else { $sawTxt += $c.text } }
+  $sawText = $sawTxt -join ' | '
+  Check 'screenshot_all method=wgc' ((-not $saw.result.isError) -and $sawImg -ge 1 -and $sawText -match 'method=wgc') ("images=" + $sawImg + " " + $sawText.Substring(0, [Math]::Min(160, $sawText.Length)))
+  $sawBad = Send-Tool 'screenshot_all' @{ method='bogus' }
+  Check 'screenshot_all unknown method rejected' ($sawBad.result.isError) ($sawBad.result.content[0].text)
 
   # --- GDI leak loop: 50x screenshot_window on winver ---
   $hp = Get-Process -Id $proc.Id

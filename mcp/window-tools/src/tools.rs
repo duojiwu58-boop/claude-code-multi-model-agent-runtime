@@ -464,9 +464,15 @@ pub fn tools_list() -> Value {
         },
         {
             "name": TOOL_SCREENSHOT_ALL,
-            "description": "截取所有显示器（每台一张 PNG）。最高保留三台 UHD 4K（3840x2160）显示器的总像素；超过时按相同比例缩放，并返回原始与实际尺寸。",
+            "description": "截取所有显示器（每台一张 PNG）。最高保留三台 UHD 4K（3840x2160）显示器的总像素；超过时按相同比例缩放，并返回原始与实际尺寸。method=auto（默认）走屏幕 BitBlt，不含光标；method=wgc 走 Windows Graphics Capture 合成帧（实验），含光标，会话断开/锁定等无合成场景单屏报错。",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "method": {"type": "string", "enum": ["auto", "wgc"], "description": "采集方式：auto=屏幕 BitBlt（默认，不含光标）；wgc=Windows Graphics Capture 合成帧（实验，含光标）"}
+                },
+                "additionalProperties": false
+            }
         },
         {
             "name": TOOL_RESIZE_WINDOW,
@@ -697,7 +703,8 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
             }
         }
         TOOL_SCREENSHOT_ALL => {
-            let shots = capture_all_monitors()?;
+            let method = args.get("method").and_then(Value::as_str).unwrap_or("auto");
+            let shots = capture_all_monitors(method)?;
             let mut content = Vec::new();
             for shot in shots {
                 let dimensions = format!(
@@ -705,9 +712,9 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
                     shot.source_width, shot.source_height, shot.output_width, shot.output_height
                 );
                 if let Some(error) = shot.error {
-                    content.push(json!({"type": "text", "text": format!("{}: {dimensions}; 错误: {error}", shot.label)}));
+                    content.push(json!({"type": "text", "text": format!("{}: {dimensions}; method={method}; 错误: {error}", shot.label)}));
                 } else {
-                    content.push(json!({"type": "text", "text": format!("{}: {dimensions}; {} bytes", shot.label, shot.png.len())}));
+                    content.push(json!({"type": "text", "text": format!("{}: {dimensions}; method={method}; {} bytes", shot.label, shot.png.len())}));
                     content.push(json!({"type": "image", "data": B64.encode(&shot.png), "mimeType": "image/png"}));
                 }
             }

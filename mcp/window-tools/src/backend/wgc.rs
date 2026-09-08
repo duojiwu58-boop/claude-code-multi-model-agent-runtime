@@ -53,6 +53,7 @@ use windows::{
                 D3D11_USAGE_STAGING,
             },
             Dxgi::{Common::DXGI_FORMAT_B8G8R8A8_UNORM, IDXGIDevice},
+            Gdi::HMONITOR,
         },
         System::{
             Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
@@ -81,6 +82,9 @@ const MAX_CACHED_SESSIONS: usize = 4;
 /// 既有会话的空闲等待复用同间隔(一次,即一个 DWM 交付周期)。
 const POLL_INTERVAL_MS: u64 = 100;
 const POLL_BUDGET_MS: u64 = 10_000;
+/// 显示器会话首帧预算:显示器正常情况下帧立即到达,长预算只会把
+/// 多屏超时拖到 15s 硬超时,失去"单屏失败快速返回"的意义。
+const MONITOR_FRAME_BUDGET_MS: u64 = 3_000;
 /// 变化区域数量上限:超过则合并为单一外接盒(如光标拖动产生的离散变化),
 /// 保证响应体(图像块数量与总字节)有界。
 pub const MAX_DIRTY_REGIONS: usize = 8;
@@ -313,7 +317,7 @@ fn poll_or_wait_frame(
     fresh: bool,
 ) -> Result<FrameArrival, ToolError> {
     if fresh {
-        let frame = wait_first_frame(&sess.pool)?;
+        let frame = wait_first_frame(&sess.pool, POLL_BUDGET_MS)?;
         let _guard = FrameGuard(frame);
         let (bgra, fw, fh) = frame_to_bgra(dev, &_guard.0)?;
         return Ok(FrameArrival::Frame { bgra, fw, fh });
@@ -332,13 +336,60 @@ fn poll_or_wait_frame(
     Ok(FrameArrival::None)
 }
 
+/// 单显示器 WGC 采集(一次性会话,不落缓存):screenshot_all 的 wgc 路径。
+/// 与窗口路径同管线,CreateForWindow 换 CreateForMonitor;光标默认包含
+/// (屏幕 BitBlt 不含光标,这是 WGC 显示器路径的主要增益)。会话不缓存:
+/// 显示器会话长期持有会挤占系统 CaptureSession 配额,且 screenshot_all
+/// 属低频调用,建链成本可接受。
+pub(crate) fn capture_monitor_wgc(hmon: HMONITOR) -> Result<(Vec<u8>, u32, u32), ToolError> {
+    with_mta(|| {
+        let mut guard = wgc_cache().lock().unwrap_or_else(|e| e.into_inner());
+        let cache = &mut *guard;
+        let dev = ensure_device(&mut cache.device)?;
+        let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+            .map_err(|e| wgc_err(format!("创建 WGC 互操作工厂失败: {e}")))?;
+        let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(hmon) }.map_err(|e| {
+            wgc_err(format!(
+                "CreateForMonitor 失败(显示器不可捕获或跨权限级): {e}"
+            ))
+        })?;
+        let size = item
+            .Size()
+            .map_err(|e| wgc_err(format!("读取捕获项尺寸失败: {e}")))?;
+        if size.Width <= 0 || size.Height <= 0 {
+            return Err(ToolError::new(
+                WGC_UNAVAILABLE,
+                "显示器未产生可捕获内容（会话可能已断开或锁定）",
+            ));
+        }
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &dev.direct3d()?,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            size,
+        )
+        .map_err(|e| wgc_err(format!("创建捕获帧池失败: {e}")))?;
+        let session = pool
+            .CreateCaptureSession(&item)
+            .map_err(|e| wgc_err(format!("创建捕获会话失败: {e}")))?;
+        session
+            .StartCapture()
+            .map_err(|e| wgc_err(format!("启动捕获失败: {e}")))?;
+        let _session_guard = OneShotSessionGuard { session, pool };
+        let frame = wait_first_frame(&_session_guard.pool, MONITOR_FRAME_BUDGET_MS)?;
+        let _frame_guard = FrameGuard(frame);
+        frame_to_bgra(&dev, &_frame_guard.0)
+    })
+}
+
 /// 轮询等待 WGC 首帧。TryGetNextFrame 无帧时以 null + S_OK 返回
 /// (windows-core 表现为 `Err(Error::empty())`),并非协议错误;
-/// 每次间隔 100ms,总预算 10s,超预算后按不可用报错。
+/// 每次间隔 100ms,总预算由调用方指定,超预算后按不可用报错。
 fn wait_first_frame(
     pool: &Direct3D11CaptureFramePool,
+    budget_ms: u64,
 ) -> Result<Direct3D11CaptureFrame, ToolError> {
-    let deadline = Instant::now() + std::time::Duration::from_millis(POLL_BUDGET_MS);
+    let deadline = Instant::now() + std::time::Duration::from_millis(budget_ms);
     let mut polls = 0u32;
     loop {
         match try_next_frame(pool) {
@@ -360,7 +411,7 @@ fn wait_first_frame(
             }
             Ok(None) => {
                 return Err(wgc_err(format!(
-                    "窗口在 {POLL_BUDGET_MS}ms 预算内未产出帧(可能已最小化或合成停止)"
+                    "窗口在 {budget_ms}ms 预算内未产出帧(可能已最小化或合成停止)"
                 )))
             }
             Err(e) => return Err(e),
@@ -835,6 +886,20 @@ struct FrameGuard(Direct3D11CaptureFrame);
 impl Drop for FrameGuard {
     fn drop(&mut self) {
         let _ = self.0.Close();
+    }
+}
+
+/// 一次性会话守卫(显示器路径):先停会话再关池,声明顺序先于帧守卫,
+/// Drop 逆序执行保证帧先归还。
+struct OneShotSessionGuard {
+    session: GraphicsCaptureSession,
+    pool: Direct3D11CaptureFramePool,
+}
+
+impl Drop for OneShotSessionGuard {
+    fn drop(&mut self) {
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
     }
 }
 

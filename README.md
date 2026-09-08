@@ -127,7 +127,7 @@ For deeply adapted models, start from a verified template:
 - [Generic OpenAI-compatible provider](examples/providers/custom-openai.example.json)
 - [Capability overrides](examples/providers/capability-overrides.example.json)
 
-Open **Claude Code Model Center**, select **Reload profiles**, and choose a model. The next request uses it without restarting VS Code, Claude Code, or the service. Active Gemini 3.7-or-newer Flash Interactions profiles also expose hot **Low / Medium / High** Thinking controls.
+Open **Claude Code Model Center**, select **Reload profiles**, and choose a model. The next request uses it without restarting VS Code, Claude Code, or the service. Active Gemini 3.7-or-newer Flash Interactions profiles also expose hot **Low / Medium / High** Thinking controls. Active Qwen3.8-Max and DeepSeek V4 official Anthropic profiles expose a separate **Provider Reasoning** control with four tiers each — Qwen `none/low/medium/xhigh`, DeepSeek `none/low/high/max` — applied from the next request and persisted per profile; the two controls are never operable at the same time.
 
 The Model Center also offers a **Test selected model** button for the highlighted row — which need not carry the ✓, i.e. need not be the active model. It runs one real, non-streaming minimal inference (1-token output ceiling, thinking disabled) to validate the profile's transport, upstream URL, model ID, auth, effective proxy, and response parsing. The probe runs on a worker thread **asynchronously and never blocks the UI**: only the **Test** button is disabled and duplicate probes are refused while the window and every other action remain usable. The bridge resolves the selected profile read-only and sends the probe through that profile's own proxy-configured client, so the reported proxy mode/URL is the proxy the probe actually used (a LocalGemini profile follows the current Gemini transport proxy). The probe never switches or persists the active model, does not disturb in-flight requests, and stays side-effect free (no storable Interactions/Responses state), but it is a real call and may consume a small amount of quota. Results appear in the status label next to the model-list header and in the run log, in Chinese: the pass latency, or the failed stage/message (stage names and bridge-owned messages localized, upstream text preserved verbatim) — plus the per-phase network breakdown: **proxy mode** (proxy URL with credentials redacted, or direct), **connect/response-headers time**, **first-byte time**, **response-body-completion time**, and **total time**. The response-headers phase deliberately includes DNS, connect, proxy tunnel, TLS, retries, and upstream queue time, so a reused connection is not misreported as a standalone connect time.
 
@@ -220,7 +220,7 @@ The original media goes to the vision provider and the extracted observation goe
 
 ### Per-model reasoning policy
 
-A top-level profile value such as `"reasoning_effort": "high"` can override Claude Code's process/request effort for that model. Accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; each transport maps or clamps them to what its upstream actually supports. See the [complete capability reference](PROVIDER_CONFIG.md#近乎无损兼容与能力覆盖).
+A top-level profile value such as `"reasoning_effort": "high"` can override Claude Code's process/request effort for that model. Accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; each transport maps or clamps them to what its upstream actually supports. For Qwen3.8-Max and DeepSeek V4 official Anthropic profiles, a Provider Reasoning runtime value set in the Model Center takes precedence over the top-level value; without one, the static value applies. See the [complete capability reference](PROVIDER_CONFIG.md#近乎无损兼容与能力覆盖).
 
 ## Security, data flow, and operations
 
@@ -264,7 +264,7 @@ Returning text is not sufficient. A model enters the priority support tier only 
 7. Authentication, rate limits, overload, context limits, refusal, cancellation, and abnormal stream termination.
 8. Official-contract request/response/stream fixtures, regressions, and real-client acceptance where the client boundary matters.
 
-The current locked Rust suite contains 225 bridge tests plus 3 Computer Host tests, all passing. Critical paths are also validated through the actual Windows service and VS Code Claude Code client; mock success alone is not treated as end-to-end compatibility.
+The current locked Rust suite contains 257 bridge tests plus 4 Computer Host tests, all passing. Critical paths are also validated through the actual Windows service and VS Code Claude Code client; mock success alone is not treated as end-to-end compatibility.
 
 ## Build from source
 

@@ -127,7 +127,7 @@ http://127.0.0.1:18787
 - [通用 OpenAI 兼容提供商](examples/providers/custom-openai.example.json)
 - [能力覆盖配置](examples/providers/capability-overrides.example.json)
 
-打开 **Claude Code 模型中心**，选择 **重新加载配置**，再选择模型。下一次请求立即使用新模型，无需重启 VS Code、Claude Code 或服务。当前 Gemini 3.7 及更高版本 Flash Interactions profile 还提供可热切换的 **Low / Medium / High** Thinking 控件。
+打开 **Claude Code 模型中心**，选择 **重新加载配置**，再选择模型。下一次请求立即使用新模型，无需重启 VS Code、Claude Code 或服务。当前 Gemini 3.7 及更高版本 Flash Interactions profile 还提供可热切换的 **Low / Medium / High** Thinking 控件。活动的 Qwen3.8-Max 与 DeepSeek V4 官方 Anthropic profile 则提供独立的 **Provider Reasoning** 四档控件（Qwen 为 `none/low/medium/xhigh`，DeepSeek 为 `none/low/high/max`），从下一次请求生效并按 profile 持久化；两个控件互斥显示，不会同时可操作。
 
 模型中心还提供 **测试选中模型** 按钮：它针对当前高亮的那一行（不一定带 ✓，即不一定是激活模型）发起一次真实的、非流式的最小推理（输出上限为 1 个 token、关闭 Thinking），用来验证该 profile 的传输协议、上游 URL、模型 ID、鉴权方式、有效代理和响应解析是否一切正常。探测在后台工作线程**异步执行，不阻塞界面**：只禁用“测试”按钮并拒绝重复探测，窗口与其余操作保持可用；桥接器以只读方式解析所选 profile，并通过该 profile 自身的带代理 HTTP 客户端发出探测，因此报告中的代理模式/代理 URL 就是探测实际使用的（LocalGemini profile 沿用当前 Gemini 传输代理）。测试**不会**切换或持久化激活模型，也不会干扰正在进行的请求，且保持无副作用（不写入可续存的 Interactions/Responses 状态）；但这是一次真实调用，可能消耗少量模型配额。结果显示在模型列表标题右侧并以中文记录到运行日志：通过时为延迟毫秒数，失败时为阶段/消息（阶段名与桥接器文案本地化，上游原文保留），并附带网络分阶段明细——**代理模式**（代理 URL 已脱敏，或直连）、**连接/响应头耗时**、**首包耗时**、**响应体完成耗时**与**总耗时**。连接/响应头阶段刻意包含 DNS、建连、代理隧道、TLS、重试与上游排队时间，连接复用时不会被误报成单独的“连接耗时”。
 
@@ -224,7 +224,7 @@ Claude 请求级 `mcp_servers` 及其匹配的 `mcp_toolset` 会转换为 Gemini
 
 ### 按模型设置推理策略
 
-profile 顶层的 `"reasoning_effort": "high"` 等值可以覆盖 Claude Code 进程级或请求级 effort。可接受值为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；各传输层会根据上游实际支持进行映射或截断。参见[完整能力字段说明](PROVIDER_CONFIG.md#近乎无损兼容与能力覆盖)。
+profile 顶层的 `"reasoning_effort": "high"` 等值可以覆盖 Claude Code 进程级或请求级 effort。可接受值为 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；各传输层会根据上游实际支持进行映射或截断。对 Qwen3.8-Max 与 DeepSeek V4 官方 Anthropic profile，模型中心的 Provider Reasoning 运行时档位优先于顶层静态值；没有运行时值时顶层值继续生效。参见[完整能力字段说明](PROVIDER_CONFIG.md#近乎无损兼容与能力覆盖)。
 
 ## 安全、数据流与运维
 
@@ -268,7 +268,7 @@ Windows 发行版按本地服务设计，而不是一个无鉴权的局域网代
 7. 鉴权、限流、过载、上下文上限、拒绝、取消和异常流终止。
 8. 官方契约请求/响应/流式 fixture、回归测试，以及客户端边界相关的真实客户端验收。
 
-当前锁定的 Rust 测试套件包含 225 项桥接器测试和 3 项 Computer Host 测试，全部通过。关键路径还会经过真实 Windows 服务和 VS Code Claude Code 客户端验证；仅仅 mock 成功不视为端到端兼容。
+当前锁定的 Rust 测试套件包含 257 项桥接器测试和 4 项 Computer Host 测试，全部通过。关键路径还会经过真实 Windows 服务和 VS Code Claude Code 客户端验证；仅仅 mock 成功不视为端到端兼容。
 
 ## 从源码构建
 

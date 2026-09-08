@@ -95,7 +95,10 @@ fn probe_safe_error_message(message: &str, sensitive_values: &[String]) -> Strin
         redacted = redacted.replace(sensitive, "[REDACTED]");
     }
     let mut chars = redacted.chars();
-    let truncated = chars.by_ref().take(PROFILE_PROBE_RESPONSE_CHARS).collect::<String>();
+    let truncated = chars
+        .by_ref()
+        .take(PROFILE_PROBE_RESPONSE_CHARS)
+        .collect::<String>();
     if chars.next().is_some() {
         format!("{truncated}…")
     } else {
@@ -172,8 +175,12 @@ async fn dispatch_profile_probe(
             forward_openai_profile(profile, request, state.thought_signatures.clone()).await
         }
         ProviderTransport::OpenAiResponses => {
-            forward_openai_responses_profile(profile, request, state.interaction_continuations.clone())
-                .await
+            forward_openai_responses_profile(
+                profile,
+                request,
+                state.interaction_continuations.clone(),
+            )
+            .await
         }
         ProviderTransport::Anthropic => {
             forward_anthropic_profile(profile, &HeaderMap::new(), request).await
@@ -276,7 +283,7 @@ async fn run_profile_probe(
                     "message": "LocalGemini requires GEMINI_API_KEY or GEMINI_BRIDGE_API_KEY_PROFILE"
                 }
             }),
-            );
+        );
     }
     let effective_proxy_url = if profile.transport == ProviderTransport::LocalGemini {
         current_gemini_transport(state)
@@ -570,6 +577,41 @@ fn effective_gemini_thinking_level(state: &AppState) -> Result<Option<String>, S
         .map(str::to_owned))
 }
 
+fn reasoning_effort_control_json(state: &AppState) -> Result<Value, String> {
+    let routing = state
+        .routing
+        .read()
+        .map_err(|_| "Cannot read provider routing state".to_string())?;
+    let Some(profile) = routing
+        .profiles
+        .iter()
+        .find(|profile| profile.file_name == routing.active_file)
+    else {
+        return Ok(json!({"supported": false, "choices": [], "current": null}));
+    };
+    let Some(choices) = profile_effort_choices(profile) else {
+        return Ok(json!({"supported": false, "choices": [], "current": null}));
+    };
+    // No runtime entry and no profile static value means there is no fixed
+    // current tier; the status reports null instead of inventing one.
+    let current = runtime_reasoning_efforts(state)?
+        .get(&profile.file_name)
+        .cloned()
+        .or_else(|| {
+            profile
+                .openai_capabilities
+                .reasoning_effort_override
+                .clone()
+        })
+        .as_deref()
+        .and_then(|effort| normalized_profile_effort(profile, effort).map(str::to_owned));
+    Ok(json!({
+        "supported": true,
+        "choices": choices,
+        "current": current
+    }))
+}
+
 async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
     let transport = match current_gemini_transport(&state) {
         Ok(transport) => transport,
@@ -625,6 +667,16 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
     };
     let proxy_enabled = transport.proxy_url.is_some();
     let public_proxy_url = transport.proxy_url.as_deref().map(redact_url_credentials);
+    let reasoning_effort_control = match reasoning_effort_control_json(&state) {
+        Ok(control) => control,
+        Err(message) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": message})),
+            )
+                .into_response();
+        }
+    };
     Json(json!({
         "status": "ok",
         "active_profile": active_profile,
@@ -636,6 +688,7 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
         "profile_source": profile_source,
         "settings_dir": state.settings_dir.to_string_lossy(),
         "gemini_thinking_level": gemini_thinking_level,
+        "reasoning_effort_control": reasoning_effort_control,
         "config_stamp": config_stamp,
         "settings_stamp": config_stamp
     }))
@@ -914,6 +967,107 @@ async fn admin_set_gemini_thinking_level(
     Json(json!({
         "status": "ok",
         "gemini_thinking_level": level
+    }))
+    .into_response()
+}
+
+fn reasoning_effort_from_admin_request(
+    request: &Value,
+    choices: &[&str],
+) -> Result<String, String> {
+    match request.get("level").and_then(Value::as_str) {
+        Some(level) if choices.contains(&level) => Ok(level.to_string()),
+        Some(_) => Err(format!(
+            "Field 'level' must be one of {} for the active provider profile",
+            choices.join(", ")
+        )),
+        None => Err("Missing string field 'level'".to_string()),
+    }
+}
+
+async fn admin_set_reasoning_effort(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<Value>,
+) -> Response {
+    let _transition = state.admin_state_lock.lock().await;
+    let active_profile = match state.routing.read() {
+        Ok(routing) => routing
+            .profiles
+            .iter()
+            .find(|profile| profile.file_name == routing.active_file)
+            .cloned(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Cannot read provider routing state"})),
+            )
+                .into_response();
+        }
+    };
+    let Some(active_profile) = active_profile else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "The active provider profile does not support a reasoning-effort control"})),
+        )
+            .into_response();
+    };
+    let Some(choices) = profile_effort_choices(&active_profile) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "The active provider profile does not support a reasoning-effort control"})),
+        )
+            .into_response();
+    };
+    let level = match reasoning_effort_from_admin_request(&request, choices) {
+        Ok(level) => level,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": message}))).into_response();
+        }
+    };
+    // Build the candidate map under the admin state lock, persist it first,
+    // and only then swap the in-memory map. A failed write leaves the
+    // previous in-memory values untouched.
+    let mut candidate = match runtime_reasoning_efforts(&state) {
+        Ok(efforts) => efforts,
+        Err(message) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": message})),
+            )
+                .into_response();
+        }
+    };
+    candidate.insert(active_profile.file_name.clone(), level.clone());
+    if let Err(message) =
+        persist_reasoning_efforts_async(state.bridge_state_path.clone(), candidate.clone()).await
+    {
+        error!("{message}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": message})),
+        )
+            .into_response();
+    }
+    let Ok(mut efforts) = state.reasoning_efforts.write() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Cannot update provider reasoning-effort state"})),
+        )
+            .into_response();
+    };
+    *efforts = candidate;
+    info!(
+        provider = %active_profile.file_name,
+        level = %level,
+        "Provider reasoning effort changed"
+    );
+    Json(json!({
+        "status": "ok",
+        "reasoning_effort_control": {
+            "supported": true,
+            "choices": choices,
+            "current": level
+        }
     }))
     .into_response()
 }

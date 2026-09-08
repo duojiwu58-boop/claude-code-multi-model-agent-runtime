@@ -131,6 +131,7 @@ where
     });
     let gemini_client = build_gemini_client(proxy_url.as_deref(), None)?;
     let gemini_thinking_level = load_persisted_gemini_thinking_level(&bridge_state_path);
+    let reasoning_efforts = load_persisted_reasoning_efforts(&bridge_state_path);
     let interaction_continuations = load_interaction_continuation_cache(
         &interaction_continuation_state_path(&bridge_state_path),
     );
@@ -141,6 +142,7 @@ where
             proxy_url,
         })),
         gemini_thinking_level: Arc::new(RwLock::new(gemini_thinking_level)),
+        reasoning_efforts: Arc::new(RwLock::new(reasoning_efforts)),
         fallback_api_key,
         local_auth_token,
         upstream_url,
@@ -181,6 +183,7 @@ where
             "/admin/gemini-thinking-level",
             post(admin_set_gemini_thinking_level),
         )
+        .route("/admin/reasoning-effort", post(admin_set_reasoning_effort))
         .route("/admin/shutdown", post(admin_shutdown))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

@@ -20,7 +20,7 @@ use std::{
 };
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Request, State},
     http::{
         header::{AUTHORIZATION, ORIGIN},
@@ -74,6 +74,7 @@ const MAX_STREAMED_TOOL_ARGUMENT_BYTES: usize = 8 * 1024 * 1024;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const DEEPSEEK_ANTHROPIC_TERMINAL_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 const GEMINI_FLEX_REQUEST_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const GEMINI_FLEX_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);

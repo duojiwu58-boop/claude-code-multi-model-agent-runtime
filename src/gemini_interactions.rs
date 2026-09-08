@@ -2010,7 +2010,7 @@ fn deepseek_effort_mapping_diagnostic(request: &Value) -> Option<String> {
                 .to_string(),
         ),
         "xhigh" => Some(
-            "Mapped Anthropic output_config.effort 'xhigh' to DeepSeek reasoning_effort 'max'"
+            "Mapped Anthropic output_config.effort 'xhigh' to DeepSeek reasoning_effort 'high' because the official DeepSeek mapping only reaches 'max' from 'max'"
                 .to_string(),
         ),
         _ => None,

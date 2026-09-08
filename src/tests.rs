@@ -177,6 +177,7 @@ async fn health_json_never_exposes_url_userinfo_credentials() {
             proxy_url: Some("http://userproxy:pwproxy@127.0.0.1:7890".to_string()),
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
+        reasoning_efforts: Arc::new(RwLock::new(HashMap::new())),
         fallback_api_key: None,
         local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://usertop:pwtop@example.invalid/v1beta/openai/chat/completions"
@@ -514,7 +515,7 @@ fn native_provider_endpoint_override_and_disabled_profiles_work() {
 }
 
 #[test]
-fn vision_proxy_defaults_to_native_local_gemini_profile() {
+fn vision_proxy_defaults_to_gemini_and_keeps_qwen_explicit() {
     let root = env::temp_dir().join(format!("claude-bridge-vision-{}", Uuid::new_v4()));
     let providers_dir = root.join("bridge-providers");
     let settings_dir = root.join(".claude");
@@ -528,6 +529,18 @@ fn vision_proxy_defaults_to_native_local_gemini_profile() {
             "base_url": "https://api.deepseek.com",
             "api_key": "secret",
             "vision": {"mode": "proxy"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        providers_dir.join("qwen.json"),
+        serde_json::to_vec_pretty(&json!({
+            "name": "Qwen3.8 Max",
+            "model": "qwen3.8-max",
+            "protocol": "anthropic",
+            "base_url": "https://dashscope.aliyuncs.com/apps/anthropic",
+            "api_key": "secret"
         }))
         .unwrap(),
     )
@@ -567,14 +580,40 @@ fn vision_proxy_defaults_to_native_local_gemini_profile() {
         .unwrap()
         .unwrap();
 
+    // Even with an official Qwen 3.8 Max profile present, the default vision
+    // leg is the bridge-managed local Gemini profile: Qwen must not hijack the
+    // default chain after live tests returned observation-less 200 responses.
     assert_eq!(target.vision.mode, VisionMode::Proxy);
     assert_eq!(source.file_name, "gemini.json");
     assert_eq!(source.transport, ProviderTransport::LocalGemini);
+    assert_eq!(source.model, "gemini-3.6-flash");
     assert_eq!(
         provider_profile_json(target, &target.file_name)["vision"]["mode"],
         "proxy"
     );
 
+    // An explicit Qwen pin still selects the Qwen profile unchanged.
+    let mut explicit_qwen_target = target.clone();
+    explicit_qwen_target.vision.profile = Some("qwen.json".to_string());
+    let source = resolve_vision_provider(&loaded.profiles, &explicit_qwen_target)
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.file_name, "qwen.json");
+    assert_eq!(source.transport, ProviderTransport::Anthropic);
+    assert_eq!(source.model, "qwen3.8-max");
+
+    // An explicit Gemini pin keeps overriding the default chain, preserving
+    // the existing low-cost rollback path.
+    let mut explicit_gemini_target = target.clone();
+    explicit_gemini_target.vision.profile = Some("gemini.json".to_string());
+    let source = resolve_vision_provider(&loaded.profiles, &explicit_gemini_target)
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.file_name, "gemini.json");
+    assert_eq!(source.transport, ProviderTransport::LocalGemini);
+
+    // Without the local Gemini profile, official Google Gemini is the final
+    // default fallback (Qwen present or not).
     let profiles_without_local = loaded
         .profiles
         .iter()
@@ -590,6 +629,69 @@ fn vision_proxy_defaults_to_native_local_gemini_profile() {
         .unwrap();
     assert_eq!(source.file_name, "gemini-openai.json");
     assert_eq!(source.transport, ProviderTransport::OpenAiChat);
+}
+
+#[test]
+fn qwen_vision_recognition_requires_official_qwen_endpoint() {
+    let client = Client::builder().build().unwrap();
+    let make = |file_name: &str, model: &str, dialect: OpenAiChatDialect| ProviderProfile {
+        file_name: file_name.to_string(),
+        display_name: file_name.to_string(),
+        source: ProviderProfileSource::Native,
+        model: model.to_string(),
+        context_window: None,
+        upstream_identity: None,
+        identity_override: true,
+        base_url: "https://example.invalid".to_string(),
+        auth_token: Some("secret".to_string()),
+        api_key: None,
+        proxy_url: None,
+        local_gemini: false,
+        transport: ProviderTransport::Anthropic,
+        openai_capabilities: OpenAiCapabilities {
+            chat_dialect: dialect,
+            ..OpenAiCapabilities::default()
+        },
+        vision: VisionConfig::default(),
+        upstream_url: "https://example.invalid/messages".to_string(),
+        client: client.clone(),
+    };
+    let target = {
+        let mut target = make(
+            "target.json",
+            "deepseek-v4-flash",
+            OpenAiChatDialect::DeepSeek,
+        );
+        target.vision = VisionConfig {
+            mode: VisionMode::Proxy,
+            profile: None,
+        };
+        target
+    };
+
+    // Model-id match alone is not enough; the endpoint dialect must be Qwen.
+    let gateway_qwen = make("gateway.json", "qwen3.8-max", OpenAiChatDialect::Generic);
+    assert!(!default_qwen_vision_profile(&gateway_qwen, &target));
+
+    // Official Qwen endpoint with the expected model id matches,
+    // case-insensitively and including dated variants.
+    let official = make("qwen.json", "Qwen3.8-Max", OpenAiChatDialect::Qwen);
+    assert!(default_qwen_vision_profile(&official, &target));
+    let dated = make(
+        "qwen.json",
+        "qwen3.8-max-2026-08-01",
+        OpenAiChatDialect::Qwen,
+    );
+    assert!(default_qwen_vision_profile(&dated, &target));
+
+    // Other Qwen models (e.g. coder variants) are not recognized as the
+    // official Qwen 3.8 Max vision profile.
+    let coder = make(
+        "qwen-coder.json",
+        "qwen3-coder-plus",
+        OpenAiChatDialect::Qwen,
+    );
+    assert!(!default_qwen_vision_profile(&coder, &target));
 }
 
 #[test]
@@ -868,6 +970,7 @@ async fn vision_proxy_calls_provider_once_and_reuses_base64_cache() {
             proxy_url: None,
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
+        reasoning_efforts: Arc::new(RwLock::new(HashMap::new())),
         fallback_api_key: None,
         local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid/gemini".to_string(),
@@ -956,6 +1059,7 @@ async fn mcp_generate_image_calls_gemini_saves_file_and_returns_preview() {
             proxy_url: None,
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
+        reasoning_efforts: Arc::new(RwLock::new(HashMap::new())),
         fallback_api_key: Some("image-secret".to_string()),
         local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid/gemini".to_string(),
@@ -1089,6 +1193,7 @@ async fn configured_kimi_formula_is_exposed_and_executed_only_when_enabled() {
             proxy_url: None,
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
+        reasoning_efforts: Arc::new(RwLock::new(HashMap::new())),
         fallback_api_key: Some("local-token".to_string()),
         local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid".to_string(),
@@ -1708,6 +1813,7 @@ async fn admin_gemini_thinking_level_is_hot_persisted_and_profile_scoped() {
             proxy_url: None,
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
+        reasoning_efforts: Arc::new(RwLock::new(HashMap::new())),
         fallback_api_key: Some("test-key".to_string()),
         local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid".to_string(),
@@ -1763,6 +1869,515 @@ async fn admin_gemini_thinking_level_is_hot_persisted_and_profile_scoped() {
     );
 
     fs::remove_dir_all(root).unwrap();
+}
+
+fn anthropic_reasoning_test_profile(file_name: &str, model: &str) -> ProviderProfile {
+    let mut profile = test_provider_profile(
+        Client::builder().build().unwrap(),
+        "https://example.invalid/anthropic".to_string(),
+    );
+    profile.file_name = file_name.to_string();
+    profile.model = model.to_string();
+    profile.base_url = "https://example.invalid".to_string();
+    profile.transport = ProviderTransport::Anthropic;
+    profile.upstream_url = "https://example.invalid/v1/messages".to_string();
+    profile
+}
+
+#[test]
+fn reasoning_effort_control_choices_are_scoped_to_official_anthropic_models() {
+    let mut qwen = anthropic_reasoning_test_profile("qwen3.8-max.json", "qwen3.8-max");
+    qwen.openai_capabilities.chat_dialect = OpenAiChatDialect::Qwen;
+    assert_eq!(
+        profile_effort_choices(&qwen),
+        Some(&["none", "low", "medium", "xhigh"][..])
+    );
+
+    // The same DashScope/Maas host with a different model must not match.
+    qwen.model = "qwen3.8-27b-local".to_string();
+    assert_eq!(profile_effort_choices(&qwen), None);
+
+    let mut deepseek =
+        anthropic_reasoning_test_profile("deepseek-v4-pro.json", "deepseek-v4-pro[1m]");
+    deepseek.openai_capabilities.chat_dialect = OpenAiChatDialect::DeepSeek;
+    assert_eq!(
+        profile_effort_choices(&deepseek),
+        Some(&["none", "low", "high", "max"][..])
+    );
+    deepseek.model = "deepseek-v4-flash".to_string();
+    assert!(profile_effort_choices(&deepseek).is_some());
+    deepseek.model = "deepseek-v4-flash-vision-exp".to_string();
+    assert!(profile_effort_choices(&deepseek).is_some());
+    deepseek.model = "deepseek-v4-other".to_string();
+    assert_eq!(profile_effort_choices(&deepseek), None);
+
+    // Non-Anthropic transports and capability=false stay unsupported.
+    deepseek.model = "deepseek-v4-flash".to_string();
+    deepseek.transport = ProviderTransport::OpenAiChat;
+    assert_eq!(profile_effort_choices(&deepseek), None);
+    deepseek.transport = ProviderTransport::Anthropic;
+    deepseek.openai_capabilities.reasoning_effort = false;
+    assert_eq!(profile_effort_choices(&deepseek), None);
+
+    // Gemini keeps its separate thinking-level control.
+    let gemini = interactions_test_profile("gemini-3.8-flash.json");
+    assert_eq!(profile_effort_choices(&gemini), None);
+}
+
+#[test]
+fn normalized_profile_effort_maps_internal_tiers_to_official_choices() {
+    let mut qwen = anthropic_reasoning_test_profile("qwen3.8-max.json", "qwen3.8-max");
+    qwen.openai_capabilities.chat_dialect = OpenAiChatDialect::Qwen;
+    for (input, expected) in [
+        ("none", "none"),
+        ("minimal", "low"),
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "medium"),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"),
+    ] {
+        assert_eq!(
+            normalized_profile_effort(&qwen, input),
+            Some(expected),
+            "qwen {input}"
+        );
+    }
+    let mut deepseek = anthropic_reasoning_test_profile("deepseek-v4-pro.json", "deepseek-v4-pro");
+    deepseek.openai_capabilities.chat_dialect = OpenAiChatDialect::DeepSeek;
+    for (input, expected) in [
+        ("none", "none"),
+        ("minimal", "low"),
+        ("low", "low"),
+        ("medium", "high"),
+        ("high", "high"),
+        ("xhigh", "high"),
+        ("max", "max"),
+    ] {
+        assert_eq!(
+            normalized_profile_effort(&deepseek, input),
+            Some(expected),
+            "deepseek {input}"
+        );
+    }
+    assert_eq!(normalized_profile_effort(&deepseek, "extreme"), None);
+    let gemini = interactions_test_profile("gemini-3.8-flash.json");
+    assert_eq!(normalized_profile_effort(&gemini, "low"), None);
+}
+
+#[test]
+fn reasoning_effort_state_persistence_ignores_malformed_entries_and_preserves_keys() {
+    let root = env::temp_dir().join(format!("claude-bridge-reasoning-state-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let state_path = root.join("bridge-state.json");
+    fs::write(
+        &state_path,
+        r#"{
+            "active_profile": "qwen3.8-max.json",
+            "gemini_thinking_level": "medium",
+            "listen": "127.0.0.1:18787",
+            "unknown_key": {"keep": true},
+            "reasoning_efforts": {
+                "qwen3.8-max.json": "xhigh",
+                "deepseek-v4-pro.json": "max",
+                "UPPER.JSON": "low",
+                "../escape.json": "high",
+                "nested/profile.json": "medium",
+                "bad-key.txt": "high",
+                "not-a-profile": "high",
+                "gemini-3.8-flash.json": "extreme",
+                "broken.json": 42,
+                "empty.json": ""
+            }
+        }"#,
+    )
+    .unwrap();
+    let loaded = load_persisted_reasoning_efforts(&state_path);
+    assert_eq!(loaded.len(), 3);
+    assert_eq!(
+        loaded.get("qwen3.8-max.json").map(String::as_str),
+        Some("xhigh")
+    );
+    assert_eq!(
+        loaded.get("deepseek-v4-pro.json").map(String::as_str),
+        Some("max")
+    );
+    assert_eq!(loaded.get("UPPER.JSON").map(String::as_str), Some("low"));
+    assert!(!loaded.contains_key("../escape.json"));
+    assert!(!loaded.contains_key("nested/profile.json"));
+
+    let mut updated = loaded;
+    updated.insert("qwen3.8-max.json".to_string(), "low".to_string());
+    persist_reasoning_efforts(&state_path, &updated).unwrap();
+    let state_json = read_state_object(&state_path);
+    assert_eq!(state_json["reasoning_efforts"]["qwen3.8-max.json"], "low");
+    assert_eq!(
+        state_json["reasoning_efforts"]["deepseek-v4-pro.json"],
+        "max"
+    );
+    assert_eq!(state_json["gemini_thinking_level"], "medium");
+    assert_eq!(state_json["active_profile"], "qwen3.8-max.json");
+    assert_eq!(state_json["listen"], "127.0.0.1:18787");
+    assert_eq!(state_json["unknown_key"]["keep"], true);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn reasoning_effort_control_admin_flow_persists_and_rejects_invalid_levels() {
+    let root = env::temp_dir().join(format!("claude-bridge-reasoning-admin-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let state_path = root.join("bridge-state.json");
+    fs::write(
+        &state_path,
+        r#"{"active_profile": "qwen3.8-max.json", "gemini_thinking_level": null, "listen": "127.0.0.1:18787"}"#,
+    )
+    .unwrap();
+    let mut qwen = anthropic_reasoning_test_profile("qwen3.8-max.json", "qwen3.8-max");
+    qwen.openai_capabilities.chat_dialect = OpenAiChatDialect::Qwen;
+    let gemini = interactions_test_profile("gemini-3.8-flash.json");
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = Arc::new(AppState {
+        gemini_transport: Arc::new(RwLock::new(GeminiTransport {
+            client: Client::builder().build().unwrap(),
+            proxy_url: None,
+        })),
+        gemini_thinking_level: Arc::new(RwLock::new(None)),
+        reasoning_efforts: Arc::new(RwLock::new(HashMap::new())),
+        fallback_api_key: Some("test-key".to_string()),
+        local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
+        upstream_url: "https://example.invalid".to_string(),
+        model: "qwen3.8-max".to_string(),
+        thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+        interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        computer: Arc::new(ComputerBroker),
+        vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        routing: Arc::new(RwLock::new(ProviderRoutingState {
+            profiles: vec![qwen, gemini],
+            active_file: "qwen3.8-max.json".to_string(),
+            source: ProviderProfileSource::Native,
+        })),
+        shutdown_tx,
+        settings_dir: root.clone(),
+        providers_dir: root.clone(),
+        bridge_state_path: state_path.clone(),
+        image_output_dir: root.clone(),
+        image_model: DEFAULT_IMAGE_MODEL.to_string(),
+        image_upstream_url: DEFAULT_IMAGE_UPSTREAM.to_string(),
+        local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
+        admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+    });
+
+    // Without a runtime entry or profile static value the control is
+    // supported but reports no fixed current.
+    let response = admin_status(State(state.clone())).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let control = &body["reasoning_effort_control"];
+    assert_eq!(control["supported"], true);
+    assert_eq!(
+        control["choices"],
+        json!(["none", "low", "medium", "xhigh"])
+    );
+    assert_eq!(control["current"], Value::Null);
+    assert_eq!(body["gemini_thinking_level"], Value::Null);
+
+    // An invalid tier is rejected with the full legal set for this profile.
+    let response =
+        admin_set_reasoning_effort(State(state.clone()), Json(json!({"level": "high"}))).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("none, low, medium, xhigh"));
+    let response = admin_set_reasoning_effort(State(state.clone()), Json(json!({}))).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // A valid tier persists first and then swaps the in-memory map.
+    let response =
+        admin_set_reasoning_effort(State(state.clone()), Json(json!({"level": "xhigh"}))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        runtime_reasoning_efforts(&state)
+            .unwrap()
+            .get("qwen3.8-max.json")
+            .map(String::as_str),
+        Some("xhigh")
+    );
+    assert_eq!(
+        load_persisted_reasoning_efforts(&state_path)
+            .get("qwen3.8-max.json")
+            .map(String::as_str),
+        Some("xhigh")
+    );
+    let state_json = read_state_object(&state_path);
+    assert_eq!(state_json["active_profile"], "qwen3.8-max.json");
+    assert_eq!(current_gemini_thinking_level(&state).unwrap(), None);
+
+    let response = admin_status(State(state.clone())).await;
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["reasoning_effort_control"]["current"], "xhigh");
+
+    // Switching to the Gemini profile makes the new control unsupported and
+    // keeps the legacy Gemini thinking-level output intact.
+    state.routing.write().unwrap().active_file = "gemini-3.8-flash.json".to_string();
+    let response =
+        admin_set_reasoning_effort(State(state.clone()), Json(json!({"level": "low"}))).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = admin_status(State(state.clone())).await;
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["reasoning_effort_control"]["supported"], false);
+    assert_eq!(body["reasoning_effort_control"]["choices"], json!([]));
+    assert_eq!(body["reasoning_effort_control"]["current"], Value::Null);
+    assert_eq!(body["gemini_thinking_level"], "medium");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn reasoning_effort_control_persist_failure_keeps_memory_state() {
+    let root = env::temp_dir().join(format!("claude-bridge-reasoning-fail-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    // A regular file blocks the state directory so the atomic write fails.
+    let blocker = root.join("state-blocker");
+    fs::write(&blocker, "not a directory").unwrap();
+    let state_path = blocker.join("bridge-state.json");
+    let mut qwen = anthropic_reasoning_test_profile("qwen3.8-max.json", "qwen3.8-max");
+    qwen.openai_capabilities.chat_dialect = OpenAiChatDialect::Qwen;
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = Arc::new(AppState {
+        gemini_transport: Arc::new(RwLock::new(GeminiTransport {
+            client: Client::builder().build().unwrap(),
+            proxy_url: None,
+        })),
+        gemini_thinking_level: Arc::new(RwLock::new(None)),
+        reasoning_efforts: Arc::new(RwLock::new(HashMap::new())),
+        fallback_api_key: Some("test-key".to_string()),
+        local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
+        upstream_url: "https://example.invalid".to_string(),
+        model: "qwen3.8-max".to_string(),
+        thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+        interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        computer: Arc::new(ComputerBroker),
+        vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        routing: Arc::new(RwLock::new(ProviderRoutingState {
+            profiles: vec![qwen],
+            active_file: "qwen3.8-max.json".to_string(),
+            source: ProviderProfileSource::Native,
+        })),
+        shutdown_tx,
+        settings_dir: root.clone(),
+        providers_dir: root.clone(),
+        bridge_state_path: state_path,
+        image_output_dir: root.clone(),
+        image_model: DEFAULT_IMAGE_MODEL.to_string(),
+        image_upstream_url: DEFAULT_IMAGE_UPSTREAM.to_string(),
+        local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
+        admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+    });
+
+    let response =
+        admin_set_reasoning_effort(State(state.clone()), Json(json!({"level": "low"}))).await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(runtime_reasoning_efforts(&state).unwrap().is_empty());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+async fn reasoning_effort_wire_assertion(
+    profile: ProviderProfile,
+    efforts: HashMap<String, String>,
+    request: Value,
+) -> Value {
+    let captured = Arc::new(tokio::sync::Mutex::new(None::<Value>));
+    let captured_for_handler = captured.clone();
+    let mock = Router::new().route(
+        "/v1/messages",
+        post(move |Json(body): Json<Value>| {
+            let captured = captured_for_handler.clone();
+            async move {
+                *captured.lock().await = Some(body);
+                Json(json!({
+                    "id": "msg_mock",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "mock",
+                    "content": [{"type": "text", "text": "Done."}],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 10, "output_tokens": 4}
+                }))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let mut profile = profile;
+    profile.base_url = format!("http://{address}");
+    profile.upstream_url = format!("http://{address}/v1/messages");
+    profile.client = Client::builder().no_proxy().build().unwrap();
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let state = Arc::new(AppState {
+        gemini_transport: Arc::new(RwLock::new(GeminiTransport {
+            client: Client::builder().no_proxy().build().unwrap(),
+            proxy_url: None,
+        })),
+        gemini_thinking_level: Arc::new(RwLock::new(None)),
+        reasoning_efforts: Arc::new(RwLock::new(efforts)),
+        fallback_api_key: Some("test-key".to_string()),
+        local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
+        upstream_url: "https://example.invalid".to_string(),
+        model: "bridge-router".to_string(),
+        thought_signatures: Arc::new(RwLock::new(IndexMap::new())),
+        interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
+        computer: Arc::new(ComputerBroker),
+        vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        routing: Arc::new(RwLock::new(ProviderRoutingState {
+            profiles: vec![profile.clone()],
+            active_file: profile.file_name.clone(),
+            source: ProviderProfileSource::Native,
+        })),
+        shutdown_tx,
+        settings_dir: PathBuf::new(),
+        providers_dir: PathBuf::new(),
+        bridge_state_path: PathBuf::new(),
+        image_output_dir: env::temp_dir(),
+        image_model: DEFAULT_IMAGE_MODEL.to_string(),
+        image_upstream_url: DEFAULT_IMAGE_UPSTREAM.to_string(),
+        local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
+        admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+    });
+
+    let response = anthropic_messages(State(state), HeaderMap::new(), Json(request)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    server.abort();
+    let captured = captured.lock().await;
+    captured.clone().expect("mock captured the request")
+}
+
+#[tokio::test]
+async fn qwen_runtime_reasoning_effort_overrides_client_max_and_static_profile() {
+    let mut profile = anthropic_reasoning_test_profile("qwen3.8-max.json", "qwen3.8-max");
+    profile.openai_capabilities.chat_dialect = OpenAiChatDialect::Qwen;
+    // Static profile default that the runtime value must beat.
+    profile.openai_capabilities.reasoning_effort_override = Some("medium".to_string());
+    let mut efforts = HashMap::new();
+    efforts.insert("qwen3.8-max.json".to_string(), "xhigh".to_string());
+
+    let captured = reasoning_effort_wire_assertion(
+        profile,
+        efforts,
+        json!({
+            "stream": false,
+            "model": "qwen3.8-max",
+            "max_tokens": 64000,
+            "thinking": {"type": "enabled", "budget_tokens": 31999},
+            "output_config": {"effort": "max"},
+            "messages": [{"role": "user", "content": "Hello"}]
+        }),
+    )
+    .await;
+    // Runtime xhigh beats the client max and the static medium; the final
+    // Qwen wire form is enabled/effort with no adaptive and no budget.
+    assert_eq!(captured["output_config"]["effort"], "xhigh");
+    assert_eq!(captured["thinking"]["type"], "enabled");
+    assert!(captured["thinking"].get("budget_tokens").is_none());
+    assert_eq!(captured["model"], "qwen3.8-max");
+}
+
+#[tokio::test]
+async fn qwen_runtime_reasoning_effort_none_disables_thinking_on_the_wire() {
+    let mut profile = anthropic_reasoning_test_profile("qwen3.8-max.json", "qwen3.8-max");
+    profile.openai_capabilities.chat_dialect = OpenAiChatDialect::Qwen;
+    let mut efforts = HashMap::new();
+    efforts.insert("qwen3.8-max.json".to_string(), "none".to_string());
+
+    let captured = reasoning_effort_wire_assertion(
+        profile,
+        efforts,
+        json!({
+            "stream": false,
+            "model": "qwen3.8-max",
+            "max_tokens": 64000,
+            "thinking": {"type": "enabled", "budget_tokens": 31999},
+            "output_config": {"effort": "max"},
+            "messages": [{"role": "user", "content": "Hello"}]
+        }),
+    )
+    .await;
+    assert_eq!(captured["thinking"]["type"], "disabled");
+    assert!(captured["thinking"].get("budget_tokens").is_none());
+    assert!(captured.get("output_config").is_none());
+}
+
+#[tokio::test]
+async fn deepseek_runtime_reasoning_effort_is_profile_scoped_and_maps_xhigh_to_high() {
+    let mut pro = anthropic_reasoning_test_profile("deepseek-v4-pro.json", "deepseek-v4-pro");
+    pro.openai_capabilities.chat_dialect = OpenAiChatDialect::DeepSeek;
+    let mut efforts = HashMap::new();
+    efforts.insert("deepseek-v4-pro.json".to_string(), "max".to_string());
+    let captured = reasoning_effort_wire_assertion(
+        pro,
+        efforts,
+        json!({
+            "stream": false,
+            "model": "deepseek-v4-pro",
+            "max_tokens": 64000,
+            "thinking": {"type": "enabled", "budget_tokens": 31999},
+            "output_config": {"effort": "max"},
+            "tool_choice": {"type": "auto"},
+            "messages": [{"role": "user", "content": "Hello"}]
+        }),
+    )
+    .await;
+    assert_eq!(captured["output_config"]["effort"], "max");
+    assert_eq!(captured["thinking"]["type"], "enabled");
+    assert_eq!(captured["model"], "deepseek-v4-pro");
+
+    // The vision-exp profile has no runtime entry, so its own request keeps
+    // the client effort; the official mapping caps xhigh at high.
+    let mut vision = anthropic_reasoning_test_profile(
+        "deepseek-v4-flash-vision-exp.json",
+        "deepseek-v4-flash-vision-exp",
+    );
+    vision.openai_capabilities.chat_dialect = OpenAiChatDialect::DeepSeek;
+    let captured = reasoning_effort_wire_assertion(
+        vision,
+        HashMap::new(),
+        json!({
+            "stream": false,
+            "model": "deepseek-v4-flash-vision-exp",
+            "max_tokens": 64000,
+            "thinking": {"type": "enabled", "budget_tokens": 31999},
+            "output_config": {"effort": "xhigh"},
+            "messages": [{"role": "user", "content": "Hello"}]
+        }),
+    )
+    .await;
+    assert_eq!(captured["output_config"]["effort"], "high");
+    assert_eq!(captured["thinking"]["type"], "enabled");
+    assert_eq!(captured["model"], "deepseek-v4-flash-vision-exp");
 }
 
 #[test]
@@ -2399,7 +3014,7 @@ fn deepseek_chat_preserves_low_high_and_max_reasoning_modes() {
         ("low", "enabled", Some("low"), true),
         ("medium", "enabled", Some("high"), true),
         ("high", "enabled", Some("high"), true),
-        ("xhigh", "enabled", Some("max"), true),
+        ("xhigh", "enabled", Some("high"), true),
         ("max", "enabled", Some("max"), true),
     ] {
         let request = json!({
@@ -3006,6 +3621,7 @@ async fn model_by_id_serves_known_names_and_rejects_unknown() {
             proxy_url: None,
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
+        reasoning_efforts: Arc::new(RwLock::new(HashMap::new())),
         fallback_api_key: None,
         local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid/gemini".to_string(),
@@ -4890,12 +5506,20 @@ async fn anthropic_forwarding_preserves_upstream_rate_limit_metadata() {
 
 #[tokio::test]
 async fn anthropic_passthrough_stream_aborts_after_idle_timeout() {
-    let upstream =
-        stream::once(async { Ok::<_, Infallible>("first chunk") }).chain(stream::pending());
-    let bounded = anthropic_passthrough_stream(upstream, Duration::from_millis(20));
+    let upstream = stream::once(async { Ok::<_, Infallible>(Bytes::from_static(b"first chunk")) })
+        .chain(stream::pending());
+    let bounded = anthropic_passthrough_stream(
+        upstream,
+        Duration::from_millis(20),
+        None,
+        "test-provider".to_string(),
+    );
     tokio::pin!(bounded);
 
-    assert_eq!(bounded.next().await.unwrap().unwrap(), "first chunk");
+    assert_eq!(
+        bounded.next().await.unwrap().unwrap(),
+        Bytes::from_static(b"first chunk")
+    );
     let error = tokio::time::timeout(Duration::from_secs(1), bounded.next())
         .await
         .expect("idle upstream body must be bounded")
@@ -4903,6 +5527,63 @@ async fn anthropic_passthrough_stream_aborts_after_idle_timeout() {
         .unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     assert!(bounded.next().await.is_none());
+}
+
+#[tokio::test]
+async fn deepseek_anthropic_passthrough_stops_at_message_stop_without_waiting_for_eof() {
+    let terminal = Bytes::from_static(
+        b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":3}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    );
+    let upstream = stream::once({
+        let terminal = terminal.clone();
+        async move { Ok::<_, Infallible>(terminal) }
+    })
+    .chain(stream::pending());
+    let bounded = anthropic_passthrough_stream(
+        upstream,
+        Duration::from_secs(30),
+        Some(Duration::from_millis(20)),
+        "deepseek-test".to_string(),
+    );
+    tokio::pin!(bounded);
+
+    assert_eq!(bounded.next().await.unwrap().unwrap(), terminal);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), bounded.next())
+            .await
+            .expect("message_stop must terminate the downstream body")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn deepseek_anthropic_passthrough_repairs_missing_message_stop() {
+    let terminal_delta = Bytes::from_static(
+        b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":3}}\n\n",
+    );
+    let upstream = stream::once({
+        let terminal_delta = terminal_delta.clone();
+        async move { Ok::<_, Infallible>(terminal_delta) }
+    })
+    .chain(stream::pending());
+    let bounded = anthropic_passthrough_stream(
+        upstream,
+        Duration::from_secs(30),
+        Some(Duration::from_millis(20)),
+        "deepseek-test".to_string(),
+    );
+    let body = tokio::time::timeout(
+        Duration::from_secs(1),
+        axum::body::to_bytes(Body::from_stream(bounded), MAX_UPSTREAM_RESPONSE_BYTES),
+    )
+    .await
+    .expect("terminal recovery must not wait for the upstream idle timeout")
+    .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let events = anthropic_sse_event_values(&body);
+
+    assert_eq!(events[0]["type"], "message_delta");
+    assert_eq!(events[1]["type"], "message_stop");
 }
 
 #[test]
@@ -6296,6 +6977,7 @@ async fn anthropic_count_tokens_uses_kimi_native_estimator() {
             proxy_url: None,
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
+        reasoning_efforts: Arc::new(RwLock::new(HashMap::new())),
         fallback_api_key: Some("local-token".to_string()),
         local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid".to_string(),
@@ -6389,6 +7071,7 @@ async fn anthropic_messages_uses_bridge_managed_gemini_credential() {
             proxy_url: None,
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
+        reasoning_efforts: Arc::new(RwLock::new(HashMap::new())),
         fallback_api_key: Some("managed-google-key".to_string()),
         local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid".to_string(),
@@ -6464,6 +7147,7 @@ async fn anthropic_count_tokens_uses_google_native_endpoint() {
             proxy_url: None,
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
+        reasoning_efforts: Arc::new(RwLock::new(HashMap::new())),
         fallback_api_key: Some("test-key".to_string()),
         local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url: "https://example.invalid".to_string(),
@@ -8146,7 +8830,7 @@ fn deepseek_responses_maps_disabled_thinking_and_default_effort() {
         "output_config": {"effort": "xhigh"}
     });
     let translated = translate_anthropic_to_responses(&xhigh, &profile, &continuations).unwrap();
-    assert_eq!(translated["reasoning"]["effort"], "max");
+    assert_eq!(translated["reasoning"]["effort"], "high");
 
     let budget = json!({
         "messages": [{"role": "user", "content": "Summarize"}],
@@ -9052,6 +9736,7 @@ fn probe_state(
             proxy_url: None,
         })),
         gemini_thinking_level: Arc::new(RwLock::new(None)),
+        reasoning_efforts: Arc::new(RwLock::new(HashMap::new())),
         fallback_api_key,
         local_auth_token: "test-local-token-that-is-long-enough-1234567890".to_string(),
         upstream_url,

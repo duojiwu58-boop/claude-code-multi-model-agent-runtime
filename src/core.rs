@@ -455,6 +455,7 @@ struct GeminiTransport {
 struct AppState {
     gemini_transport: Arc<RwLock<GeminiTransport>>,
     gemini_thinking_level: Arc<RwLock<Option<String>>>,
+    reasoning_efforts: Arc<RwLock<HashMap<String, String>>>,
     fallback_api_key: Option<String>,
     local_auth_token: String,
     upstream_url: String,

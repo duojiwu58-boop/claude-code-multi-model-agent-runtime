@@ -42,6 +42,9 @@ type
     FileName: string;
     Transport: string;
     ThinkingLevel: string;
+    ProviderReasoningSupported: Boolean;
+    ProviderReasoningChoices: string;
+    ProviderReasoningCurrent: string;
     Stamp: string;
     SettingsDir: string;
     Detail: string;
@@ -63,6 +66,11 @@ type
     FCurrentModelLabel: TLabel;
     FHintLabel: TLabel;
     FThinkingGroup: TRadioGroup;
+    FProviderReasoningGroup: TRadioGroup;
+    FProviderReasoningChoices: TStringList;
+    FProviderReasoningCurrent: string;
+    FProviderReasoningSupported: Boolean;
+    FUpdatingProviderReasoningUi: Boolean;
     FContentPanel: TPanel;
     FListPanel: TPanel;
     FListTitleLabel: TLabel;
@@ -98,6 +106,7 @@ type
     procedure StartClick(Sender: TObject);
     procedure StopClick(Sender: TObject);
     procedure ThinkingLevelClick(Sender: TObject);
+    procedure ProviderReasoningClick(Sender: TObject);
     procedure PollTimer(Sender: TObject);
     procedure ProfileDblClick(Sender: TObject);
     procedure ListSelectItem(Sender: TObject; Item: TListItem;
@@ -112,10 +121,12 @@ type
     procedure SwitchProfileAsync(const AFileName: string);
     procedure TestProfileAsync(const AFileName: string);
     procedure SetThinkingLevelAsync(const ALevel: string);
+    procedure SetProviderReasoningAsync(const ALevel: string);
     procedure StartStopAsync(const AStart: Boolean);
     procedure ApplyStatusSnapshot(const ASnapshot: TStatusSnapshot;
       const AQuiet: Boolean);
     procedure ApplyThinkingControls(const ASnapshot: TStatusSnapshot);
+    procedure ApplyProviderReasoningControls(const ASnapshot: TStatusSnapshot);
     procedure FillProfileList(const ARows: TArray<TProfileRow>);
     procedure AdjustProfileColumns;
     procedure SetBridgeState(const AOnline: Boolean; const ADetail: string);
@@ -125,6 +136,7 @@ type
       AJson: string): TJSONObject;
     function JsonText(AObject: TJSONObject; const AName: string): string;
     function JsonBool(AObject: TJSONObject; const AName: string): Boolean;
+    function JsonArrayText(AObject: TJSONObject; const AName: string): string;
     function ProbeStageName(const AStage: string): string;
     function ProbeTransportName(const ATransport: string): string;
     function LocalizeProbeMessage(const AMessage: string): string;
@@ -193,6 +205,7 @@ begin
 
     LStage := '创建配置列表';
     FProfileFiles := TStringList.Create;
+    FProviderReasoningChoices := TStringList.Create;
     FBridgeRoot := FindBridgeRoot;
     FBridgeUrl := ResolveBridgeUrl;
     FLocalAuthToken := ReadLocalAuthToken;
@@ -212,6 +225,7 @@ end;
 destructor TMainForm.Destroy;
 begin
   FPollTimer.Enabled := False;
+  FProviderReasoningChoices.Free;
   FProfileFiles.Free;
   inherited;
 end;
@@ -293,6 +307,19 @@ begin
   FThinkingGroup.ItemIndex := -1;
   FThinkingGroup.Enabled := False;
   FThinkingGroup.OnClick := ThinkingLevelClick;
+
+  // Provider Reasoning 与 Gemini Thinking 共用同一块布局，后创建因此位于
+  // 上层：Qwen/DeepSeek 活动时显示并隐藏 Gemini 组，反之亦然，两个控件
+  // 任何时刻都不会同时可操作。
+  FProviderReasoningGroup := TRadioGroup.Create(Self);
+  FProviderReasoningGroup.Parent := FTopPanel;
+  FProviderReasoningGroup.SetBounds(596, 78, 400, 70);
+  FProviderReasoningGroup.Caption := 'Provider Reasoning（下一请求生效）';
+  FProviderReasoningGroup.Columns := 4;
+  FProviderReasoningGroup.ItemIndex := -1;
+  FProviderReasoningGroup.Enabled := False;
+  FProviderReasoningGroup.Visible := False;
+  FProviderReasoningGroup.OnClick := ProviderReasoningClick;
 
   FRefreshButton := TButton.Create(Self);
   FRefreshButton.Parent := FTopPanel;
@@ -498,6 +525,8 @@ begin
       FSwitchButton.Left - CONTROL_GAP - FRefreshButton.Width;
     FThinkingGroup.Left :=
       FTopPanel.ClientWidth - EDGE_MARGIN - FThinkingGroup.Width;
+    FProviderReasoningGroup.Left :=
+      FTopPanel.ClientWidth - EDGE_MARGIN - FProviderReasoningGroup.Width;
   end;
 
   if Assigned(FStatusBar) then
@@ -651,6 +680,31 @@ end;
 function TMainForm.JsonBool(AObject: TJSONObject; const AName: string): Boolean;
 begin
   Result := SameText(JsonText(AObject, AName), 'true');
+end;
+
+// 字符串数组 → 逗号连接的纯文本（如 status 的 choices），供 TStringList
+// DelimitedText 直接解析；空数组返回空串。
+function TMainForm.JsonArrayText(AObject: TJSONObject; const AName: string): string;
+var
+  LArray: TJSONValue;
+  LItem: TJSONValue;
+  I: Integer;
+begin
+  Result := '';
+  if not Assigned(AObject) then
+    Exit;
+  LArray := AObject.Values[AName];
+  if not (LArray is TJSONArray) then
+    Exit;
+  for I := 0 to TJSONArray(LArray).Count - 1 do
+  begin
+    LItem := TJSONArray(LArray).Items[I];
+    if not (LItem is TJSONString) then
+      Continue;
+    if Result <> '' then
+      Result := Result + ',';
+    Result := Result + TJSONString(LItem).Value;
+  end;
 end;
 
 function TMainForm.GetJsonWith(AClient: THTTPClient; const APath: string): TJSONObject;
@@ -829,6 +883,7 @@ begin
     FStartButton.Enabled := False;
     FStopButton.Enabled := False;
     FThinkingGroup.Enabled := False;
+    FProviderReasoningGroup.Enabled := False;
     Screen.Cursor := crHourGlass;
   end
   else
@@ -840,6 +895,9 @@ begin
     FTestButton.Enabled := (FStatusLabel.Tag = 1) and not FTestInFlight;
     FThinkingGroup.Enabled :=
       (FStatusLabel.Tag = 1) and (FThinkingLevel <> '');
+    FProviderReasoningGroup.Enabled :=
+      (FStatusLabel.Tag = 1) and FProviderReasoningSupported and
+      (FProviderReasoningCurrent <> '');
     RefreshStatusAsync(True);
   end;
 end;
@@ -871,6 +929,7 @@ begin
     FStatusLabel.Tag := 0;
     FCurrentModelLabel.Caption := '当前模型：-';
     FThinkingGroup.Enabled := False;
+    FProviderReasoningGroup.Enabled := False;
     FSwitchButton.Enabled := False;
     FTestButton.Enabled := False;
     FStopButton.Enabled := False;
@@ -899,6 +958,7 @@ begin
       LClient: THTTPClient;
       LJson: TJSONObject;
       LProfile: TJSONObject;
+      LControl: TJSONObject;
       LSnapshot: TStatusSnapshot;
     begin
       LSnapshot := Default(TStatusSnapshot);
@@ -920,6 +980,15 @@ begin
               LJson,
               'gemini_thinking_level'
             );
+            if LJson.Values['reasoning_effort_control'] is TJSONObject then
+            begin
+              LControl := TJSONObject(LJson.Values['reasoning_effort_control']);
+              LSnapshot.ProviderReasoningSupported :=
+                JsonBool(LControl, 'supported');
+              LSnapshot.ProviderReasoningChoices :=
+                JsonArrayText(LControl, 'choices');
+              LSnapshot.ProviderReasoningCurrent := JsonText(LControl, 'current');
+            end;
             LSnapshot.Stamp := JsonText(LJson, 'config_stamp');
             if LSnapshot.Stamp = '' then
               LSnapshot.Stamp := JsonText(LJson, 'settings_stamp');
@@ -975,6 +1044,7 @@ begin
     if ASnapshot.SettingsDir <> '' then
       FStatusBar.Panels[1].Text := '配置目录：' + ASnapshot.SettingsDir;
     ApplyThinkingControls(ASnapshot);
+    ApplyProviderReasoningControls(ASnapshot);
     LStampChanged :=
       (ASnapshot.Stamp <> '') and (ASnapshot.Stamp <> FSettingsStamp);
     if LStampChanged then
@@ -987,6 +1057,7 @@ begin
   begin
     SetBridgeState(False, ASnapshot.Detail);
     ApplyThinkingControls(ASnapshot);
+    ApplyProviderReasoningControls(ASnapshot);
     if not AQuiet then
       AppendLog('状态检查失败：' + ASnapshot.Detail);
   end;
@@ -1024,6 +1095,61 @@ begin
     end;
   finally
     FUpdatingThinkingUi := False;
+  end;
+end;
+
+procedure TMainForm.ApplyProviderReasoningControls(const ASnapshot: TStatusSnapshot);
+var
+  LChoices: TStringList;
+  LVisible: Boolean;
+  LIndex: Integer;
+begin
+  LChoices := TStringList.Create;
+  try
+    LChoices.DelimitedText := ASnapshot.ProviderReasoningChoices;
+    // 支持且 choices 有效时显示四档组；current 缺失（无 runtime 值也没有
+    // profile 静态默认）时不选择任何 radio 并保持禁用，不凭空声称档位。
+    LVisible := ASnapshot.Online and ASnapshot.HasProfile and
+      ASnapshot.ProviderReasoningSupported and (LChoices.Count > 0);
+    FUpdatingProviderReasoningUi := True;
+    try
+      if LVisible then
+      begin
+        FProviderReasoningGroup.Caption := 'Provider Reasoning（下一请求生效）';
+        // 只在 choices 实际变化时重建选项，避免 3 秒轮询反复重建按钮。
+        if FProviderReasoningChoices.CommaText <> LChoices.CommaText then
+        begin
+          FProviderReasoningGroup.Items.Assign(LChoices);
+          FProviderReasoningChoices.Assign(LChoices);
+        end;
+        FProviderReasoningSupported := True;
+        FProviderReasoningCurrent :=
+          LowerCase(ASnapshot.ProviderReasoningCurrent);
+        LIndex := FProviderReasoningChoices.IndexOf(FProviderReasoningCurrent);
+        FProviderReasoningGroup.ItemIndex := LIndex;
+        FProviderReasoningGroup.Visible := True;
+        FProviderReasoningGroup.Enabled := (LIndex >= 0) and not FBusy;
+        // Provider Reasoning 显示在上层时，Gemini 组同时隐藏且禁用，两个
+        // 控件任何时刻都不会同时可操作。
+        FThinkingGroup.Visible := False;
+        FThinkingGroup.Enabled := False;
+      end
+      else
+      begin
+        FProviderReasoningSupported := False;
+        FProviderReasoningCurrent := '';
+        FProviderReasoningChoices.Clear;
+        FProviderReasoningGroup.Items.Clear;
+        FProviderReasoningGroup.ItemIndex := -1;
+        FProviderReasoningGroup.Enabled := False;
+        FProviderReasoningGroup.Visible := False;
+        FThinkingGroup.Visible := True;
+      end;
+    finally
+      FUpdatingProviderReasoningUi := False;
+    end;
+  finally
+    LChoices.Free;
   end;
 end;
 
@@ -1303,6 +1429,78 @@ begin
   if SameText(LLevel, FThinkingLevel) then
     Exit;
   SetThinkingLevelAsync(LLevel);
+end;
+
+procedure TMainForm.SetProviderReasoningAsync(const ALevel: string);
+begin
+  if FClosing or FBusy then
+    Exit;
+  SetBusy(True);
+  Inc(FWorkerCount);
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      LClient: THTTPClient;
+      LRequest: TJSONObject;
+      LResult: TJSONObject;
+      LError: string;
+    begin
+      LError := '';
+      try
+        LClient := NewHttpClient(ACTION_RESPONSE_TIMEOUT_MS);
+        try
+          LRequest := TJSONObject.Create;
+          try
+            LRequest.AddPair('level', ALevel);
+            LResult := PostJsonWith(
+              LClient,
+              '/admin/reasoning-effort',
+              LRequest.ToJSON
+            );
+          finally
+            LRequest.Free;
+          end;
+          LResult.Free;
+        finally
+          LClient.Free;
+        end;
+      except
+        on E: Exception do
+          LError := E.Message;
+      end;
+      QueueToMain(
+        procedure
+        begin
+          SetBusy(False);
+          if LError <> '' then
+          begin
+            // 不在本地留下虚假选择：下一次状态刷新恢复服务端真实 current。
+            AppendLog('Provider Reasoning 档位切换失败：' + LError);
+            MessageDlg(LError, mtError, [mbOK], 0);
+          end
+          else
+            AppendLog('Provider Reasoning 已切换为：' + ALevel);
+          RefreshStatusAsync(True);
+        end);
+    end).Start;
+end;
+
+procedure TMainForm.ProviderReasoningClick(Sender: TObject);
+var
+  LLevel: string;
+begin
+  if FUpdatingProviderReasoningUi or FBusy or
+     not FProviderReasoningGroup.Enabled then
+    Exit;
+  // 按当前 choices 数组的 ItemIndex 取实际字符串：Qwen 与 DeepSeek 的
+  // 第三、四项内容不同，不能把索引硬编码成两个模型共用的档位名。
+  if (FProviderReasoningGroup.ItemIndex < 0) or
+     (FProviderReasoningGroup.ItemIndex >= FProviderReasoningChoices.Count) then
+    Exit;
+  LLevel := FProviderReasoningChoices[FProviderReasoningGroup.ItemIndex];
+  if SameText(LLevel, FProviderReasoningCurrent) then
+    Exit;
+  SetProviderReasoningAsync(LLevel);
 end;
 
 procedure TMainForm.SwitchClick(Sender: TObject);

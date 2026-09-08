@@ -195,6 +195,11 @@ fn resolve_vision_provider(
             .iter()
             .find(|profile| profile.file_name.eq_ignore_ascii_case(file_name))
     } else {
+        // Default vision provider preference: bridge-managed local Gemini
+        // first, then official Google Gemini. Qwen 3.8 Max is no longer
+        // auto-selected (live testing showed successful HTTP responses with no
+        // extractable observation, which surfaced as bridge 502s); it remains
+        // available through an explicit `vision.profile` pin.
         profiles
             .iter()
             .find(|profile| default_gemini_vision_profile(profile, target, true))
@@ -207,7 +212,7 @@ fn resolve_vision_provider(
     .ok_or_else(|| {
         target.vision.profile.as_ref().map_or_else(
             || format!(
-                "Provider profile '{}' enables vision proxy but no native local or official Google Gemini profile is available",
+                "Provider profile '{}' enables vision proxy but no bridge-managed local Gemini or official Google Gemini profile is available",
                 target.file_name
             ),
             |file_name| format!(
@@ -229,6 +234,32 @@ fn resolve_vision_provider(
         ));
     }
     Ok(Some(source.clone()))
+}
+
+/// Model id prefix of the Qwen vision provider matching
+/// `examples/providers/qwen.example.json` ("Qwen 3.8 Max" is the display name;
+/// `qwen3.8-max` is the API model id).
+const DEFAULT_VISION_QWEN_MODEL_PREFIX: &str = "qwen3.8-max";
+
+/// Recognition helper for an official Qwen 3.8 Max vision profile. Qwen is no
+/// longer part of the default vision chain (see `resolve_vision_provider`);
+/// this predicate is retained for explicit-pin diagnostics, unit tests, and
+/// future experiments, so it stays available without being auto-selected.
+#[allow(dead_code)]
+fn default_qwen_vision_profile(candidate: &ProviderProfile, target: &ProviderProfile) -> bool {
+    if candidate.vision.mode != VisionMode::Native
+        || candidate.file_name.eq_ignore_ascii_case(&target.file_name)
+    {
+        return false;
+    }
+    // Require an official Qwen endpoint (DashScope/Bailian hosts inferred as
+    // OpenAiChatDialect::Qwen, including explicit capability overrides), not
+    // just a model-name coincidence on a third-party gateway.
+    candidate.openai_capabilities.chat_dialect == OpenAiChatDialect::Qwen
+        && candidate
+            .model
+            .to_ascii_lowercase()
+            .starts_with(DEFAULT_VISION_QWEN_MODEL_PREFIX)
 }
 
 fn default_gemini_vision_profile(
@@ -1657,6 +1688,150 @@ fn persist_gemini_thinking_level(state_path: &Path, level: &str) -> Result<(), S
         Value::String(level.to_string()),
     );
     write_state_atomically(state_path, &Value::Object(state_json).to_string())
+}
+
+/// Profile file names are the stable keys of the per-profile reasoning-effort
+/// runtime map. Entries that can never match a loaded provider profile are
+/// dead data and are dropped on load.
+fn valid_reasoning_effort_profile_key(file_name: &str) -> bool {
+    !file_name.trim().is_empty()
+        && Path::new(file_name)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == file_name && name.to_ascii_lowercase().ends_with(".json"))
+}
+
+/// Load the per-profile reasoning-effort runtime map from bridge-state.json.
+/// A malformed entry (non-object value, invalid key, or an effort outside the
+/// seven-tier internal IR) is skipped individually; one bad entry must not
+/// prevent the bridge from starting.
+fn load_persisted_reasoning_efforts(state_path: &Path) -> HashMap<String, String> {
+    let mut efforts = HashMap::new();
+    let state = read_state_object(state_path);
+    let Some(entries) = state.get("reasoning_efforts").and_then(Value::as_object) else {
+        return efforts;
+    };
+    for (file_name, value) in entries {
+        let Some(effort) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty())
+        else {
+            continue;
+        };
+        if valid_reasoning_effort_profile_key(file_name) && is_reasoning_effort(effort) {
+            efforts.insert(file_name.clone(), effort.to_string());
+        }
+    }
+    efforts
+}
+
+fn persist_reasoning_efforts(
+    state_path: &Path,
+    values: &HashMap<String, String>,
+) -> Result<(), String> {
+    let mut state_json = read_state_object(state_path);
+    state_json.insert(
+        "reasoning_efforts".to_string(),
+        Value::Object(
+            values
+                .iter()
+                .map(|(file_name, effort)| (file_name.clone(), json!(effort)))
+                .collect(),
+        ),
+    );
+    write_state_atomically(state_path, &Value::Object(state_json).to_string())
+}
+
+async fn persist_reasoning_efforts_async(
+    state_path: PathBuf,
+    values: HashMap<String, String>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || persist_reasoning_efforts(&state_path, &values))
+        .await
+        .map_err(|err| format!("Cannot join reasoning-effort state writer: {err}"))?
+}
+
+fn runtime_reasoning_efforts(state: &AppState) -> Result<HashMap<String, String>, String> {
+    state
+        .reasoning_efforts
+        .read()
+        .map(|efforts| efforts.clone())
+        .map_err(|_| "Cannot read provider reasoning-effort state".to_string())
+}
+
+/// Fixed reasoning-effort choices the Provider Reasoning GUI offers, per
+/// official upstream semantics: Qwen's Anthropic endpoint accepts
+/// none/low/medium/xhigh, DeepSeek's official Anthropic endpoint accepts
+/// none/low/high/max. Ambiguous tiers (Qwen high/max, DeepSeek medium/xhigh)
+/// are deliberately not exposed as choices.
+const QWEN_ANTHROPIC_EFFORT_CHOICES: &[&str] = &["none", "low", "medium", "xhigh"];
+const DEEPSEEK_ANTHROPIC_EFFORT_CHOICES: &[&str] = &["none", "low", "high", "max"];
+
+fn is_qwen38_max_model(model: &str) -> bool {
+    display_model_name(model).eq_ignore_ascii_case("qwen3.8-max")
+}
+
+fn is_supported_deepseek_v4_anthropic_model(model: &str) -> bool {
+    matches!(
+        display_model_name(model).to_ascii_lowercase().as_str(),
+        "deepseek-v4-flash" | "deepseek-v4-pro" | "deepseek-v4-flash-vision-exp"
+    )
+}
+
+/// The Provider Reasoning control covers only the official Qwen3.8-Max and
+/// the repository's supported DeepSeek V4 models on their Anthropic
+/// transports, and only while the capability that emits the upstream effort
+/// field is enabled. Inferring the dialect from a DashScope/Maas host alone
+/// would wrongly match other models routed through the same host, so the
+/// model ID and transport are checked explicitly. Gemini keeps its separate
+/// thinking-level control; OpenRouter, Kimi, and the Responses/Chat
+/// transports are out of scope.
+fn profile_effort_choices(profile: &ProviderProfile) -> Option<&'static [&'static str]> {
+    if profile.transport != ProviderTransport::Anthropic
+        || !profile.openai_capabilities.reasoning_effort
+    {
+        return None;
+    }
+    match profile.openai_capabilities.chat_dialect {
+        OpenAiChatDialect::Qwen if is_qwen38_max_model(&profile.model) => {
+            Some(QWEN_ANTHROPIC_EFFORT_CHOICES)
+        }
+        OpenAiChatDialect::DeepSeek if is_supported_deepseek_v4_anthropic_model(&profile.model) => {
+            Some(DEEPSEEK_ANTHROPIC_EFFORT_CHOICES)
+        }
+        _ => None,
+    }
+}
+
+/// Normalize a seven-tier internal-IR effort to the active profile's fixed
+/// choice set. Values that already are a valid choice pass through; the
+/// remaining IR tiers map onto the nearest official tier (Qwen high/max
+/// collapse into medium/xhigh, DeepSeek medium/xhigh collapse into high).
+fn normalized_profile_effort(profile: &ProviderProfile, effort: &str) -> Option<&'static str> {
+    let choices = profile_effort_choices(profile)?;
+    let effort = effort.trim();
+    if !is_reasoning_effort(effort) {
+        return None;
+    }
+    let choice = if choices == QWEN_ANTHROPIC_EFFORT_CHOICES {
+        match effort {
+            "none" => "none",
+            "minimal" | "low" => "low",
+            "medium" | "high" => "medium",
+            "xhigh" | "max" => "xhigh",
+            _ => return None,
+        }
+    } else {
+        match effort {
+            "none" => "none",
+            "minimal" | "low" => "low",
+            "medium" | "high" | "xhigh" => "high",
+            "max" => "max",
+            _ => return None,
+        }
+    };
+    Some(choice)
 }
 
 fn persist_bridge_state(

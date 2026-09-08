@@ -3,6 +3,7 @@
   "model": "deepseek-v4-flash",
   "context_window": 1048576,
   "protocol": "anthropic",
+  "reasoning_effort": "high",
   "base_url": "https://api.deepseek.com/anthropic",
   "api_key": "<DEEPSEEK_API_KEY>",
   "vision": {

@@ -860,7 +860,9 @@ fn deepseek_reasoning_policy(
             effort: Some("low"),
             source,
         },
-        "xhigh" | "max" => DeepSeekReasoningPolicy {
+        // The official DeepSeek mapping caps every tier above "low" except
+        // the explicit maximum at "high"; only "max" reaches "max".
+        "max" => DeepSeekReasoningPolicy {
             thinking_enabled: true,
             effort: Some("max"),
             source,

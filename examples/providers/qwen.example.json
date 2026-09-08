@@ -2,6 +2,7 @@
   "name": "Qwen3.8 Max",
   "model": "qwen3.8-max",
   "protocol": "anthropic",
+  "reasoning_effort": "medium",
   "base_url": "https://{WORKSPACE_ID}.cn-beijing.maas.aliyuncs.com/apps/anthropic",
   "api_key": "<DASHSCOPE_API_KEY>"
 }

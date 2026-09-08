@@ -179,13 +179,36 @@ async fn anthropic_messages(
     headers: HeaderMap,
     Json(mut request): Json<Value>,
 ) -> Response {
-    let Some(active_profile) = active_provider_profile(&state) else {
+    let Some(mut active_profile) = active_provider_profile(&state) else {
         return anthropic_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "api_error",
             "No active provider profile",
         );
     };
+    // Per-profile runtime reasoning-effort value takes precedence over the
+    // profile's static top-level value and the client request. It only
+    // mutates the request-scoped profile clone: the routing table and the
+    // Gemini thinking-level state are untouched. Without a runtime entry the
+    // clone keeps its static override, if any.
+    if profile_effort_choices(&active_profile).is_some() {
+        let runtime_effort = state
+            .reasoning_efforts
+            .read()
+            .ok()
+            .and_then(|efforts| efforts.get(&active_profile.file_name).cloned());
+        if let Some(effort) = runtime_effort {
+            if let Some(normalized) = normalized_profile_effort(&active_profile, &effort) {
+                info!(
+                    provider = %active_profile.file_name,
+                    reasoning_effort = normalized,
+                    "Applied per-profile runtime reasoning effort"
+                );
+                active_profile.openai_capabilities.reasoning_effort_override =
+                    Some(normalized.to_string());
+            }
+        }
+    }
     let request_override_diagnostics =
         match apply_provider_request_overrides(&active_profile, &mut request) {
             Ok(diagnostics) => diagnostics,
@@ -252,7 +275,6 @@ async fn anthropic_messages(
             attach_bridge_diagnostics(response, &provider_file, &diagnostics)
         }
         ProviderTransport::GeminiInteractions => {
-            let mut active_profile = active_profile;
             if active_profile
                 .openai_capabilities
                 .reasoning_effort_override
@@ -695,9 +717,14 @@ async fn forward_anthropic_profile(
     // cancels further socket reads. The stream wrapper bounds a connected
     // upstream that stops producing response bytes without imposing a total
     // deadline on long responses that continue making progress.
+    let terminal_grace_timeout = (stream_requested
+        && profile.openai_capabilities.chat_dialect == OpenAiChatDialect::DeepSeek)
+        .then_some(DEEPSEEK_ANTHROPIC_TERMINAL_GRACE_TIMEOUT);
     let body = Body::from_stream(anthropic_passthrough_stream(
         upstream.bytes_stream(),
         UPSTREAM_STREAM_IDLE_TIMEOUT,
+        terminal_grace_timeout,
+        profile.file_name.clone(),
     ));
     let mut builder = Response::builder()
         .status(status)
@@ -718,47 +745,180 @@ async fn forward_anthropic_profile(
     })
 }
 
-fn anthropic_passthrough_stream<S, B, E>(
+fn anthropic_stream_terminal_events(payloads: Vec<String>) -> (bool, bool) {
+    let mut terminal_delta_seen = false;
+    let mut message_stop_seen = false;
+    for payload in payloads {
+        let Ok(event) = serde_json::from_str::<Value>(&payload) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("message_delta")
+                if event
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                    .is_some() =>
+            {
+                terminal_delta_seen = true;
+            }
+            Some("message_stop") => message_stop_seen = true,
+            _ => {}
+        }
+    }
+    (terminal_delta_seen, message_stop_seen)
+}
+
+fn anthropic_passthrough_stream<S, E>(
     byte_stream: S,
     idle_timeout: Duration,
-) -> impl Stream<Item = Result<B, std::io::Error>>
+    terminal_grace_timeout: Option<Duration>,
+    provider_name: String,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>>
 where
-    S: Stream<Item = Result<B, E>> + Send + 'static,
-    B: Send + 'static,
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
 {
-    stream::unfold(Some(Box::pin(byte_stream)), move |byte_stream| async move {
-        let mut byte_stream = byte_stream?;
-        match tokio::time::timeout(idle_timeout, byte_stream.next()).await {
-            Ok(Some(Ok(bytes))) => {
-                mark_profile_probe_first_byte();
-                Some((Ok(bytes), Some(byte_stream)))
+    const MESSAGE_STOP_FRAME: &[u8] =
+        b"\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    stream::unfold(
+        (
+            Box::pin(byte_stream),
+            terminal_grace_timeout.map(|_| SseDataDecoder::default()),
+            None::<Instant>,
+            false,
+        ),
+        move |(mut byte_stream, mut decoder, mut terminal_deadline, ended)| {
+            let provider_name = provider_name.clone();
+            async move {
+                if ended {
+                    return None;
+                }
+
+                if terminal_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                    mark_profile_probe_response_body();
+                    warn!(
+                        provider = %provider_name,
+                        "Anthropic stream ended locally after terminal stop_reason because upstream message_stop was missing or delayed"
+                    );
+                    return Some((
+                        Ok(Bytes::from_static(MESSAGE_STOP_FRAME)),
+                        (byte_stream, decoder, None, true),
+                    ));
+                }
+
+                let wait_timeout = terminal_deadline
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                    .map(|remaining| remaining.min(idle_timeout))
+                    .unwrap_or(idle_timeout);
+                match tokio::time::timeout(wait_timeout, byte_stream.next()).await {
+                    Ok(Some(Ok(bytes))) => {
+                        mark_profile_probe_first_byte();
+                        let mut terminal_delta_seen = false;
+                        let mut message_stop_seen = false;
+                        if let Some(active_decoder) = decoder.as_mut() {
+                            match active_decoder.push_bytes(bytes.as_ref()) {
+                                Ok(payloads) => {
+                                    (terminal_delta_seen, message_stop_seen) =
+                                        anthropic_stream_terminal_events(payloads);
+                                }
+                                Err(message) => {
+                                    warn!(
+                                        provider = %provider_name,
+                                        error = %message,
+                                        "Cannot inspect Anthropic SSE terminal events; continuing byte passthrough"
+                                    );
+                                    decoder = None;
+                                    terminal_deadline = None;
+                                }
+                            }
+                        }
+                        if message_stop_seen {
+                            mark_profile_probe_response_body();
+                            info!(
+                                provider = %provider_name,
+                                "Anthropic stream completed with upstream message_stop"
+                            );
+                            Some((Ok(bytes), (byte_stream, decoder, None, true)))
+                        } else {
+                            if terminal_delta_seen && terminal_deadline.is_none() {
+                                terminal_deadline =
+                                    terminal_grace_timeout.map(|grace| Instant::now() + grace);
+                            }
+                            Some((Ok(bytes), (byte_stream, decoder, terminal_deadline, false)))
+                        }
+                    }
+                    Ok(Some(Err(err))) => {
+                        mark_profile_probe_response_body();
+                        if terminal_deadline.is_some() {
+                            warn!(
+                                provider = %provider_name,
+                                error = %err,
+                                "Anthropic upstream failed after terminal stop_reason; supplying message_stop"
+                            );
+                            Some((
+                                Ok(Bytes::from_static(MESSAGE_STOP_FRAME)),
+                                (byte_stream, decoder, None, true),
+                            ))
+                        } else {
+                            Some((
+                                Err(std::io::Error::other(format!(
+                                    "Anthropic upstream stream failed: {err}"
+                                ))),
+                                (byte_stream, decoder, None, true),
+                            ))
+                        }
+                    }
+                    Ok(None) => {
+                        mark_profile_probe_response_body();
+                        let (terminal_delta_seen, message_stop_seen) = decoder
+                            .as_mut()
+                            .and_then(|active_decoder| active_decoder.finish().ok())
+                            .map(anthropic_stream_terminal_events)
+                            .unwrap_or_default();
+                        if terminal_deadline.is_some() || terminal_delta_seen {
+                            warn!(
+                                provider = %provider_name,
+                                "Anthropic upstream reached EOF after terminal stop_reason; supplying message_stop"
+                            );
+                            Some((
+                                Ok(Bytes::from_static(MESSAGE_STOP_FRAME)),
+                                (byte_stream, decoder, None, true),
+                            ))
+                        } else if message_stop_seen {
+                            Some((
+                                Ok(Bytes::from_static(b"\n\n")),
+                                (byte_stream, decoder, None, true),
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => {
+                        mark_profile_probe_response_body();
+                        if terminal_deadline.is_some() {
+                            warn!(
+                                provider = %provider_name,
+                                "Anthropic stream reached terminal grace timeout; supplying message_stop"
+                            );
+                            Some((
+                                Ok(Bytes::from_static(MESSAGE_STOP_FRAME)),
+                                (byte_stream, decoder, None, true),
+                            ))
+                        } else {
+                            Some((
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "Anthropic upstream stream was idle for too long",
+                                )),
+                                (byte_stream, decoder, None, true),
+                            ))
+                        }
+                    }
+                }
             }
-            Ok(Some(Err(err))) => {
-                mark_profile_probe_response_body();
-                Some((
-                    Err(std::io::Error::other(format!(
-                        "Anthropic upstream stream failed: {err}"
-                    ))),
-                    None,
-                ))
-            }
-            Ok(None) => {
-                mark_profile_probe_response_body();
-                None
-            }
-            Err(_) => {
-                mark_profile_probe_response_body();
-                Some((
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Anthropic upstream stream was idle for too long",
-                    )),
-                    None,
-                ))
-            }
-        }
-    })
+        },
+    )
 }
 
 fn apply_anthropic_forward_headers(

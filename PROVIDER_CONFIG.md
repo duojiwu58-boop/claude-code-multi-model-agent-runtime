@@ -75,6 +75,8 @@ Opus 5 使用同一配置，只需把 `name` 和 `model` 分别改为 `OpenRoute
 两者不能同时配置为“顶层有值、能力关闭”。顶层值为 `none` 时会强制写入
 `thinking:{"type":"disabled"}` 并移除 budget；顶层值非 `none` 时，即使客户端显式发送
 `thinking:{"type":"disabled"}`，也会改为 adaptive thinking，使 profile 强制值保持最高优先级。
+对 Qwen3.8-Max 与 DeepSeek V4 官方 Anthropic profile，模型中心的 Provider Reasoning
+运行时档位优先级高于顶层值，可随时临时升降；无运行时值时顶层值继续生效（见各模型段落）。
 
 桥接器会按 OpenRouter 文档使用 Bearer 鉴权。`anthropic-version` 与 `anthropic-beta` 会继续发往
 Anthropic 兼容上游；`anthropic-user-profile-id`、`X-OpenRouter-Metadata`、`HTTP-Referer` 与
@@ -170,8 +172,9 @@ Completions 仍可作为 fallback：桥接器会从官方域名推断方言，�
 `capabilities.chat_dialect` 显式指定 `deepseek` 或 `qwen`。
 
 DeepSeek 推荐的 Anthropic 路径与 Chat fallback 共用四种实际运行态：`none` 关闭 thinking，
-`minimal/low` 映射为官方 `low`（V4 GA 起两模型均支持，官方文档与实测确认），`medium/high`
-映射为官方 `high`，`xhigh/max` 映射为官方 `max`。仅使用 `thinking.budget_tokens` 时，
+`minimal/low` 映射为官方 `low`（V4 GA 起两模型均支持，官方文档与实测确认），
+`medium/high/xhigh` 按现行官方规则统一映射为官方 `high`，只有 `max` 进入官方 `max`。
+仅使用 `thinking.budget_tokens` 时，
 32,768 以下保持 `high`，达到 32,768 才进入 `max`，避免 Claude Code 常见的 16K budget
 让简单轮次长期运行在最高推理档——DeepSeek Anthropic 端点会忽略 `budget_tokens`（实测
 64 token budget 仍产出完整思考），桥接器的 budget→effort 翻译是唯一让该字段生效的机制。
@@ -205,6 +208,11 @@ DeepSeek 服务端执行（实测：模型发出 `server_tool_use`，API 返回
 因此会影响同一 Claude Code 进程切换到的所有模型，修改后需要重启正在运行的会话。
 若只希望某个 Provider 使用固定档位，应在对应 Provider JSON 顶层设置
 `reasoning_effort`；profile 值优先于客户端全局值，并可在 GUI“刷新”后从下一次请求生效。
+Qwen3.8-Max 与 DeepSeek V4 官方 Anthropic profile 还可在模型中心用 Provider Reasoning
+四档控件即时切换（Qwen `none/low/medium/xhigh`，DeepSeek `none/low/high/max`），
+选择从下一次请求生效并按 profile 文件名持久化；控件值优先于 profile 顶层
+`reasoning_effort`，没有控件记录时才回落顶层静态值。完整优先级链为：
+Provider Reasoning 运行时值 > profile 顶层 `reasoning_effort` > Claude 请求/全局值 > profile 默认值。
 
 Chat fallback 的历史回放遵循 DeepSeek 工具契约：不携带 `tools` 且历史中没有工具调用时，普通
 assistant Thinking 不进入后续 Chat 上下文；只要当前请求携带 `tools`，全部历史
@@ -355,6 +363,14 @@ Gemini 3.8 Flash 的输入窗口为 1,048,576 tokens、最大输出为 65,536 to
 `output_config.effort`、`thinking.budget_tokens` 以及 profile 的 `default_reasoning_effort`。
 若 profile 顶层设置了 `reasoning_effort`，该模型级强制值再覆盖 GUI 档位；未设置时保持现有 GUI
 行为。完整优先级为：profile 顶层强制值 > Gemini GUI 值 > Claude 请求/全局值 > profile 默认值。
+
+Qwen3.8-Max 与 DeepSeek V4 官方 Anthropic profile 使用独立的 Provider Reasoning
+四档控件（Qwen `none/low/medium/xhigh`，DeepSeek `none/low/high/max`），与 Gemini
+控件互斥显示，两个控件不会同时可操作。Provider Reasoning 值按 profile 文件名持久化在
+`bridge-state.json` 的 `reasoning_efforts` 键中，切换后从下一次请求生效，无需重启；
+`/admin/status` 通过 `reasoning_effort_control`（`supported`、`choices`、`current`）
+如实报告支持状态与当前档位，没有运行时值和 profile 顶层值时 `current` 为 null，
+GUI 不选择任何 radio 也不凭空声称档位。Gemini 控件与旧机制完全不受影响。
 
 此 transport 默认发送 `store: true`；可用 `gemini_store: false` 关闭 Google 服务端存储，
 同时禁用 `previous_interaction_id` 续接。首轮成功后，普通多轮按完整消息前缀指纹、
@@ -563,8 +579,9 @@ Google 文本 annotations 则原样保存在
   并在结果中显示实际使用的代理模式/URL（LocalGemini profile 沿用当前 Gemini 传输代理）。
 - `enabled`：可选，默认 `true`。设为 `false` 后保留文件但不显示该配置。
 - `vision`：可选，默认 `{"mode":"native"}`，即图片仍由当前 Provider 原生处理。
-  对无视觉能力的模型可设为 `{"mode":"proxy"}`；此时默认由本地 Gemini
-  profile 提取视觉信息。也可用 `profile` 指定另一个视觉 Provider 配置文件。
+  对无视觉能力的模型可设为 `{"mode":"proxy"}`；此时默认优先由本地 bridge 管理的
+  Gemini profile 提取视觉信息，其次是 Google 官方 Gemini profile。也可用
+  `profile` 指定另一个视觉 Provider 配置文件（包括显式指定 Qwen 3.8 Max）。
 - `capabilities`：可选。仅在供应商的 OpenAI 兼容实现与默认行为不同时填写；
   省略时使用下文列出的兼容默认值。
 
@@ -587,10 +604,24 @@ Google 文本 annotations 则原样保存在
 }
 ```
 
-省略 `vision.profile` 时，桥接器优先选择第一个使用 `protocol: "gemini"` 的本地
-Gemini profile；若没有，则选择 `base_url` 指向 Google 官方
-`generativelanguage.googleapis.com` 的原生 Gemini profile。也可以显式指定任意一个
-原生支持视觉的 Provider 文件，例如：
+省略 `vision.profile` 时，桥接器按以下顺序选择默认视觉 Provider：
+
+1. 第一个使用 `protocol: "gemini"` 的本地 Gemini profile；
+2. 若没有，选择 `base_url` 指向 Google 官方
+   `generativelanguage.googleapis.com` 的原生 Gemini profile。
+
+Qwen 3.8 Max 不再参与默认选择（线上实测中其视觉轮次多次返回成功 HTTP 但无可
+提取观察，桥接器只能报 502）；如需继续实验，可在目标 Provider 中显式指定视觉
+profile，例如：
+
+```json
+"vision": {
+  "mode": "proxy",
+  "profile": "qwen.json"
+}
+```
+
+也可以显式指定任意一个原生支持视觉的 Provider 文件，例如：
 
 ```json
 "vision": {

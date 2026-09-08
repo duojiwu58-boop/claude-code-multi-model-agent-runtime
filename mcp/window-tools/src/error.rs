@@ -30,6 +30,10 @@ pub const UIA_UNAVAILABLE: &str = "UIA_UNAVAILABLE";
 /// WGC(Windows Graphics Capture)不可用:D3D11 设备创建失败、目标窗口受 DRM 保护、
 /// 捕获被系统拒绝或帧格式意外。环境/能力问题,重试无意义。
 pub const WGC_UNAVAILABLE: &str = "WGC_UNAVAILABLE";
+/// 目标进程以更高完整性级别运行(典型:管理员提权),UIPI 会静默拦截本服务
+/// (未提权)注入的输入——不报错、无效。需以管理员权限重启 MCP 服务或改选
+/// 非提权窗口,会话内重试无意义。
+pub const UIPI_BLOCKED: &str = "UIPI_BLOCKED";
 /// 不可预期内部错误(panic 路径)。应上报维护者。
 pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
 
@@ -87,6 +91,7 @@ mod tests {
         assert!(!ToolError::new(LIMIT_EXCEEDED, "x").retryable);
         assert!(!ToolError::new(INTERNAL_ERROR, "x").retryable);
         assert!(!ToolError::new(WGC_UNAVAILABLE, "x").retryable);
+        assert!(!ToolError::new(UIPI_BLOCKED, "x").retryable);
         for code in [
             WINDOW_NOT_FOUND,
             WINDOW_NOT_VISIBLE,

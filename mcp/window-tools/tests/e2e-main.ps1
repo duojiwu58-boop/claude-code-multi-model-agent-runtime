@@ -79,6 +79,8 @@ try {
   $lwL = Send-Tool 'list_windows' @{ limit=501 }
   $pl = Tool-Payload $lwL
   Check 'list_windows limit clamp 501->500' ((-not $lwL.result.isError) -and $pl.count -le 500) ("count=" + $pl.count)
+  # v0.7:每行 elevated 字段(UIPI 预判,布尔)
+  Check 'list_windows elevated flag boolean' ($null -ne $p.windows[0].PSObject.Properties['elevated'] -and $p.windows[0].elevated -is [bool]) ("sample elevated=" + $p.windows[0].elevated)
 
   # --- get_window_rect ---
   $gr = Send-Tool 'get_window_rect' @{ hwnd='@active' }
@@ -126,6 +128,9 @@ try {
 
   $wa = Send-Tool 'window_activate' @{ hwnd=$nh }
   Check 'window_activate winver' (-not $wa.result.isError) "ok"
+  $waM = Send-Tool 'window_activate' @{ hwnd=$nh }
+  $pwam = Tool-Payload $waM
+  Check 'window_activate reports activation_method' ((-not $waM.result.isError) -and $pwam.activation_method -in @('direct','attach_input','alt_trick')) ("method=" + $pwam.activation_method)
   Start-Sleep -Milliseconds 400
   $si = Send-Tool 'send_input' @{ hwnd=$nh; activate=$false; actions=@(@{kind='key_tap'; vkey='a'}) }
   Check 'send_input foreground key_tap' (-not $si.result.isError) ($si.result.content[0].text)
@@ -135,12 +140,27 @@ try {
   Start-Sleep -Milliseconds 200
   $siA = Send-Tool 'send_input' @{ hwnd=$nh; activate=$true; actions=@(@{kind='key_tap'; vkey='c'}) }
   Check 'send_input activate:true raises and injects' (-not $siA.result.isError) ($siA.result.content[0].text)
+  # v0.7 多模型容错:整数字符串参数 + 激活方式标注
+  $siS = Send-Tool 'send_input' @{ hwnd=$nh; activate=$true; delay_ms='30'; actions=@(@{kind='key_tap'; vkey='d'}) }
+  Check 'send_input string delay_ms tolerated' (-not $siS.result.isError) ($siS.result.content[0].text)
+  $siP = Tool-Payload $siS
+  Check 'send_input activation_method reported' ($siP.activation_method -in @('direct','attach_input','alt_trick')) ("method=" + $siP.activation_method)
 
   $scanN = Send-Tool 'pixel_scan_line' @{ hwnd=$nh; x=250; y_from=0; y_to=300 }
   $psn = Tool-Payload $scanN
   Check 'pixel_scan_line winver in-range' ($psn -and $psn.band_count -gt 0) ("bands=" + $psn.band_count)
   $scanO = Send-Tool 'pixel_scan_line' @{ hwnd=$nh; x=250; y_from=0; y_to=400 }
   Check 'pixel_scan_line out-of-range error' ($scanO.result.isError) $scanO.result.content[0].text
+  # v0.7:采样来源与遮挡标注
+  $scanS = Send-Tool 'pixel_scan_line' @{ hwnd=$nh; x=250; y_from=0; y_to=100; method='auto' }
+  $pss = Tool-Payload $scanS
+  Check 'pixel_scan_line reports source+occluded' ($pss -and $pss.source -eq 'screen' -and $null -ne $pss.PSObject.Properties['occluded']) ("source=" + $pss.source + " occluded=" + $pss.occluded)
+  $scanW = Send-Tool 'pixel_scan_line' @{ hwnd=$nh; x=250; y_from=0; y_to=100; method='wgc' }
+  $psw = Tool-Payload $scanW
+  Check 'pixel_scan_line method=wgc' ($psw -and $psw.source -eq 'wgc' -and $psw.band_count -gt 0) ("source=" + $psw.source + " bands=" + $psw.band_count)
+  $findW = Send-Tool 'pixel_find_color' @{ hwnd=$nh; x=0; y=0; width=100; height=100; color='#000000'; tolerance=60; method='wgc' }
+  $pfw = Tool-Payload $findW
+  Check 'pixel_find_color method=wgc' ($pfw -and $pfw.source -eq 'wgc') ("source=" + $pfw.source)
   $hex = '0x' + [Convert]::ToString([int64]$nh, 16)
   $gh = Send-Tool 'get_window_rect' @{ hwnd=$hex }
   $pgh = Tool-Payload $gh
@@ -155,6 +175,17 @@ try {
   # --- auto 链来源标注契约:无回退,或标注必须是 wgc/screen 形态 ---
   $swText = $sw.result.content[0].text
   Check 'screenshot_window auto source annotation' ($swText -notmatch 'fallback=' -or $swText -match 'fallback=(wgc|screen) \(') $swText
+
+  # --- v0.7:JPEG 编码(4:4:4)与 max_dim 降采样 ---
+  $jpg = Send-Tool 'screenshot_window' @{ hwnd=$nh; client_only=$false; format='jpeg'; quality=85 }
+  Check 'screenshot_window format=jpeg' ((-not $jpg.result.isError) -and $jpg.result.content[1].mimeType -eq 'image/jpeg') ($jpg.result.content[0].text + " b64len=" + $jpg.result.content[1].data.Length)
+  $jbytes = [Convert]::FromBase64String($jpg.result.content[1].data)
+  Check 'jpeg magic bytes FFD8' ($jbytes[0] -eq 0xFF -and $jbytes[1] -eq 0xD8) ("head=" + $jbytes[0].ToString('X2') + $jbytes[1].ToString('X2'))
+  $dim = Send-Tool 'screenshot_window' @{ hwnd=$nh; client_only=$false; max_dim=100 }
+  $dimDims = Png-Dims $dim.result.content
+  Check 'screenshot_window max_dim scales output' ((-not $dim.result.isError) -and $dimDims[0] -eq 100 -and $dimDims[1] -eq 80 -and $dim.result.content[0].text -match '输出 100x80') ($dim.result.content[0].text + " png=" + $dimDims[0] + "x" + $dimDims[1])
+  $incJ = Send-Tool 'screenshot_window' @{ hwnd=$nh; method='wgc'; incremental=$true; format='jpeg' }
+  Check 'incremental rejects jpeg format' ($incJ.result.isError) ($incJ.result.content[0].text)
 
   # --- WGC 实验路径:GPU 合成帧,独立于 PrintWindow/屏幕采样 ---
   $wg = Send-Tool 'screenshot_window' @{ hwnd=$nh; client_only=$false; method='wgc' }
@@ -175,6 +206,11 @@ try {
   Check 'screenshot_all method=wgc' ((-not $saw.result.isError) -and $sawImg -ge 1 -and $sawText -match 'method=wgc') ("images=" + $sawImg + " " + $sawText.Substring(0, [Math]::Min(160, $sawText.Length)))
   $sawBad = Send-Tool 'screenshot_all' @{ method='bogus' }
   Check 'screenshot_all unknown method rejected' ($sawBad.result.isError) ($sawBad.result.content[0].text)
+  # v0.7:screenshot_all 支持 jpeg + max_dim
+  $saj = Send-Tool 'screenshot_all' @{ format='jpeg'; max_dim=400 }
+  $sajImg = 0
+  foreach ($c in $saj.result.content) { if ($c.type -eq 'image' -and $c.mimeType -eq 'image/jpeg') { $sajImg++ } }
+  Check 'screenshot_all format=jpeg + max_dim' ((-not $saj.result.isError) -and $sajImg -ge 1) ("jpeg images=" + $sajImg)
 
   # --- GDI leak loop: 50x screenshot_window on winver ---
   $hp = Get-Process -Id $proc.Id
@@ -209,6 +245,7 @@ using System;
 using System.Windows.Forms;
 using System.Drawing;
 public static class UiaProbe {
+    public static System.Threading.Timer CoverTimer;
     public static void Start() {
         var t = new System.Threading.Thread(() => {
             var f = new Form();
@@ -231,6 +268,31 @@ public static class UiaProbe {
             f.Show();
             Console.WriteLine(f.Handle.ToInt64());
             Console.Out.Flush();
+            // Cover form for occlusion tests: hidden until the flag file appears.
+            // Owned by the main form so it always stays above it in z-order.
+            // Keep this Add-Type source free of non-ASCII comments (PS 5.1 encoding).
+            var f2 = new Form();
+            f2.Text = "UIA_E2E_COVER";
+            f2.FormBorderStyle = FormBorderStyle.None;
+            f2.BackColor = Color.Magenta;
+            f2.ClientSize = new Size(200, 120);
+            f2.StartPosition = FormStartPosition.Manual;
+            f2.TopMost = true;  // owner f is TopMost; plain windows sit below that band
+            f2.Owner = f;
+            // Drive the toggle from the main form via BeginInvoke: invoking on a
+            // hidden control whose handle is not created throws, so never touch
+            // f2 from the timer thread directly.
+            UiaProbe.CoverTimer = new System.Threading.Timer(_ => {
+                try {
+                    bool want = System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "wt-cover.flag"));
+                    f.BeginInvoke((Action)(() => {
+                        if (want != f2.Visible) {
+                            if (want) { f2.Location = f.Location + new Size(60, 60); f2.Show(); }
+                            else { f2.Hide(); }
+                        }
+                    }));
+                } catch { }
+            }, null, 0, 500);
             Application.Run(f);
         });
         t.IsBackground = true;
@@ -282,6 +344,28 @@ while ($true) { Start-Sleep -Seconds 60 }
     $fhaText = if ($fha.result.content) { $fha.result.content[0].text } else { '' }
     Check 'screenshot_window auto probe (chain)' ((-not $fha.result.isError) -and ($fhaText -notmatch 'fallback=' -or $fhaText -match 'fallback=(wgc|screen) \(')) $fhaText
 
+    # --- v0.7 像素采样遮挡感知:auto(屏幕,遮挡即错采并标注) vs wgc(合成帧,遮挡也准确) ---
+    # 覆盖窗(同进程、Owner 挂在探针上、品红底)由探针按标记文件显示/隐藏,位置确定。
+    $coverFlag = Join-Path $env:TEMP 'wt-cover.flag'
+    Set-Content -Path $coverFlag -Value 'on' -Encoding ASCII
+    Start-Sleep -Milliseconds 1500
+    $coverLw = Send-Tool 'list_windows' @{ title='UIA_E2E_COVER' }
+    $pcover = Tool-Payload $coverLw
+    Check 'occlusion cover window visible' ($pcover -and $pcover.count -ge 1) ("cover windows=" + $pcover.count)
+    $scanCov = Send-Tool 'pixel_scan_line' @{ hwnd=$fh; x=150; y_from=80; y_to=160; method='auto' }
+    $pscov = Tool-Payload $scanCov
+    Check 'pixel_scan_line auto detects occlusion' ($pscov -and $pscov.source -eq 'screen' -and $pscov.occluded -eq $true) ("occluded=" + $pscov.occluded + " band0=" + ($pscov.bands[0] | ConvertTo-Json -Compress))
+    $scanCovW = Send-Tool 'pixel_scan_line' @{ hwnd=$fh; x=150; y_from=80; y_to=160; method='wgc' }
+    $pscovw = Tool-Payload $scanCovW
+    Check 'pixel_scan_line wgc bypasses occlusion' ($pscovw -and $pscovw.source -eq 'wgc' -and $pscovw.band_count -gt 0) ("source=" + $pscovw.source + " bands=" + $pscovw.band_count)
+    # 覆盖下屏幕采样到品红(覆盖窗内容),WGC 帧给出探针真实内容:首带颜色必须不同
+    Check 'occlusion: screen vs wgc pixels differ' ($pscov.bands[0].color -ne $pscovw.bands[0].color) ("screen=" + $pscov.bands[0].color + " wgc=" + $pscovw.bands[0].color)
+    Remove-Item $coverFlag -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 1200
+    $scanClear = Send-Tool 'pixel_scan_line' @{ hwnd=$fh; x=150; y_from=80; y_to=160; method='auto' }
+    $psclear = Tool-Payload $scanClear
+    Check 'pixel_scan_line auto clears after uncover' ($psclear -and $psclear.occluded -eq $false) ("occluded=" + $psclear.occluded)
+
     # --- 增量差分(WGC 会话缓存):基线 → 无变化 → 点击触发变化 → 变化 → 再无变化 ---
     # 增量会话禁用光标捕获,差分与光标移动无关,判定确定。
     $incBad = Send-Tool 'screenshot_window' @{ hwnd=$fh; method='auto'; incremental=$true }
@@ -308,6 +392,9 @@ while ($true) { Start-Sleep -Seconds 60 }
     $inc4 = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$true; method='wgc'; incremental=$true }
     $inc4Img = ($inc4.result.content | Where-Object { $_.type -eq 'image' }).Count
     Check 'incremental settles back to no-change' ((-not $inc4.result.isError) -and $inc4Img -eq 0) ($inc4.result.content[0].text)
+    # v0.7 多模型容错:鼠标坐标整数字符串(再次点击按钮2,无视觉变化,不影响后续)
+    $clickStr = Send-Tool 'send_input' @{ hwnd=$fh; activate=$true; actions=@(@{kind='click'; x="$b2x"; y="$b2y"}) }
+    Check 'send_input string coords tolerated' (-not $clickStr.result.isError) ($clickStr.result.content[0].text)
 
     # --- ① 最小化中途:缓存会话后最小化 → 确定性结构化拒绝(不挂 15s),恢复后正常 ---
     # 背景:GetWindowRect 对最小化窗口返回 (-32000,-32000) 位置但尺寸仍为正,

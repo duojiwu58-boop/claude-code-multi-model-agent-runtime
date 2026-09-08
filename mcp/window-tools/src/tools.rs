@@ -6,11 +6,15 @@ use serde_json::{json, Value};
 use windows::Win32::Foundation::HWND;
 
 use crate::backend::{
-    capture::{capture_all_monitors, capture_client_region_bgra, capture_window},
+    capture::{
+        capture_all_monitors, capture_client_region_bgra, capture_window, CaptureFormat,
+        MAX_CAPTURE_DIM,
+    },
+    elevation::elevated_flag,
     input::send_input,
     window::{
-        collect_windows, entry_for_hwnd, entry_is_interactive, foreground_hwnd, hwnd_num, hwnd_str,
-        WindowEntry,
+        client_region_occluded, collect_windows, entry_for_hwnd, entry_is_interactive,
+        foreground_hwnd, hwnd_num, hwnd_str, WindowEntry,
     },
 };
 use crate::error::{
@@ -41,6 +45,41 @@ const MAX_SCAN_BANDS: usize = 256;
 // 工具实现
 // ---------------------------------------------------------------------------
 
+/// 解析 format/quality/max_dim 参数为 [`CaptureFormat`](默认 png 无损)。
+/// 多模型接入:数值参数全部经 json_i32(整数字符串等价、null 视为缺省)。
+fn parse_capture_format(args: &Value) -> Result<CaptureFormat, ToolError> {
+    let format_arg = args.get("format").and_then(Value::as_str).unwrap_or("png");
+    let quality = json_i32(args, "quality", false)?
+        .unwrap_or(85)
+        .clamp(1, 100) as u8;
+    let max_dim = json_i32(args, "max_dim", false)?
+        .unwrap_or(0)
+        .clamp(0, MAX_CAPTURE_DIM) as u32;
+    match format_arg {
+        "png" => Ok(CaptureFormat {
+            jpeg_quality: None,
+            max_dim,
+        }),
+        "jpeg" => Ok(CaptureFormat {
+            jpeg_quality: Some(quality),
+            max_dim,
+        }),
+        other => Err(ToolError::new(
+            INVALID_ARGUMENT,
+            format!("未知输出格式 '{other}'，支持 png / jpeg"),
+        )),
+    }
+}
+
+/// 编码名(响应文本用):png / jpeg。
+fn encoding_label(format: CaptureFormat) -> &'static str {
+    if format.jpeg_quality.is_some() {
+        "jpeg"
+    } else {
+        "png"
+    }
+}
+
 pub fn list_windows(args: &Value) -> Result<Value, ToolError> {
     let title = args.get("title").and_then(Value::as_str).unwrap_or("");
     let class = args.get("class").and_then(Value::as_str).unwrap_or("");
@@ -53,12 +92,9 @@ pub fn list_windows(args: &Value) -> Result<Value, ToolError> {
         .get("interactive_only")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .map(|v| v as usize)
+    let limit = json_u32(args, "limit")?
         .unwrap_or(100)
-        .clamp(1, MAX_WINDOWS_LIMIT);
+        .clamp(1, MAX_WINDOWS_LIMIT as u32) as usize;
 
     let mut entries = collect_windows();
     if !title.is_empty() {
@@ -87,9 +123,15 @@ pub fn list_windows(args: &Value) -> Result<Value, ToolError> {
     });
     entries.truncate(limit);
 
+    // 每个不同 PID 只探测一次提权状态(OpenProcess + token 查询,避免重复)。
+    let mut elevated_by_pid: std::collections::HashMap<u32, bool> =
+        std::collections::HashMap::new();
     let rows: Vec<Value> = entries
         .iter()
         .map(|e| {
+            let elevated = *elevated_by_pid
+                .entry(e.pid)
+                .or_insert_with(|| elevated_flag(e.pid));
             json!({
                 "hwnd": e.hwnd.to_string(),
                 "pid": e.pid,
@@ -97,6 +139,7 @@ pub fn list_windows(args: &Value) -> Result<Value, ToolError> {
                 "class": e.class,
                 "visible": e.visible,
                 "minimized": e.minimized,
+                "elevated": elevated,
                 "rect": {
                     "left": e.left, "top": e.top,
                     "width": e.width, "height": e.height
@@ -291,6 +334,35 @@ fn merge_color_bands(colors: &[(u8, u8, u8)], tolerance: u8, min_band: usize) ->
         .collect()
 }
 
+/// 像素采样来源:auto=屏幕 BitBlt(实时,但被遮挡区域采到的是遮挡方像素);
+/// wgc=DWM 合成帧(遮挡也给出目标窗口真实像素,但帧异步、可能旧一个合成
+/// 周期)。返回 (BGRA, source, occluded);occluded 仅对 auto 有意义
+/// (wgc 帧与屏幕现状无关,恒 false)。
+fn capture_region_for_pixels(
+    hwnd: HWND,
+    method: &str,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<(Vec<u8>, &'static str, bool), ToolError> {
+    match method {
+        "auto" => {
+            let bgra = capture_client_region_bgra(hwnd, x, y, width, height)?;
+            let occluded = client_region_occluded(hwnd, x, y, width, height);
+            Ok((bgra, "screen", occluded))
+        }
+        "wgc" => {
+            let bgra = crate::backend::wgc::capture_client_region_wgc(hwnd, x, y, width, height)?;
+            Ok((bgra, "wgc", false))
+        }
+        other => Err(ToolError::new(
+            INVALID_ARGUMENT,
+            format!("未知采集方式 '{other}'，支持 auto / wgc"),
+        )),
+    }
+}
+
 /// 在窗口客户区内沿 x 指定的垂直列扫描屏幕像素，输出颜色带列表。
 /// 用于布局验证：面板边界、控件高度、占位空隙一类的断言。
 fn pixel_scan_line(hwnd: HWND, args: &Value) -> Result<Value, ToolError> {
@@ -312,8 +384,10 @@ fn pixel_scan_line(hwnd: HWND, args: &Value) -> Result<Value, ToolError> {
     let max_bands = json_i32(args, "max_bands", false)?
         .unwrap_or(MAX_SCAN_BANDS as i32)
         .clamp(1, MAX_SCAN_BANDS as i32) as usize;
+    let method = args.get("method").and_then(Value::as_str).unwrap_or("auto");
 
-    let bgra = capture_client_region_bgra(hwnd, x, y_from, 1, scan_height)?;
+    let (bgra, source, occluded) =
+        capture_region_for_pixels(hwnd, method, x, y_from, 1, scan_height)?;
     // BGRA → (r,g,b)
     let colors: Vec<(u8, u8, u8)> = bgra
         .chunks_exact(4)
@@ -344,6 +418,8 @@ fn pixel_scan_line(hwnd: HWND, args: &Value) -> Result<Value, ToolError> {
             "y_to": y_to,
             "tolerance": tolerance,
             "min_band": min_band,
+            "source": source,
+            "occluded": occluded,
             "band_count": rows.len(),
             "truncated": truncated,
             "bands": rows
@@ -365,8 +441,9 @@ fn pixel_find_color(hwnd: HWND, args: &Value) -> Result<Value, ToolError> {
     let y = json_i32(args, "y", true)?.expect("required value checked above");
     let width = json_i32(args, "width", true)?.expect("required value checked above");
     let height = json_i32(args, "height", true)?.expect("required value checked above");
+    let method = args.get("method").and_then(Value::as_str).unwrap_or("auto");
 
-    let bgra = capture_client_region_bgra(hwnd, x, y, width, height)?;
+    let (bgra, source, occluded) = capture_region_for_pixels(hwnd, method, x, y, width, height)?;
     let mut count: i64 = 0;
     let mut min_x = i32::MAX;
     let mut min_y = i32::MAX;
@@ -403,6 +480,8 @@ fn pixel_find_color(hwnd: HWND, args: &Value) -> Result<Value, ToolError> {
             "hwnd": hwnd_str(hwnd),
             "color": format!("#{:02X}{:02X}{:02X}", r, g, b),
             "tolerance": tolerance,
+            "source": source,
+            "occluded": occluded,
             "match_count": count,
             "bbox": bbox
         }).to_string()}]
@@ -417,17 +496,17 @@ pub fn tools_list() -> Value {
     json!({"tools": [
         {
             "name": TOOL_LIST,
-            "description": "枚举当前桌面的顶层窗口,支持按标题子串、窗口类名或进程 PID 过滤。返回每个窗口的句柄(hwnd,十进制字符串)、pid、标题、类名、可见性、最小化状态和屏幕矩形。",
+            "description": "枚举当前桌面的顶层窗口,支持按标题子串、窗口类名或进程 PID 过滤。返回每个窗口的句柄(hwnd,十进制字符串)、pid、标题、类名、可见性、最小化状态、提权状态(elevated:该进程是否以管理员权限运行,为 true 时本服务注入输入会被 UIPI 静默拦截)和屏幕矩形。",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "title": {"type": "string", "description": "标题子串过滤(忽略大小写)"},
                     "class": {"type": "string", "description": "窗口类名子串过滤(忽略大小写)"},
-                    "pid": {"type": "integer", "description": "按进程 PID 过滤"},
+                    "pid": {"type": ["integer", "string"], "description": "按进程 PID 过滤"},
                     "visible_only": {"type": "boolean", "description": "只返回可见窗口,默认 true"},
                     "interactive_only": {"type": "boolean", "description": "只返回人类可交互窗口(启发式:非最小化、≥100x100、非工具窗口、有标题),默认 true;false 返回全部(含输入法/托盘/DWM 骨架等噪点窗口)"},
-                    "limit": {"type": "integer", "description": "最多返回条数,默认 100,上限 500,超出按 500 钳制"}
+                    "limit": {"type": ["integer", "string"], "description": "最多返回条数,默认 100,上限 500,超出按 500 钳制"}
                 },
                 "additionalProperties": false
             }
@@ -447,29 +526,35 @@ pub fn tools_list() -> Value {
         },
         {
             "name": TOOL_SCREENSHOT_WINDOW,
-            "description": "截取指定窗口的渲染内容。client_only=false（默认）包含标题栏和边框；true 仅截客户区。hwnd 可为 @active；其余定位必须且只能用 hwnd / title / pid 之一。单窗口最高 1200 万像素，超限请先 resize_window。method=auto（默认）时 PrintWindow 输出近纯黑(部分 GPU 加速窗口)或失败先试 WGC 合成帧(实验)，仍不可用再回退屏幕采样，被遮挡区域按屏幕当前显示内容；method=wgc 直接走 Windows Graphics Capture GPU 合成帧(实验)，被遮挡窗口也产出完整内容，但最小化窗口确定性返回 WINDOW_NOT_VISIBLE、DRM 保护内容被拒或黑区，且边框策略随系统版本不同(Win10 不支持去边框)。incremental=true(仅 method=wgc，实验)启用增量差分：首次调用返回完整基线帧，后续调用只返回相对上次的变化区域图像(文本列出帧坐标矩形)，无变化时仅返回文本零图像；会话跨调用缓存：有变化时约 10-30ms，静态窗口约 100ms(等待确认无新帧)。响应文本 fallback= 标注 PrintWindow 未产出时的实际来源(wgc / screen)。",
+            "description": "截取指定窗口的渲染内容。client_only=false（默认）包含标题栏和边框；true 仅截客户区。hwnd 可为 @active；其余定位必须且只能用 hwnd / title / pid 之一。单窗口最高 1200 万像素，超限请先 resize_window。method=auto（默认）时 PrintWindow 输出近纯黑(部分 GPU 加速窗口)或失败先试 WGC 合成帧(实验)，仍不可用再回退屏幕采样，被遮挡区域按屏幕当前显示内容；method=wgc 直接走 Windows Graphics Capture GPU 合成帧(实验)，被遮挡窗口也产出完整内容，但最小化窗口确定性返回 WINDOW_NOT_VISIBLE、DRM 保护内容被拒或黑区，且边框策略随系统版本不同(Win10 不支持去边框)。format=png(默认)无损,像素断言用;format=jpeg 有损(4:4:4 无色度下采样,彩色文字可读),体积小 60-90%,全局语义观察或网络上行用。max_dim>0 时输出最长边按比例双线性缩小(默认 0 不限制):视觉模型 token 按分辨率计费,观察整体布局建议 1568~1920,需逐像素细节时保持 0。incremental=true(仅 method=wgc，实验)启用增量差分：首次调用返回完整基线帧，后续调用只返回相对上次的变化区域图像(文本列出帧坐标矩形)，无变化时仅返回文本零图像；会话跨调用缓存：有变化时约 10-30ms，静态窗口约 100ms(等待确认无新帧)。响应文本 fallback= 标注 PrintWindow 未产出时的实际来源(wgc / screen)。",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "hwnd": {"type": "string", "description": "窗口句柄(十进制字符串)"},
                     "title": {"type": "string", "description": "窗口标题子串"},
-                    "pid": {"type": "integer", "description": "窗口所属进程 PID"},
+                    "pid": {"type": ["integer", "string"], "description": "窗口所属进程 PID"},
                     "client_only": {"type": "boolean", "description": "仅截客户区，默认 false"},
                     "method": {"type": "string", "enum": ["auto", "wgc"], "description": "采集方式：auto=PrintWindow，近纯黑/失败先试 WGC 再回退屏幕采样（默认）；wgc=直接走 Windows Graphics Capture GPU 合成帧（实验）"},
-                    "incremental": {"type": "boolean", "description": "增量差分(实验,仅 method=wgc 有效)：true 时首次调用返回基线全帧，后续调用只返回相对上次的变化区域图像，无变化时仅返回文本"}
+                    "format": {"type": "string", "enum": ["png", "jpeg"], "description": "输出编码：png 无损（默认，像素断言）；jpeg 有损但体积小 60-90%（全局语义观察），配合 quality 使用"},
+                    "quality": {"type": ["integer", "string"], "minimum": 1, "maximum": 100, "description": "jpeg 质量 1-100，默认 85，仅 format=jpeg 有效"},
+                    "max_dim": {"type": ["integer", "string"], "minimum": 0, "maximum": 7680, "description": "输出最长边上限（物理像素），超过按比例双线性缩小；0=不限制（默认）。视觉模型 token 按分辨率计费，整体观察可设 1568~1920"},
+                    "incremental": {"type": "boolean", "description": "增量差分(实验,仅 method=wgc 有效且要求 format=png、max_dim=0)：true 时首次调用返回基线全帧，后续调用只返回相对上次的变化区域图像，无变化时仅返回文本"}
                 },
                 "additionalProperties": false
             }
         },
         {
             "name": TOOL_SCREENSHOT_ALL,
-            "description": "截取所有显示器（每台一张 PNG）。最高保留三台 UHD 4K（3840x2160）显示器的总像素；超过时按相同比例缩放，并返回原始与实际尺寸。method=auto（默认）走屏幕 BitBlt，不含光标；method=wgc 走 Windows Graphics Capture 合成帧（实验），含光标，会话断开/锁定等无合成场景单屏报错。",
+            "description": "截取所有显示器（每台一张图）。最高保留三台 UHD 4K（3840x2160）显示器的总像素；超过时按相同比例缩放，并返回原始与实际尺寸。method=auto（默认）走屏幕 BitBlt，不含光标；method=wgc 走 Windows Graphics Capture 合成帧（实验），含光标，会话断开/锁定等无合成场景单屏报错。format=png(默认)无损；format=jpeg 有损但体积小 60-90%；max_dim>0 时输出最长边按比例缩小（默认 0 不限制，视觉模型 token 按分辨率计费）。",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "method": {"type": "string", "enum": ["auto", "wgc"], "description": "采集方式：auto=屏幕 BitBlt（默认，不含光标）；wgc=Windows Graphics Capture 合成帧（实验，含光标）"}
+                    "method": {"type": "string", "enum": ["auto", "wgc"], "description": "采集方式：auto=屏幕 BitBlt（默认，不含光标）；wgc=Windows Graphics Capture 合成帧（实验，含光标）"},
+                    "format": {"type": "string", "enum": ["png", "jpeg"], "description": "输出编码：png 无损（默认）；jpeg 有损但体积小 60-90%"},
+                    "quality": {"type": ["integer", "string"], "minimum": 1, "maximum": 100, "description": "jpeg 质量 1-100，默认 85，仅 format=jpeg 有效"},
+                    "max_dim": {"type": ["integer", "string"], "minimum": 0, "maximum": 7680, "description": "输出最长边上限（物理像素），超过按比例双线性缩小；0=不限制（默认）"}
                 },
                 "additionalProperties": false
             }
@@ -482,10 +567,10 @@ pub fn tools_list() -> Value {
                 "type": "object",
                 "properties": {
                     "hwnd": {"type": "string", "description": "窗口句柄(十进制字符串，必须由 list_windows 返回)"},
-                    "width": {"type": "integer", "minimum": 40, "description": "目标宽度"},
-                    "height": {"type": "integer", "minimum": 40, "description": "目标高度"},
-                    "x": {"type": "integer", "description": "可选,目标 X 坐标"},
-                    "y": {"type": "integer", "description": "可选,目标 Y 坐标"}
+                    "width": {"type": ["integer", "string"], "minimum": 40, "description": "目标宽度"},
+                    "height": {"type": ["integer", "string"], "minimum": 40, "description": "目标高度"},
+                    "x": {"type": ["integer", "string"], "description": "可选,目标 X 坐标"},
+                    "y": {"type": ["integer", "string"], "description": "可选,目标 Y 坐标"}
                 },
                 "required": ["hwnd", "width", "height"],
                 "additionalProperties": false
@@ -493,12 +578,13 @@ pub fn tools_list() -> Value {
         },
         {
             "name": TOOL_ACTIVATE,
-            "description": "将一个由 hwnd 精确指定的窗口请求置为前台，用于截图前的人工对比或布局检查。Windows 焦点保护拒绝时返回错误；不发送鼠标或键盘输入。",
+            "description": "将一个由 hwnd 精确指定的窗口请求置为前台，用于截图前的人工对比或布局检查。Windows 焦点保护拒绝直连请求时自动升级：AttachThreadInput 附着前台线程(挂起预检,挂接即解绑)→ 失败且 allow_alt_trick=true 时向当前前台窗口注入一次 Alt 按键(有副作用,默认关闭)。响应 activation_method 标注哪一级生效；全部失败返回结构化错误。不发送其他鼠标或键盘输入。目标窗口提权且本服务未提权时返回 UIPI_BLOCKED。",
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "hwnd": {"type": "string", "description": "精确窗口句柄，或 @active"}
+                    "hwnd": {"type": "string", "description": "精确窗口句柄，或 @active"},
+                    "allow_alt_trick": {"type": "boolean", "description": "允许最后手段:向前台窗口注入一次 Alt 按键解除焦点锁(有副作用),默认 false"}
                 },
                 "required": ["hwnd"],
                 "additionalProperties": false
@@ -506,18 +592,19 @@ pub fn tools_list() -> Value {
         },
         {
             "name": TOOL_PIXEL_SCAN_LINE,
-            "description": "在窗口客户区内沿指定垂直列扫描屏幕像素，将颜色相近的连续行合并为颜色带（每个带含起止行、高度和平均颜色）。用于布局验证：测量面板边界、控件高度、空白占位。坐标均为相对客户区的物理像素；窗口被遮挡的区域按屏幕当前显示内容采样。",
+            "description": "在窗口客户区内沿指定垂直列扫描像素，将颜色相近的连续行合并为颜色带（每个带含起止行、高度和平均颜色）。用于布局验证：测量面板边界、控件高度、空白占位。坐标均为相对客户区的物理像素。method=auto（默认）实时屏幕采样，响应含 source=screen 与 occluded（该列被其他窗口遮挡时 true，此时颜色带不可信）；method=wgc 走 DWM 合成帧（实验），遮挡也给出目标窗口真实像素，但帧异步、输入后立即断言可能读到上一帧。",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "hwnd": {"type": "string", "description": "精确窗口句柄，或 @active"},
-                    "x": {"type": "integer", "description": "扫描列（客户区 X）"},
-                    "y_from": {"type": "integer", "description": "起始行（客户区 Y，含）"},
-                    "y_to": {"type": "integer", "description": "结束行（客户区 Y，不含）"},
-                    "tolerance": {"type": "integer", "minimum": 0, "maximum": 255, "description": "相邻行颜色差阈值，默认 2"},
-                    "min_band": {"type": "integer", "minimum": 1, "description": "小于该高度的颜色带被忽略，默认 2"},
-                    "max_bands": {"type": "integer", "minimum": 1, "maximum": 256, "description": "最多返回颜色带数，默认 256"}
+                    "x": {"type": ["integer", "string"], "description": "扫描列（客户区 X）"},
+                    "y_from": {"type": ["integer", "string"], "description": "起始行（客户区 Y，含）"},
+                    "y_to": {"type": ["integer", "string"], "description": "结束行（客户区 Y，不含）"},
+                    "tolerance": {"type": ["integer", "string"], "minimum": 0, "maximum": 255, "description": "相邻行颜色差阈值，默认 2"},
+                    "min_band": {"type": ["integer", "string"], "minimum": 1, "description": "小于该高度的颜色带被忽略，默认 2"},
+                    "max_bands": {"type": ["integer", "string"], "minimum": 1, "maximum": 256, "description": "最多返回颜色带数，默认 256"},
+                    "method": {"type": "string", "enum": ["auto", "wgc"], "description": "采样来源：auto=屏幕（默认，实时但遮挡即错采，响应 occluded 标注）；wgc=DWM 合成帧（实验，遮挡准确但帧异步）"}
                 },
                 "required": ["hwnd", "x", "y_from", "y_to"],
                 "additionalProperties": false
@@ -525,18 +612,19 @@ pub fn tools_list() -> Value {
         },
         {
             "name": TOOL_PIXEL_FIND_COLOR,
-            "description": "在窗口客户区矩形区域内查找与指定颜色匹配的像素，返回匹配数量和最小包围盒。可与 pixel_scan_line 配合做布局断言；color 为 #RRGGBB，坐标均为相对客户区的物理像素。",
+            "description": "在窗口客户区矩形区域内查找与指定颜色匹配的像素，返回匹配数量和最小包围盒。可与 pixel_scan_line 配合做布局断言；color 为 #RRGGBB，坐标均为相对客户区的物理像素。method=auto（默认）实时屏幕采样，响应含 source=screen 与 occluded（区域被其他窗口遮挡时 true，此时结果不可信）；method=wgc 走 DWM 合成帧（实验），遮挡也给出目标窗口真实像素，但帧异步、输入后立即断言可能读到上一帧。",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "hwnd": {"type": "string", "description": "精确窗口句柄，或 @active"},
-                    "x": {"type": "integer", "description": "区域左上角（客户区 X）"},
-                    "y": {"type": "integer", "description": "区域左上角（客户区 Y）"},
-                    "width": {"type": "integer", "minimum": 1, "description": "区域宽度"},
-                    "height": {"type": "integer", "minimum": 1, "description": "区域高度"},
+                    "x": {"type": ["integer", "string"], "description": "区域左上角（客户区 X）"},
+                    "y": {"type": ["integer", "string"], "description": "区域左上角（客户区 Y）"},
+                    "width": {"type": ["integer", "string"], "minimum": 1, "description": "区域宽度"},
+                    "height": {"type": ["integer", "string"], "minimum": 1, "description": "区域高度"},
                     "color": {"type": "string", "description": "目标颜色 #RRGGBB"},
-                    "tolerance": {"type": "integer", "minimum": 0, "maximum": 255, "description": "每通道颜色差阈值，默认 0"}
+                    "tolerance": {"type": ["integer", "string"], "minimum": 0, "maximum": 255, "description": "每通道颜色差阈值，默认 0"},
+                    "method": {"type": "string", "enum": ["auto", "wgc"], "description": "采样来源：auto=屏幕（默认，实时但遮挡即错采，响应 occluded 标注）；wgc=DWM 合成帧（实验，遮挡准确但帧异步）"}
                 },
                 "required": ["hwnd", "x", "y", "width", "height", "color"],
                 "additionalProperties": false
@@ -544,14 +632,15 @@ pub fn tools_list() -> Value {
         },
         {
             "name": TOOL_SEND_INPUT,
-            "description": "向指定窗口发送鼠标/键盘输入。目标必须保持为前台窗口，每个鼠标坐标必须位于客户区；activate:true 可先请求置前。动作先整体校验再执行，down/key_down 必须在同一批次内由 up/key_up 配平，异常路径会自动释放。每批最多 128 个动作且计划延迟不超过 60 秒。",
+            "description": "向指定窗口发送鼠标/键盘输入。目标必须保持为前台窗口，每个鼠标坐标必须位于客户区；activate:true 可先请求置前（直连失败自动升级 AttachThreadInput，allow_alt_trick=true 时才用 Alt 点击最后手段）。动作先整体校验再执行，down/key_down 必须在同一批次内由 up/key_up 配平，异常路径会自动释放。每批最多 128 个动作且计划延迟不超过 60 秒。目标窗口提权且本服务未提权时返回 UIPI_BLOCKED（注入会被 Windows 静默拦截）。数值字段接受整数字符串。",
             "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "hwnd": {"type": "string", "description": "精确窗口句柄，或 @active"},
                     "activate": {"type": "boolean", "description": "先请求激活目标窗口再注入，默认 false"},
-                    "delay_ms": {"type": "integer", "minimum": 0, "maximum": 5000, "description": "动作间延迟，默认 50"},
+                    "allow_alt_trick": {"type": "boolean", "description": "激活最后手段:向前台窗口注入一次 Alt 按键解除焦点锁(有副作用),默认 false;仅 activate:true 时有效"},
+                    "delay_ms": {"type": ["integer", "string"], "minimum": 0, "maximum": 5000, "description": "动作间延迟，默认 50"},
                     "actions": {
                         "type": "array",
                         "minItems": 1,
@@ -560,15 +649,14 @@ pub fn tools_list() -> Value {
                             "type": "object",
                             "properties": {
                                 "kind": {"type": "string", "enum": ["move", "click", "down", "up", "scroll", "key_tap", "key_down", "key_up"]},
-                                "x": {"type": "integer", "description": "客户区 X（鼠标动作必填）"},
-                                "y": {"type": "integer", "description": "客户区 Y（鼠标动作必填）"},
+                                "x": {"type": ["integer", "string"], "description": "客户区 X（鼠标动作必填）"},
+                                "y": {"type": ["integer", "string"], "description": "客户区 Y（鼠标动作必填）"},
                                 "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "鼠标键，默认 left"},
-                                "delta": {"type": "integer", "description": "scroll：滚轮增量（正=上滚）"},
+                                "delta": {"type": ["integer", "string"], "description": "scroll：滚轮增量（正=上滚）"},
                                 "vkey": {"type": ["integer", "string"], "description": "虚拟键码或按键名（key_tap/key_down/key_up 必填）"},
-                                "steps": {"type": "integer", "minimum": 1, "maximum": 200, "description": "move 插值步数，默认 1"}
+                                "steps": {"type": ["integer", "string"], "minimum": 1, "maximum": 200, "description": "move 插值步数，默认 1"}
                             },
-                            "required": ["kind"],
-                            "additionalProperties": false
+                            "required": ["kind"]
                         }
                     }
                 },
@@ -584,8 +672,8 @@ pub fn tools_list() -> Value {
                 "type": "object",
                 "properties": {
                     "hwnd": {"type": "string", "description": "精确窗口句柄，或 @active"},
-                    "x": {"type": "integer", "description": "检查点（客户区 X）"},
-                    "y": {"type": "integer", "description": "检查点（客户区 Y）"}
+                    "x": {"type": ["integer", "string"], "description": "检查点（客户区 X）"},
+                    "y": {"type": ["integer", "string"], "description": "检查点（客户区 Y）"}
                 },
                 "required": ["hwnd", "x", "y"],
                 "additionalProperties": false
@@ -627,12 +715,19 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
                     format!("增量差分仅支持 method=wgc，当前 method={method}"),
                 ));
             }
+            let format = parse_capture_format(args)?;
+            if incremental && (format.jpeg_quality.is_some() || format.max_dim != 0) {
+                return Err(ToolError::new(
+                    INVALID_ARGUMENT,
+                    "增量差分仅支持 format=png 且 max_dim=0(差分区域像素保真优先)",
+                ));
+            }
             let capture = match method {
-                "auto" => capture_window(hwnd, client_only)?,
+                "auto" => capture_window(hwnd, client_only, format)?,
                 "wgc" if incremental => {
                     crate::backend::wgc::capture_window_wgc_incremental(hwnd, client_only)?
                 }
-                "wgc" => crate::backend::wgc::capture_window_wgc(hwnd, client_only)?,
+                "wgc" => crate::backend::wgc::capture_window_wgc(hwnd, client_only, format)?,
                 other => {
                     return Err(ToolError::new(
                         INVALID_ARGUMENT,
@@ -649,16 +744,25 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
             } else {
                 ""
             };
+            let rect_w = capture.rect.right - capture.rect.left;
+            let rect_h = capture.rect.bottom - capture.rect.top;
+            // max_dim 降采样后输出尺寸与窗口矩形不同时显式标注。
+            let dims_note = if capture.image_dims.0 > 0
+                && capture.image_dims != (rect_w as u32, rect_h as u32)
+            {
+                format!(" 输出 {}x{}", capture.image_dims.0, capture.image_dims.1)
+            } else {
+                String::new()
+            };
             match &capture.incremental {
                 Some(info) if info.baseline => Ok(json!({
                     "content": [
                         {"type": "text", "text": format!(
                             "增量截图基线: hwnd={} client_only={} 矩形=({},{}) {}x{} 图像={} bytes;已建立差分基线，后续调用仅返回变化区域",
                             hwnd_str(hwnd), client_only, capture.rect.left, capture.rect.top,
-                            capture.rect.right - capture.rect.left,
-                            capture.rect.bottom - capture.rect.top, capture.png.len()
+                            rect_w, rect_h, capture.image.len()
                         )},
-                        {"type": "image", "data": B64.encode(&capture.png), "mimeType": "image/png"}
+                        {"type": "image", "data": B64.encode(&capture.image), "mimeType": capture.mime}
                     ]
                 })),
                 Some(info) if info.regions.is_empty() => Ok(json!({
@@ -692,19 +796,19 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
                 None => Ok(json!({
                     "content": [
                         {"type": "text", "text": format!(
-                            "窗口截图: hwnd={} client_only={} method={} 矩形=({},{}) {}x{} 图像={} bytes{reused}{fallback}",
+                            "窗口截图: hwnd={} client_only={} method={} 矩形=({},{}) {}x{} 编码={} 图像={} bytes{dims_note}{reused}{fallback}",
                             hwnd_str(hwnd), client_only, method, capture.rect.left, capture.rect.top,
-                            capture.rect.right - capture.rect.left,
-                            capture.rect.bottom - capture.rect.top, capture.png.len()
+                            rect_w, rect_h, encoding_label(format), capture.image.len()
                         )},
-                        {"type": "image", "data": B64.encode(&capture.png), "mimeType": "image/png"}
+                        {"type": "image", "data": B64.encode(&capture.image), "mimeType": capture.mime}
                     ]
                 })),
             }
         }
         TOOL_SCREENSHOT_ALL => {
             let method = args.get("method").and_then(Value::as_str).unwrap_or("auto");
-            let shots = capture_all_monitors(method)?;
+            let format = parse_capture_format(args)?;
+            let shots = capture_all_monitors(method, format)?;
             let mut content = Vec::new();
             for shot in shots {
                 let dimensions = format!(
@@ -714,8 +818,8 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
                 if let Some(error) = shot.error {
                     content.push(json!({"type": "text", "text": format!("{}: {dimensions}; method={method}; 错误: {error}", shot.label)}));
                 } else {
-                    content.push(json!({"type": "text", "text": format!("{}: {dimensions}; method={method}; {} bytes", shot.label, shot.png.len())}));
-                    content.push(json!({"type": "image", "data": B64.encode(&shot.png), "mimeType": "image/png"}));
+                    content.push(json!({"type": "text", "text": format!("{}: {dimensions}; method={method}; 编码={} {} bytes", shot.label, encoding_label(format), shot.image.len())}));
+                    content.push(json!({"type": "image", "data": B64.encode(&shot.image), "mimeType": shot.mime}));
                 }
             }
             Ok(json!({"content": content}))
@@ -724,7 +828,9 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
             let hwnd = resolve_explicit_hwnd(args)?;
             crate::backend::window::resize_window(hwnd, args)
         }
-        TOOL_ACTIVATE => crate::backend::window::window_activate(resolve_explicit_hwnd(args)?),
+        TOOL_ACTIVATE => {
+            crate::backend::window::window_activate(resolve_explicit_hwnd(args)?, args)
+        }
         TOOL_PIXEL_SCAN_LINE => pixel_scan_line(resolve_explicit_hwnd(args)?, args),
         TOOL_PIXEL_FIND_COLOR => pixel_find_color(resolve_explicit_hwnd(args)?, args),
         TOOL_SEND_INPUT => send_input(resolve_explicit_hwnd(args)?, args),
@@ -868,5 +974,97 @@ mod tests {
         let split: Vec<(u8, u8, u8)> = vec![(0, 0, 0), (10, 0, 0)];
         assert_eq!(merge_color_bands(&split, 0, 1).len(), 2);
         assert_eq!(merge_color_bands(&split, 11, 1).len(), 1);
+    }
+
+    #[test]
+    fn schema_is_tolerant_for_cross_model_numeric_args() {
+        let catalog = tools_list();
+        let tools = catalog["tools"].as_array().unwrap();
+        let input = tools.iter().find(|t| t["name"] == TOOL_SEND_INPUT).unwrap();
+        let props = &input["inputSchema"]["properties"];
+        // 数值字段接受整数字符串(Codex 等模型偶发字符串数字,客户端 schema 校验先行)
+        for key in ["x", "y", "delta", "steps"] {
+            assert_eq!(
+                props["actions"]["items"]["properties"][key]["type"],
+                json!(["integer", "string"]),
+                "actions.{key} 应接受整数字符串"
+            );
+        }
+        assert_eq!(props["delay_ms"]["type"], json!(["integer", "string"]));
+        // 动作项不再拒绝未知字段(模型幻觉字段在运行时自然忽略)
+        assert!(props["actions"]["items"]
+            .get("additionalProperties")
+            .is_none());
+        assert_eq!(props["allow_alt_trick"]["type"], "boolean");
+    }
+
+    #[test]
+    fn screenshot_schema_publishes_format_quality_max_dim() {
+        let catalog = tools_list();
+        let tools = catalog["tools"].as_array().unwrap();
+        for name in [TOOL_SCREENSHOT_WINDOW, TOOL_SCREENSHOT_ALL] {
+            let tool = tools.iter().find(|t| t["name"] == name).unwrap();
+            assert_eq!(
+                tool["inputSchema"]["properties"]["format"]["enum"],
+                json!(["png", "jpeg"]),
+                "{name}"
+            );
+            assert!(tool["inputSchema"]["properties"]["quality"].is_object());
+            assert!(tool["inputSchema"]["properties"]["max_dim"].is_object());
+        }
+    }
+
+    #[test]
+    fn pixel_tools_publish_method_and_tolerant_types() {
+        let catalog = tools_list();
+        let tools = catalog["tools"].as_array().unwrap();
+        for name in [TOOL_PIXEL_SCAN_LINE, TOOL_PIXEL_FIND_COLOR] {
+            let tool = tools.iter().find(|t| t["name"] == name).unwrap();
+            assert_eq!(
+                tool["inputSchema"]["properties"]["method"]["enum"],
+                json!(["auto", "wgc"]),
+                "{name}"
+            );
+            assert_eq!(
+                tool["inputSchema"]["properties"]["x"]["type"],
+                json!(["integer", "string"]),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn window_activate_publishes_alt_trick_gate() {
+        let catalog = tools_list();
+        let tools = catalog["tools"].as_array().unwrap();
+        let activate = tools.iter().find(|t| t["name"] == TOOL_ACTIVATE).unwrap();
+        assert_eq!(
+            activate["inputSchema"]["properties"]["allow_alt_trick"]["type"],
+            "boolean"
+        );
+    }
+
+    #[test]
+    fn parse_capture_format_maps_jpeg_and_max_dim() {
+        let fmt =
+            parse_capture_format(&json!({"format": "jpeg", "quality": 90, "max_dim": "1920"}))
+                .unwrap();
+        assert_eq!(fmt.jpeg_quality, Some(90));
+        assert_eq!(fmt.max_dim, 1920);
+        // 缺省 = png 无损、不降采样
+        assert_eq!(
+            parse_capture_format(&json!({})).unwrap(),
+            CaptureFormat::png()
+        );
+        assert!(parse_capture_format(&json!({"format": "webp"})).is_err());
+        // 浮点质量显式拒绝(模型选错类型信号)
+        assert!(parse_capture_format(&json!({"quality": 85.5})).is_err());
+        // 质量钳制
+        assert_eq!(
+            parse_capture_format(&json!({"format": "jpeg", "quality": 500}))
+                .unwrap()
+                .jpeg_quality,
+            Some(100)
+        );
     }
 }

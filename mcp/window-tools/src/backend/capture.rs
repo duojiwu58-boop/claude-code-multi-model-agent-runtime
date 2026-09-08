@@ -151,7 +151,10 @@ impl Drop for GdiHandle {
 /// [`IncrementalInfo`];`reused=true` 表示窗口静态无新帧,复用上次帧内容
 /// (与重新采集语义等价)。
 pub struct WindowCapture {
-    pub png: Vec<u8>,
+    pub image: Vec<u8>,
+    pub mime: &'static str,
+    /// 实际输出像素尺寸(编码前经 max_dim 缩放,与 `rect` 尺寸可能不同)。
+    pub image_dims: (u32, u32),
     pub rect: RECT,
     pub fallback: Option<String>,
     pub incremental: Option<IncrementalInfo>,
@@ -168,6 +171,7 @@ pub struct IncrementalInfo {
 }
 
 /// 一个变化区域:帧坐标 (x, y, w, h) 与裁剪后的 PNG(仅含该区域内容)。
+/// 增量差分固定 PNG:差分区域的像素保真优先,压缩收益次要。
 pub struct DirtyRegion {
     pub x: u32,
     pub y: u32,
@@ -176,7 +180,107 @@ pub struct DirtyRegion {
     pub png: Vec<u8>,
 }
 
-pub fn capture_window(hwnd: HWND, client_only: bool) -> Result<WindowCapture, ToolError> {
+/// 输出编码与降采样选项(多模型接入):
+/// - `jpeg_quality=Some(q)` = JPEG(4:4:4 无下采样,彩色文字边缘可读),
+///   体积比 PNG 小 60-90%,用于全局语义观察与网络上行;
+/// - `None` = PNG(无损,像素断言保真,默认);
+/// - `max_dim` = 输出最长边上限(物理像素),超过按比例双线性缩小,
+///   0 不限制——视觉模型 token 按分辨率计费,降采样才是省 token 的主杠杆。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CaptureFormat {
+    pub jpeg_quality: Option<u8>,
+    pub max_dim: u32,
+}
+
+impl CaptureFormat {
+    pub fn png() -> Self {
+        Self {
+            jpeg_quality: None,
+            max_dim: 0,
+        }
+    }
+
+    pub fn mime(self) -> &'static str {
+        match self.jpeg_quality {
+            Some(_) => "image/jpeg",
+            None => "image/png",
+        }
+    }
+}
+
+/// 编码产物:(字节, MIME, 实际输出尺寸)。
+pub(crate) type EncodedImage = (Vec<u8>, &'static str, (u32, u32));
+
+/// max_dim 缩放到输出尺寸(只缩小不放大)。纯函数,便于单测。
+pub fn apply_max_dim(width: i32, height: i32, max_dim: u32) -> (i32, i32) {
+    if max_dim > 0 && width.max(height) as u32 > max_dim {
+        let scale = f64::from(max_dim) / f64::from(width.max(height));
+        (
+            (f64::from(width) * scale).floor().max(1.0) as i32,
+            (f64::from(height) * scale).floor().max(1.0) as i32,
+        )
+    } else {
+        (width, height)
+    }
+}
+
+/// BGRA → 目标格式编码:max_dim 缩放(等大直通)→ RGBA→PNG 或 RGB→JPEG。
+/// 返回 (字节, MIME, 实际输出尺寸)。PrintWindow/WGC 原尺寸路径在此缩放,
+/// 屏幕路径在 StretchBlt 阶段已缩到预算内,此处等大直通。
+pub(crate) fn encode_frame(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    format: CaptureFormat,
+) -> Result<EncodedImage, ToolError> {
+    let (out_w, out_h, frame) = if format.max_dim > 0 && width.max(height) > format.max_dim {
+        let (w, h) = apply_max_dim(width as i32, height as i32, format.max_dim);
+        (
+            w as u32,
+            h as u32,
+            resize_bgra(bgra, width, height, w as u32, h as u32)?,
+        )
+    } else {
+        (width, height, bgra.to_vec())
+    };
+    match format.jpeg_quality {
+        Some(q) => Ok((
+            encode_jpeg(out_w, out_h, &frame, q)?,
+            "image/jpeg",
+            (out_w, out_h),
+        )),
+        None => Ok((
+            bgra_to_rgba_png(out_w as i32, out_h as i32, &frame)?,
+            "image/png",
+            (out_w, out_h),
+        )),
+    }
+}
+
+/// BGRA → JPEG。强制 4:4:4 采样(F_1_1),避免色度下采样糊掉彩色文字边缘;
+/// quality 1-100。jpeg-encoder 纯 Rust 实现,无原生依赖。
+fn encode_jpeg(width: u32, height: u32, bgra: &[u8], quality: u8) -> Result<Vec<u8>, ToolError> {
+    use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
+    let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
+    for px in bgra.chunks_exact(4) {
+        rgb.extend_from_slice(&[px[2], px[1], px[0]]); // BGRA → RGB
+    }
+    let mut out = Vec::new();
+    {
+        let mut encoder = Encoder::new(&mut out, quality);
+        encoder.set_sampling_factor(SamplingFactor::F_1_1);
+        encoder
+            .encode(&rgb, width as u16, height as u16, ColorType::Rgb)
+            .map_err(|e| ToolError::new(CAPTURE_FAILED, format!("JPEG 编码失败: {e}")))?;
+    }
+    Ok(out)
+}
+
+pub fn capture_window(
+    hwnd: HWND,
+    client_only: bool,
+    format: CaptureFormat,
+) -> Result<WindowCapture, ToolError> {
     // 挂起预检在主线程完成(快速内核查询),挂起窗口直接给结构化错误,
     // 绝不进入 PrintWindow——那是把 WM_PRINT 投递进目标线程的阻塞调用。
     if is_window_hung(hwnd) {
@@ -191,7 +295,7 @@ pub fn capture_window(hwnd: HWND, client_only: bool) -> Result<WindowCapture, To
     // HWND 是裸指针包装,不满足 Send;以 isize 跨界传递,worker 内重建。
     let raw = hwnd.0 as isize;
     run_capture_with_timeout(CAPTURE_TIMEOUT_MS, move || {
-        capture_window_inner(HWND(raw as *mut core::ffi::c_void), client_only)
+        capture_window_inner(HWND(raw as *mut core::ffi::c_void), client_only, format)
     })
 }
 
@@ -199,7 +303,11 @@ fn hwnd_num_str(hwnd: HWND) -> String {
     (hwnd.0 as isize).to_string()
 }
 
-fn capture_window_inner(hwnd: HWND, client_only: bool) -> Result<WindowCapture, ToolError> {
+fn capture_window_inner(
+    hwnd: HWND,
+    client_only: bool,
+    format: CaptureFormat,
+) -> Result<WindowCapture, ToolError> {
     // 最小化窗口确定性拒绝:GetWindowRect 对最小化窗口返回 (-32000,-32000)
     // 位置但尺寸仍为正,尺寸预检拦不住;WGC 缓存会话还会复用最小化前的旧帧。
     if unsafe { IsIconic(hwnd) }.as_bool() {
@@ -269,9 +377,12 @@ fn capture_window_inner(hwnd: HWND, client_only: bool) -> Result<WindowCapture, 
     };
     match print_window_bgra(hwnd, hdc_mem, hbm, width, height, flags) {
         Ok(bgra) if !bgra_looks_black(&bgra) => {
-            let png = bgra_to_rgba_png(width, height, &bgra)?;
+            let (image, mime, image_dims) =
+                encode_frame(&bgra, width as u32, height as u32, format)?;
             Ok(WindowCapture {
-                png,
+                image,
+                mime,
+                image_dims,
                 rect,
                 fallback: None,
                 incremental: None,
@@ -288,11 +399,17 @@ fn capture_window_inner(hwnd: HWND, client_only: bool) -> Result<WindowCapture, 
             } else {
                 "PrintWindow 失败"
             };
-            match crate::backend::wgc::capture_window_wgc_cached(hwnd, client_only, false) {
+            match crate::backend::wgc::capture_window_wgc_cached(
+                hwnd,
+                client_only,
+                crate::backend::wgc::CaptureMode::Full(format),
+            ) {
                 Ok(wgc) => {
-                    crate::log_info!("capture: {print_reason},WGC 产出 {} bytes", wgc.png.len());
+                    crate::log_info!("capture: {print_reason},WGC 产出 {} bytes", wgc.image.len());
                     Ok(WindowCapture {
-                        png: wgc.png,
+                        image: wgc.image,
+                        mime: wgc.mime,
+                        image_dims: wgc.image_dims,
                         rect,
                         fallback: Some(wgc_fallback_reason(print_reason)),
                         incremental: None,
@@ -300,11 +417,22 @@ fn capture_window_inner(hwnd: HWND, client_only: bool) -> Result<WindowCapture, 
                     })
                 }
                 Err(wgc_error) => {
-                    let png = capture_rect_from_screen(
-                        hdc_screen, width, height, width, height, rect.left, rect.top,
+                    let (image, mime, image_dims) = capture_rect_from_screen(
+                        hdc_screen,
+                        ScreenCaptureSpec {
+                            source_width: width,
+                            source_height: height,
+                            output_width: width,
+                            output_height: height,
+                            left: rect.left,
+                            top: rect.top,
+                        },
+                        format,
                     )?;
                     Ok(WindowCapture {
-                        png,
+                        image,
+                        mime,
+                        image_dims,
                         rect,
                         fallback: Some(screen_fallback_reason(print_reason, &wgc_error)),
                         incremental: None,
@@ -419,7 +547,8 @@ pub struct MonitorShot {
     pub source_height: i32,
     pub output_width: i32,
     pub output_height: i32,
-    pub png: Vec<u8>,
+    pub image: Vec<u8>,
+    pub mime: &'static str,
     pub error: Option<ToolError>,
 }
 
@@ -455,14 +584,22 @@ fn enum_monitors() -> Vec<MonitorRecord> {
     list
 }
 
-/// 截取所有显示器,返回每台一张 PNG(带标签与尺寸元数据,单台失败不中断其余)。
-/// `method`: `auto` = 屏幕 BitBlt(默认,不含光标);`wgc` = Windows Graphics
-/// Capture 合成帧(实验,含光标;会话断开/锁定等无合成场景单屏报错)。
+/// 截取所有显示器,返回每台一张图(带标签、尺寸与编码元数据,单台失败
+/// 不中断其余)。`method`: `auto` = 屏幕 BitBlt(默认,不含光标);
+/// `wgc` = Windows Graphics Capture 合成帧(实验,含光标;会话断开/锁定等
+/// 无合成场景单屏报错)。`format` 控制编码与 max_dim 降采样。
 /// 整体限时执行:GPU 驱动级卡死也不阻塞服务。
-pub fn capture_all_monitors(method: &str) -> Result<Vec<MonitorShot>, ToolError> {
+pub fn capture_all_monitors(
+    method: &str,
+    format: CaptureFormat,
+) -> Result<Vec<MonitorShot>, ToolError> {
     match method {
-        "auto" => run_capture_with_timeout(CAPTURE_TIMEOUT_MS, capture_all_monitors_inner),
-        "wgc" => run_capture_with_timeout(CAPTURE_TIMEOUT_MS, capture_all_monitors_wgc_inner),
+        "auto" => run_capture_with_timeout(CAPTURE_TIMEOUT_MS, move || {
+            capture_all_monitors_inner(format)
+        }),
+        "wgc" => run_capture_with_timeout(CAPTURE_TIMEOUT_MS, move || {
+            capture_all_monitors_wgc_inner(format)
+        }),
         other => Err(ToolError::new(
             INVALID_ARGUMENT,
             format!("未知采集方式 '{other}'，支持 auto / wgc"),
@@ -499,8 +636,9 @@ fn monitor_label(index: usize, m: &MonitorRecord) -> String {
 }
 
 /// WGC 显示器路径:每台显示器一个一次性捕获会话(不落缓存),首帧预算 3s,
-/// 帧含光标。超过预算时用与 BitBlt 路径相同的统一比例 CPU 缩放。
-fn capture_all_monitors_wgc_inner() -> Result<Vec<MonitorShot>, ToolError> {
+/// 帧含光标。超过预算时用与 BitBlt 路径相同的统一比例 CPU 缩放,
+/// max_dim 在预算缩放后再套一层。
+fn capture_all_monitors_wgc_inner(format: CaptureFormat) -> Result<Vec<MonitorShot>, ToolError> {
     let monitors = enum_monitors();
     if monitors.is_empty() {
         return Err(ToolError::new(CAPTURE_FAILED, "未找到任何显示器"));
@@ -511,21 +649,31 @@ fn capture_all_monitors_wgc_inner() -> Result<Vec<MonitorShot>, ToolError> {
         let width = m.rect.right - m.rect.left;
         let height = m.rect.bottom - m.rect.top;
         let label = monitor_label(index, m);
-        let (output_width, output_height) =
+        let (fitted_w, fitted_h) =
             fit_capture_dimensions(width, height, MAX_WINDOW_CAPTURE_PIXELS, total_scale)?;
+        let (output_width, output_height) = apply_max_dim(fitted_w, fitted_h, format.max_dim);
         match crate::backend::wgc::capture_monitor_wgc(m.hmon) {
             Ok((bgra, fw, fh)) => {
                 // 帧尺寸与显示器矩形物理像素一致;不一致时以帧为准缩放
                 // 到目标尺寸(等大时 resize 原样返回)。
                 let scaled = resize_bgra(&bgra, fw, fh, output_width as u32, output_height as u32)?;
-                let png = bgra_to_rgba_png(output_width, output_height, &scaled)?;
+                let (image, mime, _) = encode_frame(
+                    &scaled,
+                    output_width as u32,
+                    output_height as u32,
+                    CaptureFormat {
+                        max_dim: 0,
+                        ..format
+                    },
+                )?;
                 results.push(MonitorShot {
                     label,
                     source_width: width,
                     source_height: height,
                     output_width,
                     output_height,
-                    png,
+                    image,
+                    mime,
                     error: None,
                 });
             }
@@ -535,7 +683,8 @@ fn capture_all_monitors_wgc_inner() -> Result<Vec<MonitorShot>, ToolError> {
                 source_height: height,
                 output_width,
                 output_height,
-                png: Vec::new(),
+                image: Vec::new(),
+                mime: format.mime(),
                 error: Some(error),
             }),
         }
@@ -589,7 +738,7 @@ pub fn resize_bgra(
     Ok(out)
 }
 
-fn capture_all_monitors_inner() -> Result<Vec<MonitorShot>, ToolError> {
+fn capture_all_monitors_inner(format: CaptureFormat) -> Result<Vec<MonitorShot>, ToolError> {
     let monitors = enum_monitors();
     if monitors.is_empty() {
         return Err(ToolError::new(CAPTURE_FAILED, "未找到任何显示器"));
@@ -608,25 +757,30 @@ fn capture_all_monitors_inner() -> Result<Vec<MonitorShot>, ToolError> {
         let height = m.rect.bottom - m.rect.top;
         let label = monitor_label(index, m);
         // 对每台再套单图预算；这里会在 StretchBlt 期间直接生成缩小位图，
-        // 不会为超大原图额外分配一个完整的像素缓冲。
-        let (output_width, output_height) =
+        // 不会为超大原图额外分配一个完整的像素缓冲。max_dim 再套一层。
+        let (fitted_w, fitted_h) =
             fit_capture_dimensions(width, height, MAX_WINDOW_CAPTURE_PIXELS, total_scale)?;
+        let (output_width, output_height) = apply_max_dim(fitted_w, fitted_h, format.max_dim);
         match capture_rect_from_screen(
             hdc_screen,
-            width,
-            height,
-            output_width,
-            output_height,
-            m.rect.left,
-            m.rect.top,
+            ScreenCaptureSpec {
+                source_width: width,
+                source_height: height,
+                output_width,
+                output_height,
+                left: m.rect.left,
+                top: m.rect.top,
+            },
+            format,
         ) {
-            Ok(png) => results.push(MonitorShot {
+            Ok((image, mime, _)) => results.push(MonitorShot {
                 label,
                 source_width: width,
                 source_height: height,
                 output_width,
                 output_height,
-                png,
+                image,
+                mime,
                 error: None,
             }),
             Err(error) => results.push(MonitorShot {
@@ -635,7 +789,8 @@ fn capture_all_monitors_inner() -> Result<Vec<MonitorShot>, ToolError> {
                 source_height: height,
                 output_width,
                 output_height,
-                png: Vec::new(),
+                image: Vec::new(),
+                mime: format.mime(),
                 error: Some(error),
             }),
         }
@@ -643,15 +798,29 @@ fn capture_all_monitors_inner() -> Result<Vec<MonitorShot>, ToolError> {
     Ok(results)
 }
 
-fn capture_rect_from_screen(
-    hdc_screen: HDC,
+/// 屏幕区域采集参数:来源矩形与目标输出尺寸(预算缩放后的最终值)。
+struct ScreenCaptureSpec {
     source_width: i32,
     source_height: i32,
     output_width: i32,
     output_height: i32,
     left: i32,
     top: i32,
-) -> Result<Vec<u8>, ToolError> {
+}
+
+fn capture_rect_from_screen(
+    hdc_screen: HDC,
+    spec: ScreenCaptureSpec,
+    format: CaptureFormat,
+) -> Result<EncodedImage, ToolError> {
+    let ScreenCaptureSpec {
+        source_width,
+        source_height,
+        output_width,
+        output_height,
+        left,
+        top,
+    } = spec;
     // source_* 是真实桌面区域，output_* 是已按预算计算的目标位图尺寸。
     // 只有尺寸不同才走 StretchBlt；正常三台 4K 情况仍是无缩放的 BitBlt。
     checked_pixels(source_width, source_height)?;
@@ -756,7 +925,7 @@ fn capture_rect_from_screen(
         if lines <= 0 {
             Err(ToolError::new(CAPTURE_FAILED, "GetDIBits 未返回任何位图行"))
         } else {
-            bgra_to_rgba_png(output_width, output_height, &bgra)
+            encode_frame(&bgra, output_width as u32, output_height as u32, format)
         }
     }
 }
@@ -1026,6 +1195,70 @@ mod tests {
         assert_eq!(
             screen_fallback_reason("PrintWindow 失败", &err),
             "screen (PrintWindow 失败; WGC 不可用: CreateForWindow 失败(窗口受 DRM 保护))"
+        );
+    }
+
+    #[test]
+    fn apply_max_dim_shrinks_longest_edge_only() {
+        assert_eq!(apply_max_dim(800, 400, 200), (200, 100));
+        assert_eq!(apply_max_dim(400, 800, 200), (100, 200));
+        // 不放大;0 = 不限制
+        assert_eq!(apply_max_dim(100, 50, 200), (100, 50));
+        assert_eq!(apply_max_dim(100, 50, 0), (100, 50));
+    }
+
+    #[test]
+    fn encode_frame_jpeg_has_magic_bytes_and_scaled_dims() {
+        // 800x400 渐变 + max_dim 200 → 200x100 JPEG,FFD8 魔数
+        let mut bgra = vec![0u8; 800 * 400 * 4];
+        for y in 0..400usize {
+            for x in 0..800usize {
+                let o = (y * 800 + x) * 4;
+                bgra[o] = (x % 256) as u8;
+                bgra[o + 1] = (y % 256) as u8;
+                bgra[o + 2] = ((x + y) % 256) as u8;
+                bgra[o + 3] = 0xFF;
+            }
+        }
+        let format = CaptureFormat {
+            jpeg_quality: Some(85),
+            max_dim: 200,
+        };
+        let (bytes, mime, dims) = encode_frame(&bgra, 800, 400, format).unwrap();
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(dims, (200, 100));
+        assert_eq!(&bytes[..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn encode_frame_png_path_preserves_dims_without_max_dim() {
+        let bgra = vec![128u8; 16 * 8 * 4];
+        let (bytes, mime, dims) = encode_frame(&bgra, 16, 8, CaptureFormat::png()).unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(dims, (16, 8));
+        assert_eq!(&bytes[..4], &[0x89, b'P', b'N', b'G']);
+    }
+
+    #[test]
+    fn jpeg_beats_png_on_noisy_content() {
+        // 伪随机噪点:PNG 几乎无压缩收益,JPEG 有损显著更小
+        let mut bgra = vec![0u8; 128 * 128 * 4];
+        let mut seed = 42u32;
+        for px in bgra.chunks_exact_mut(4) {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let v = (seed >> 24) as u8;
+            px[0] = v;
+            px[1] = v.wrapping_add(3);
+            px[2] = v.wrapping_sub(7);
+            px[3] = 0xFF;
+        }
+        let jpeg = encode_jpeg(128, 128, &bgra, 85).unwrap();
+        let png = bgra_to_rgba_png(128, 128, &bgra).unwrap();
+        assert!(
+            jpeg.len() * 3 < png.len(),
+            "jpeg={} png={}",
+            jpeg.len(),
+            png.len()
         );
     }
 }

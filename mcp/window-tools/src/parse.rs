@@ -7,6 +7,8 @@ use serde_json::Value;
 use crate::error::{ToolError, INVALID_ARGUMENT};
 
 /// JSON 整数不能直接 `as i32`：先验证范围，避免窗口坐标/尺寸被静默截断。
+/// 多模型接入容错：数字与整数字符串("120")等价;可选字段传 null 视为缺省。
+/// 浮点数显式拒绝——模型选错字段/类型的信号,静默截断是语义 bug。
 pub fn json_i32(args: &Value, key: &str, required: bool) -> Result<Option<i32>, ToolError> {
     let Some(value) = args.get(key) else {
         return if required {
@@ -15,22 +17,45 @@ pub fn json_i32(args: &Value, key: &str, required: bool) -> Result<Option<i32>, 
             Ok(None)
         };
     };
-    let raw = value
-        .as_i64()
-        .ok_or_else(|| ToolError::new(INVALID_ARGUMENT, format!("{key} 必须是 32 位整数")))?;
+    if value.is_null() && !required {
+        return Ok(None);
+    }
+    let invalid = || {
+        ToolError::new(
+            INVALID_ARGUMENT,
+            format!("{key} 必须是 32 位整数(或整数字符串)"),
+        )
+    };
+    let raw = match value {
+        Value::Number(n) => n.as_i64().ok_or_else(invalid)?,
+        Value::String(s) => s.trim().parse::<i64>().map_err(|_| invalid())?,
+        _ => return Err(invalid()),
+    };
     i32::try_from(raw)
         .map(Some)
         .map_err(|_| ToolError::new(INVALID_ARGUMENT, format!("{key} 超出 32 位整数范围")))
 }
 
 /// Windows PID 是 u32；拒绝超范围 JSON 数字，而不是截断后指向其他进程。
+/// 容错语义与 [`json_i32`] 一致：整数字符串等价，null 视为缺省。
 pub fn json_u32(args: &Value, key: &str) -> Result<Option<u32>, ToolError> {
     let Some(value) = args.get(key) else {
         return Ok(None);
     };
-    let raw = value
-        .as_u64()
-        .ok_or_else(|| ToolError::new(INVALID_ARGUMENT, format!("{key} 必须是非负整数")))?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let invalid = || {
+        ToolError::new(
+            INVALID_ARGUMENT,
+            format!("{key} 必须是非负整数(或整数字符串)"),
+        )
+    };
+    let raw = match value {
+        Value::Number(n) => n.as_u64().ok_or_else(invalid)?,
+        Value::String(s) => s.trim().parse::<u64>().map_err(|_| invalid())?,
+        _ => return Err(invalid()),
+    };
     u32::try_from(raw)
         .map(Some)
         .map_err(|_| ToolError::new(INVALID_ARGUMENT, format!("{key} 超出 Windows PID 范围")))
@@ -88,6 +113,45 @@ mod tests {
     fn rejects_out_of_range_json_integers() {
         assert!(json_i32(&json!({"x": 2_147_483_648_i64}), "x", true).is_err());
         assert!(json_u32(&json!({"pid": 4_294_967_296_u64}), "pid").is_err());
+    }
+
+    #[test]
+    fn accepts_numeric_strings_across_models() {
+        assert_eq!(
+            json_i32(&json!({"x": "120"}), "x", true).unwrap(),
+            Some(120)
+        );
+        assert_eq!(
+            json_i32(&json!({"x": " 120 "}), "x", true).unwrap(),
+            Some(120)
+        );
+        assert_eq!(json_i32(&json!({"x": 120}), "x", true).unwrap(), Some(120));
+        assert_eq!(json_u32(&json!({"pid": "42"}), "pid").unwrap(), Some(42));
+        // 负数 PID 字符串仍拒绝
+        assert!(json_u32(&json!({"pid": "-1"}), "pid").is_err());
+    }
+
+    #[test]
+    fn treats_null_optional_as_absent() {
+        assert_eq!(
+            json_i32(&json!({"steps": serde_json::Value::Null}), "steps", false).unwrap(),
+            None
+        );
+        assert_eq!(
+            json_u32(&json!({"pid": serde_json::Value::Null}), "pid").unwrap(),
+            None
+        );
+        // 必填字段的 null 仍是错误
+        assert!(json_i32(&json!({"x": serde_json::Value::Null}), "x", true).is_err());
+    }
+
+    #[test]
+    fn rejects_floats_and_non_numeric_strings() {
+        // 浮点是模型选错类型的信号,拒绝而非截断
+        assert!(json_i32(&json!({"x": 120.5}), "x", true).is_err());
+        assert!(json_i32(&json!({"x": "12.5"}), "x", true).is_err());
+        assert!(json_u32(&json!({"pid": "abc"}), "pid").is_err());
+        assert!(json_u32(&json!({"pid": 1.5}), "pid").is_err());
     }
 
     #[test]

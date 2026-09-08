@@ -70,12 +70,15 @@ use windows::{
 
 use crate::backend::{
     capture::{
-        bgra_to_rgba_png, checked_pixels, run_with_timeout, DirtyRegion, IncrementalInfo,
-        WindowCapture, CAPTURE_TIMEOUT_MS, MAX_CAPTURE_DIM, MAX_WINDOW_CAPTURE_PIXELS,
+        bgra_to_rgba_png, checked_pixels, encode_frame, run_with_timeout, CaptureFormat,
+        DirtyRegion, IncrementalInfo, WindowCapture, CAPTURE_TIMEOUT_MS, MAX_CAPTURE_DIM,
+        MAX_WINDOW_CAPTURE_PIXELS,
     },
     window::{client_rect_of, is_window_hung, rect_of},
 };
-use crate::error::{ToolError, LIMIT_EXCEEDED, WGC_UNAVAILABLE, WINDOW_HUNG, WINDOW_NOT_VISIBLE};
+use crate::error::{
+    ToolError, INVALID_ARGUMENT, LIMIT_EXCEEDED, WGC_UNAVAILABLE, WINDOW_HUNG, WINDOW_NOT_VISIBLE,
+};
 
 /// 会话缓存上限:与系统级 CaptureSession 并发上限保持距离,同时约束
 /// BGRA 基线内存(每会话 ≤ 12MP×4B = 48MB,4 会话最坏 192MB 仅理论值)。
@@ -91,26 +94,22 @@ const MONITOR_FRAME_BUDGET_MS: u64 = 3_000;
 /// 保证响应体(图像块数量与总字节)有界。
 pub const MAX_DIRTY_REGIONS: usize = 8;
 
-/// WGC 采集入口(全帧):挂起预检 + 尺寸预检与 GDI 路径一致,采集在独立
-/// 线程执行并限时等待。
-pub fn capture_window_wgc(hwnd: HWND, client_only: bool) -> Result<WindowCapture, ToolError> {
-    run_wgc_entry(hwnd, client_only, false)
+/// WGC 采集模式:全帧编码(格式可选) / 增量差分(固定 PNG) / 原始 BGRA
+/// (像素采样,不编码)。Copy:尺寸变化重建循环内可能多次 match。
+/// pub(crate):auto 链(capture.rs)需要构造 Full 模式。
+#[derive(Clone, Copy)]
+pub(crate) enum CaptureMode {
+    Full(CaptureFormat),
+    Incremental,
+    Raw,
 }
 
-/// WGC 增量差分入口:首次调用返回完整基线帧,后续调用只返回相对上次的
-/// 变化区域(无变化时纯文本)。会话经全局缓存跨调用复用。
-pub fn capture_window_wgc_incremental(
+/// 采集前置检查(与 GDI 路径一致):挂起预检 + 最小化确定性拒绝 + 尺寸预检,
+/// 返回目标矩形。所有 WGC 入口共用。
+fn wgc_precheck(
     hwnd: HWND,
     client_only: bool,
-) -> Result<WindowCapture, ToolError> {
-    run_wgc_entry(hwnd, client_only, true)
-}
-
-fn run_wgc_entry(
-    hwnd: HWND,
-    client_only: bool,
-    incremental: bool,
-) -> Result<WindowCapture, ToolError> {
+) -> Result<windows::Win32::Foundation::RECT, ToolError> {
     if is_window_hung(hwnd) {
         return Err(ToolError::new(
             WINDOW_HUNG,
@@ -120,34 +119,6 @@ fn run_wgc_entry(
             ),
         ));
     }
-    let raw = hwnd.0 as isize;
-    run_with_timeout(
-        CAPTURE_TIMEOUT_MS,
-        move || {
-            capture_window_wgc_cached(
-                HWND(raw as *mut core::ffi::c_void),
-                client_only,
-                incremental,
-            )
-        },
-        |ms| {
-            ToolError::new(
-                WINDOW_HUNG,
-                format!("WGC 在 {ms}ms 内未产出帧，窗口可能已最小化或合成停止"),
-            )
-        },
-    )
-}
-
-/// WGC 缓存采集(auto 链复用,不设超时包装,由调用方保证):
-/// 全局设备 + 按 (hwnd, client_only, incremental) 的会话缓存。
-/// auto 链在 capture_window_inner 的 worker 内直接调用,外层 15s 硬超时
-/// 已覆盖首帧轮询;method=wgc / incremental 入口经 run_wgc_entry 包装。
-pub(crate) fn capture_window_wgc_cached(
-    hwnd: HWND,
-    client_only: bool,
-    incremental: bool,
-) -> Result<WindowCapture, ToolError> {
     // 最小化窗口确定性拒绝:缓存会话对最小化窗口不产帧,若复用旧帧会返回
     // 最小化前的过期内容;尺寸预检拦不住(最小化窗口矩形位置 -32000 但尺寸
     // 仍为正),须显式检查。
@@ -160,7 +131,6 @@ pub(crate) fn capture_window_wgc_cached(
             ),
         ));
     }
-    // 尺寸预检与 GDI 路径一致:退化矩形(宽高非正)直接结构化拒绝。
     let rect = if client_only {
         client_rect_of(hwnd)?
     } else {
@@ -177,7 +147,116 @@ pub(crate) fn capture_window_wgc_cached(
             ),
         ));
     }
-    with_mta(|| capture_cached_inner(hwnd, rect, client_only, incremental))
+    Ok(rect)
+}
+
+/// WGC 采集入口(全帧):挂起预检 + 尺寸预检与 GDI 路径一致,采集在独立
+/// 线程执行并限时等待。`format` 控制编码与 max_dim 降采样。
+pub fn capture_window_wgc(
+    hwnd: HWND,
+    client_only: bool,
+    format: CaptureFormat,
+) -> Result<WindowCapture, ToolError> {
+    run_wgc_entry(hwnd, client_only, CaptureMode::Full(format))
+}
+
+/// WGC 增量差分入口:首次调用返回完整基线帧,后续调用只返回相对上次的
+/// 变化区域(无变化时纯文本)。会话经全局缓存跨调用复用。固定 PNG 输出
+/// (差分区域的像素保真优先)。
+pub fn capture_window_wgc_incremental(
+    hwnd: HWND,
+    client_only: bool,
+) -> Result<WindowCapture, ToolError> {
+    run_wgc_entry(hwnd, client_only, CaptureMode::Incremental)
+}
+
+fn run_wgc_entry(
+    hwnd: HWND,
+    client_only: bool,
+    mode: CaptureMode,
+) -> Result<WindowCapture, ToolError> {
+    wgc_precheck(hwnd, client_only)?;
+    let raw = hwnd.0 as isize;
+    run_with_timeout(
+        CAPTURE_TIMEOUT_MS,
+        move || capture_window_wgc_cached(HWND(raw as *mut core::ffi::c_void), client_only, mode),
+        |ms| {
+            ToolError::new(
+                WINDOW_HUNG,
+                format!("WGC 在 {ms}ms 内未产出帧，窗口可能已最小化或合成停止"),
+            )
+        },
+    )
+}
+
+/// WGC 缓存采集(auto 链复用,不设超时包装,由调用方保证):
+/// 全局设备 + 按 (hwnd, client_only, incremental) 的会话缓存。
+/// auto 链在 capture_window_inner 的 worker 内直接调用,外层 15s 硬超时
+/// 已覆盖首帧轮询;method=wgc / incremental 入口经 run_wgc_entry 包装。
+pub(crate) fn capture_window_wgc_cached(
+    hwnd: HWND,
+    client_only: bool,
+    mode: CaptureMode,
+) -> Result<WindowCapture, ToolError> {
+    let rect = wgc_precheck(hwnd, client_only)?;
+    with_mta(|| {
+        let output = capture_cached_inner(hwnd, rect, client_only, mode)?;
+        output.into_window_capture(rect)
+    })
+}
+
+/// 原始 BGRA 帧(像素采样用,不编码):与截图共用缓存会话,窗口静态时
+/// 直接复用上次帧,不重新拷贝 GPU 纹理。返回 (bgra, frame_w, frame_h)。
+pub(crate) fn capture_window_wgc_bgra(
+    hwnd: HWND,
+    client_only: bool,
+) -> Result<(Vec<u8>, u32, u32), ToolError> {
+    // 前置检查即全部意图:返回值仅用于校验,原始帧路径不需要矩形。
+    let _rect = wgc_precheck(hwnd, client_only)?;
+    with_mta(
+        || match capture_cached_inner(hwnd, _rect, client_only, CaptureMode::Raw)? {
+            CaptureOutput::Raw { bgra, fw, fh, .. } => Ok((bgra, fw, fh)),
+            _ => Err(wgc_err("Raw 模式未返回原始帧(内部状态异常)".to_string())),
+        },
+    )
+}
+
+/// 客户区矩形像素采样(WGC 帧):`capture_client_region_bgra` 的 wgc 对应物。
+/// 复用 (hwnd, client_only=true, incremental=false) 缓存会话;client_only
+/// 会话帧即客户区内容,坐标直接对应、无边框偏移。帧来自 DWM 合成,与屏幕
+/// 现状无关——被其他窗口遮挡也给出目标窗口的真实像素。
+pub(crate) fn capture_client_region_wgc(
+    hwnd: HWND,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<Vec<u8>, ToolError> {
+    if width <= 0 || height <= 0 {
+        return Err(ToolError::new(
+            INVALID_ARGUMENT,
+            format!("扫描区域尺寸必须为正数，实际为 {width}x{height}"),
+        ));
+    }
+    let (bgra, fw, fh) = capture_window_wgc_bgra(hwnd, true)?;
+    if x < 0
+        || y < 0
+        || i64::from(x) + i64::from(width) > i64::from(fw)
+        || i64::from(y) + i64::from(height) > i64::from(fh)
+    {
+        return Err(ToolError::new(
+            INVALID_ARGUMENT,
+            format!("扫描区域 ({x},{y}) {width}x{height} 超出 WGC 帧 {fw}x{fh}"),
+        ));
+    }
+    Ok(crop_bgra(
+        &bgra,
+        fw,
+        x as u32,
+        y as u32,
+        width as u32,
+        height as u32,
+    ))
 }
 
 /// 会话缓存键:窗口 + 是否仅客户区 + 是否增量。任一维不同 = 不同会话
@@ -257,16 +336,89 @@ fn wgc_cache() -> &'static Mutex<WgcCache> {
     })
 }
 
+/// 采集输出三态:原始 BGRA(像素采样) / 编码图像(全帧) / 增量信息。
+enum CaptureOutput {
+    Raw {
+        bgra: Vec<u8>,
+        fw: u32,
+        fh: u32,
+    },
+    Image {
+        image: Vec<u8>,
+        mime: &'static str,
+        image_dims: (u32, u32),
+        reused: bool,
+    },
+    Incremental {
+        /// 基线帧的 PNG(baseline=true 时非空;差分/无变化时为空)。
+        image: Vec<u8>,
+        baseline: bool,
+        regions: Vec<DirtyRegion>,
+        reused: bool,
+    },
+}
+
+impl CaptureOutput {
+    fn into_window_capture(
+        self,
+        rect: windows::Win32::Foundation::RECT,
+    ) -> Result<WindowCapture, ToolError> {
+        match self {
+            CaptureOutput::Image {
+                image,
+                mime,
+                image_dims,
+                reused,
+            } => Ok(WindowCapture {
+                image,
+                mime,
+                image_dims,
+                rect,
+                fallback: None,
+                incremental: None,
+                reused,
+            }),
+            CaptureOutput::Incremental {
+                image,
+                baseline,
+                regions,
+                reused,
+            } => {
+                let image_dims = if image.is_empty() {
+                    (0, 0)
+                } else {
+                    (
+                        (rect.right - rect.left) as u32,
+                        (rect.bottom - rect.top) as u32,
+                    )
+                };
+                Ok(WindowCapture {
+                    image,
+                    mime: "image/png",
+                    image_dims,
+                    rect,
+                    fallback: None,
+                    incremental: Some(IncrementalInfo { baseline, regions }),
+                    reused,
+                })
+            }
+            CaptureOutput::Raw { .. } => Err(wgc_err(
+                "Raw 模式结果被错误地转为 MCP 响应(内部状态异常)".to_string(),
+            )),
+        }
+    }
+}
+
 fn capture_cached_inner(
     hwnd: HWND,
-    rect: windows::Win32::Foundation::RECT,
+    _rect: windows::Win32::Foundation::RECT,
     client_only: bool,
-    incremental: bool,
-) -> Result<WindowCapture, ToolError> {
+    mode: CaptureMode,
+) -> Result<CaptureOutput, ToolError> {
     let key = SessionKey {
         hwnd: hwnd.0 as isize,
         client_only,
-        incremental,
+        incremental: matches!(mode, CaptureMode::Incremental),
     };
     let mut guard = wgc_cache().lock().unwrap_or_else(|e| e.into_inner());
     let cache = &mut *guard;
@@ -311,21 +463,33 @@ fn capture_cached_inner(
                 }
                 sess.size = (fw, fh);
                 sess.content_size = (cw, ch);
-                let result = build_result(&mut sess, bgra, fw, fh, incremental, rect);
-                if result.is_ok() {
-                    sess.last_used = Instant::now();
-                    cache.sessions.push(sess);
-                }
-                return result;
+                let output = match mode {
+                    CaptureMode::Raw => {
+                        sess.last_bgra = Some(bgra.clone());
+                        CaptureOutput::Raw { bgra, fw, fh }
+                    }
+                    CaptureMode::Full(format) => {
+                        let (image, mime, image_dims) = encode_frame(&bgra, fw, fh, format)?;
+                        sess.last_bgra = Some(bgra);
+                        CaptureOutput::Image {
+                            image,
+                            mime,
+                            image_dims,
+                            reused: false,
+                        }
+                    }
+                    CaptureMode::Incremental => incremental_from_frame(&mut sess, bgra, fw, fh)?,
+                };
+                sess.last_used = Instant::now();
+                cache.sessions.push(sess);
+                return Ok(output);
             }
             FrameArrival::None => {
                 // 无新帧:静态窗口 DWM 不产帧,内容与上次一致。
-                let result = reuse_last(&sess, incremental, rect);
-                if result.is_ok() {
-                    sess.last_used = Instant::now();
-                    cache.sessions.push(sess);
-                }
-                return result;
+                let output = reuse_last(&sess, mode)?;
+                sess.last_used = Instant::now();
+                cache.sessions.push(sess);
+                return Ok(output);
             }
         }
     }
@@ -485,38 +649,21 @@ fn try_next_frame(
     }
 }
 
-/// 帧就位后的结果构造:全帧编码 / 增量差分(基线→差分→无变化三态)。
-fn build_result(
+/// 增量模式的帧就位结果构造:基线→差分→无变化三态(固定 PNG)。
+fn incremental_from_frame(
     sess: &mut CachedSession,
     bgra: Vec<u8>,
     fw: u32,
     fh: u32,
-    incremental: bool,
-    rect: windows::Win32::Foundation::RECT,
-) -> Result<WindowCapture, ToolError> {
-    if !incremental {
-        let png = bgra_to_rgba_png(fw as i32, fh as i32, &bgra)?;
-        sess.last_bgra = Some(bgra);
-        return Ok(WindowCapture {
-            png,
-            rect,
-            fallback: None,
-            incremental: None,
-            reused: false,
-        });
-    }
+) -> Result<CaptureOutput, ToolError> {
     let Some(prev) = sess.last_bgra.take() else {
         // 首次采集(基线):全帧返回,存基线。
         let png = bgra_to_rgba_png(fw as i32, fh as i32, &bgra)?;
         sess.last_bgra = Some(bgra);
-        return Ok(WindowCapture {
-            png,
-            rect,
-            fallback: None,
-            incremental: Some(IncrementalInfo {
-                baseline: true,
-                regions: Vec::new(),
-            }),
+        return Ok(CaptureOutput::Incremental {
+            image: png,
+            baseline: true,
+            regions: Vec::new(),
             reused: false,
         });
     };
@@ -525,28 +672,20 @@ fn build_result(
         // 重建基线,全帧返回。
         let png = bgra_to_rgba_png(fw as i32, fh as i32, &bgra)?;
         sess.last_bgra = Some(bgra);
-        return Ok(WindowCapture {
-            png,
-            rect,
-            fallback: None,
-            incremental: Some(IncrementalInfo {
-                baseline: true,
-                regions: Vec::new(),
-            }),
+        return Ok(CaptureOutput::Incremental {
+            image: png,
+            baseline: true,
+            regions: Vec::new(),
             reused: false,
         });
     }
     let rects = diff_dirty_bands(&prev, &bgra, fw, fh, MAX_DIRTY_REGIONS);
     sess.last_bgra = Some(bgra);
     if rects.is_empty() {
-        return Ok(WindowCapture {
-            png: Vec::new(),
-            rect,
-            fallback: None,
-            incremental: Some(IncrementalInfo {
-                baseline: false,
-                regions: Vec::new(),
-            }),
+        return Ok(CaptureOutput::Incremental {
+            image: Vec::new(),
+            baseline: false,
+            regions: Vec::new(),
             reused: true,
         });
     }
@@ -557,49 +696,43 @@ fn build_result(
         let png = bgra_to_rgba_png(w as i32, h as i32, &cropped)?;
         regions.push(DirtyRegion { x, y, w, h, png });
     }
-    Ok(WindowCapture {
-        png: Vec::new(),
-        rect,
-        fallback: None,
-        incremental: Some(IncrementalInfo {
-            baseline: false,
-            regions,
-        }),
+    Ok(CaptureOutput::Incremental {
+        image: Vec::new(),
+        baseline: false,
+        regions,
         reused: false,
     })
 }
 
-/// 无新帧路径:内容与上次一致。增量=纯文本零图像;全帧=基线 BGRA 重编码。
-fn reuse_last(
-    sess: &CachedSession,
-    incremental: bool,
-    rect: windows::Win32::Foundation::RECT,
-) -> Result<WindowCapture, ToolError> {
-    match &sess.last_bgra {
-        Some(bgra) if incremental => Ok(WindowCapture {
-            png: Vec::new(),
-            rect,
-            fallback: None,
-            incremental: Some(IncrementalInfo {
-                baseline: false,
-                regions: Vec::new(),
-            }),
-            reused: true,
+/// 无新帧路径:内容与上次一致。增量=纯文本零图像;全帧=基线 BGRA 重编码;
+/// Raw=基线 BGRA 直接返回(克隆)。
+fn reuse_last(sess: &CachedSession, mode: CaptureMode) -> Result<CaptureOutput, ToolError> {
+    let bgra = sess
+        .last_bgra
+        .as_ref()
+        .ok_or_else(|| wgc_err("会话基线缺失(内部状态异常),本次调用将重建会话".to_string()))?;
+    let (fw, fh) = sess.size;
+    match mode {
+        CaptureMode::Raw => Ok(CaptureOutput::Raw {
+            bgra: bgra.clone(),
+            fw,
+            fh,
         }),
-        Some(bgra) => {
-            let (fw, fh) = sess.size;
-            let png = bgra_to_rgba_png(fw as i32, fh as i32, bgra)?;
-            Ok(WindowCapture {
-                png,
-                rect,
-                fallback: None,
-                incremental: None,
+        CaptureMode::Full(format) => {
+            let (image, mime, image_dims) = encode_frame(bgra, fw, fh, format)?;
+            Ok(CaptureOutput::Image {
+                image,
+                mime,
+                image_dims,
                 reused: true,
             })
         }
-        None => Err(wgc_err(
-            "会话基线缺失(内部状态异常),本次调用将重建会话".to_string(),
-        )),
+        CaptureMode::Incremental => Ok(CaptureOutput::Incremental {
+            image: Vec::new(),
+            baseline: false,
+            regions: Vec::new(),
+            reused: true,
+        }),
     }
 }
 

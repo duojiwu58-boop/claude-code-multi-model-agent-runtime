@@ -9,18 +9,16 @@ use windows::Win32::{
             MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
             MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSE_EVENT_FLAGS,
         },
-        WindowsAndMessaging::{GetCursorPos, SetCursorPos, SetForegroundWindow},
+        WindowsAndMessaging::{GetCursorPos, SetCursorPos},
     },
 };
 
-use crate::error::{
-    ToolError, ACTIVATION_DENIED, INPUT_FAILED, INVALID_ARGUMENT, LIMIT_EXCEEDED,
-    WINDOW_NOT_VISIBLE,
-};
+use crate::error::{ToolError, INPUT_FAILED, INVALID_ARGUMENT, LIMIT_EXCEEDED, WINDOW_NOT_VISIBLE};
 use crate::parse::json_i32;
 
 use super::window::{
-    client_rect_of, ensure_input_foreground, entry_for_hwnd, foreground_hwnd, hwnd_str,
+    activate_with_ladder, client_rect_of, ensure_input_foreground, entry_for_hwnd, foreground_hwnd,
+    hwnd_str,
 };
 
 /// 输入批次必须保持短小，避免单线程 stdio 服务被一个请求长期占用。
@@ -491,26 +489,20 @@ pub fn send_input(hwnd: HWND, args: &Value) -> Result<Value, ToolError> {
             ),
         ));
     }
+    // UIPI 前置检查:目标提权且本服务未提权时,注入被静默过滤且无错误码,
+    // 必须提前结构化拒绝(否则"成功但无效"会让模型陷入重试死循环)。
+    crate::backend::elevation::ensure_uipi_injectable(entry.pid)?;
     let activate = args
         .get("activate")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if activate {
-        if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
-            return Err(ToolError::new(
-                ACTIVATION_DENIED,
-                format!(
-                    "SetForegroundWindow 拒绝激活 hwnd={}（Windows 焦点保护或窗口已失效）",
-                    hwnd_str(hwnd)
-                ),
-            ));
-        }
-        if foreground_hwnd() != hwnd {
-            return Err(ToolError::new(
-                ACTIVATION_DENIED,
-                "窗口激活请求未生效，请改用 window_activate",
-            ));
-        }
+    let allow_alt_trick = args
+        .get("allow_alt_trick")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // 激活升级阶梯:直连 → AttachThreadInput → (allow_alt_trick 时)Alt 点击。
+    let activation_method = if activate {
+        Some(activate_with_ladder(hwnd, allow_alt_trick)?.name())
     } else if foreground_hwnd() != hwnd {
         return Err(ToolError::new(
             crate::error::NOT_FOREGROUND,
@@ -519,7 +511,9 @@ pub fn send_input(hwnd: HWND, args: &Value) -> Result<Value, ToolError> {
                 hwnd_str(hwnd)
             ),
         ));
-    }
+    } else {
+        None
+    };
 
     let actions = args
         .get("actions")
@@ -546,6 +540,7 @@ pub fn send_input(hwnd: HWND, args: &Value) -> Result<Value, ToolError> {
         "content": [{"type": "text", "text": json!({
             "hwnd": hwnd_str(hwnd),
             "foreground_verified": true,
+            "activation_method": activation_method,
             "action_count": reported.len(),
             "scheduled_delay_ms": scheduled_delay_ms,
             "actions": reported

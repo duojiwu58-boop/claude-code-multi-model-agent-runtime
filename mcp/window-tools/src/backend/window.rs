@@ -6,11 +6,16 @@ use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
         Graphics::Gdi::ClientToScreen,
-        UI::WindowsAndMessaging::{
-            EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindowLongPtrW,
-            GetWindowRect, GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindowVisible,
-            SendMessageTimeoutW, SetForegroundWindow, SetWindowPos, GWL_EXSTYLE, SMTO_ABORTIFHUNG,
-            SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, WM_GETTEXT, WS_EX_TOOLWINDOW,
+        System::Threading::{AttachThreadInput, GetCurrentThreadId},
+        UI::{
+            Input::KeyboardAndMouse::{keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU},
+            WindowsAndMessaging::{
+                EnumWindows, GetClassNameW, GetClientRect, GetForegroundWindow, GetWindow,
+                GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsHungAppWindow,
+                IsIconic, IsWindowVisible, SendMessageTimeoutW, SetForegroundWindow, SetWindowPos,
+                GWL_EXSTYLE, GW_HWNDPREV, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
+                SWP_NOZORDER, WM_GETTEXT, WS_EX_TOOLWINDOW,
+            },
         },
     },
 };
@@ -306,34 +311,131 @@ pub fn get_window_rect(hwnd: HWND) -> Result<Value, ToolError> {
     }))
 }
 
-/// 请求 Windows 将一个精确 HWND 放到前台。Windows 焦点窃取保护可能拒绝该请求；
-/// 失败时明确返回错误，而不是假装截图已聚焦。
-pub fn window_activate(hwnd: HWND) -> Result<Value, ToolError> {
-    entry_for_hwnd(hwnd)?;
-    if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
-        return Err(ToolError::new(
-            ACTIVATION_DENIED,
-            format!(
-                "SetForegroundWindow 拒绝激活 hwnd={}（Windows 焦点限制或窗口已失效）",
-                hwnd_str(hwnd)
-            ),
-        ));
-    }
-    let foreground = foreground_hwnd();
-    if foreground != hwnd {
-        return Err(ToolError::new(
-            ACTIVATION_DENIED,
-            format!(
-                "窗口激活请求未生效：前台 hwnd={}，目标 hwnd={}",
-                hwnd_str(foreground),
-                hwnd_str(hwnd)
-            ),
-        ));
-    }
+/// 请求 Windows 将一个精确 HWND 放到前台。Windows 焦点窃取保护可能拒绝
+/// 直连请求;升级阶梯(AttachThreadInput / Alt 点击)尽力突破,全部失败时
+/// 返回结构化错误而不是假装已聚焦。`allow_alt_trick` 允许最后手段
+/// (向用户当前前台窗口注入一次真实 Alt 按键,有副作用,默认关闭)。
+pub fn window_activate(hwnd: HWND, args: &Value) -> Result<Value, ToolError> {
+    let entry = entry_for_hwnd(hwnd)?;
+    crate::backend::elevation::ensure_uipi_injectable(entry.pid)?;
+    let allow_alt_trick = args
+        .get("allow_alt_trick")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let method = activate_with_ladder(hwnd, allow_alt_trick)?;
     Ok(json!({"content": [{"type": "text", "text": json!({
         "hwnd": hwnd_str(hwnd),
-        "activated": true
+        "activated": true,
+        "activation_method": method.name()
     }).to_string()}]}))
+}
+
+/// 激活方式:直连 / 前台线程输入附着 / Alt 点击绕过焦点锁。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationMethod {
+    Direct,
+    AttachInput,
+    AltTrick,
+}
+
+impl ActivationMethod {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::AttachInput => "attach_input",
+            Self::AltTrick => "alt_trick",
+        }
+    }
+}
+
+/// SetForegroundWindow + 前台验证一步完成。
+fn set_foreground_and_verify(hwnd: HWND) -> bool {
+    unsafe { SetForegroundWindow(hwnd) }.as_bool() && foreground_hwnd() == hwnd
+}
+
+/// 焦点激活升级阶梯:直连 → AttachThreadInput → (可选)Alt 点击。
+///
+/// AttachThreadInput 的护栏:①前台线程挂起时挂接会把本进程输入队列一起
+/// 冻死,先 IsHungAppWindow 预检;②UIPI 拦跨完整性级别挂接,调用方已做
+/// 提权前置检查;③挂接立即解绑,绝不过夜。
+///
+/// Alt 点击机制(LockSetForegroundWindow 文档行为):前台窗口处理 Alt 时
+/// 系统自动解除焦点锁。副作用是向用户当前正在使用的前台窗口注入一次
+/// 真实按键,仅在 `allow_alt_trick` 时执行。
+pub fn activate_with_ladder(
+    hwnd: HWND,
+    allow_alt_trick: bool,
+) -> Result<ActivationMethod, ToolError> {
+    if set_foreground_and_verify(hwnd) {
+        return Ok(ActivationMethod::Direct);
+    }
+    let foreground = foreground_hwnd();
+    if !foreground.0.is_null() && foreground != hwnd && !is_window_hung(foreground) {
+        let target_tid = unsafe { GetWindowThreadProcessId(foreground, None) };
+        let self_tid = unsafe { GetCurrentThreadId() };
+        if target_tid != 0 && target_tid != self_tid {
+            unsafe {
+                let _ = AttachThreadInput(self_tid, target_tid, true);
+            }
+            let attached = set_foreground_and_verify(hwnd);
+            unsafe {
+                let _ = AttachThreadInput(self_tid, target_tid, false);
+            }
+            if attached {
+                return Ok(ActivationMethod::AttachInput);
+            }
+        }
+    }
+    if allow_alt_trick {
+        unsafe {
+            keybd_event(VK_MENU.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
+            keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if set_foreground_and_verify(hwnd) {
+            return Ok(ActivationMethod::AltTrick);
+        }
+    }
+    Err(ToolError::new(
+        ACTIVATION_DENIED,
+        format!(
+            "SetForegroundWindow 与焦点锁绕过均未生效:目标 hwnd={}(Windows 焦点保护或窗口已失效)",
+            hwnd_str(hwnd)
+        ),
+    ))
+}
+
+/// 矩形相交判定(含边界接触)。纯函数,便于单测。
+fn rects_intersect(a: RECT, b: RECT) -> bool {
+    a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
+}
+
+/// 客户区矩形区域是否被其他顶层窗口遮挡:自目标窗口沿 z 序向上走查,
+/// 任意可见且非最小化窗口的外框与该区域(屏幕坐标)相交即判定遮挡。
+/// 半透明/分层窗口不保证像素级判定,但对"断言结果可信度"足够。
+/// 探测失败(窗口已销毁等)按不遮挡处理,由后续采样自行报错。
+pub fn client_region_occluded(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) -> bool {
+    let Ok(client) = client_rect_of(hwnd) else {
+        return false;
+    };
+    let region = RECT {
+        left: client.left + x,
+        top: client.top + y,
+        right: client.left + x + width,
+        bottom: client.top + y + height,
+    };
+    // GetWindow 在 0.61 返回 Result;失败(目标已销毁)按无遮挡处理。
+    let mut above = unsafe { GetWindow(hwnd, GW_HWNDPREV) }.unwrap_or_default();
+    while !above.0.is_null() {
+        if unsafe { IsWindowVisible(above) }.as_bool() && !unsafe { IsIconic(above) }.as_bool() {
+            let mut r = RECT::default();
+            if unsafe { GetWindowRect(above, &mut r) }.is_ok() && rects_intersect(region, r) {
+                return true;
+            }
+        }
+        above = unsafe { GetWindow(above, GW_HWNDPREV) }.unwrap_or_default();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -380,5 +482,59 @@ mod tests {
             ex_style: WS_EX_TOOLWINDOW.0,
             ..base
         }));
+    }
+
+    #[test]
+    fn rect_intersection_detects_overlap_but_not_contact() {
+        let r = RECT {
+            left: 100,
+            top: 100,
+            right: 200,
+            bottom: 200,
+        };
+        assert!(rects_intersect(
+            r,
+            RECT {
+                left: 150,
+                top: 150,
+                right: 300,
+                bottom: 300
+            }
+        ));
+        assert!(rects_intersect(
+            r,
+            RECT {
+                left: 50,
+                top: 50,
+                right: 150,
+                bottom: 150
+            }
+        ));
+        // 边界接触不算遮挡
+        assert!(!rects_intersect(
+            r,
+            RECT {
+                left: 200,
+                top: 100,
+                right: 300,
+                bottom: 200
+            }
+        ));
+        assert!(!rects_intersect(
+            r,
+            RECT {
+                left: 100,
+                top: 200,
+                right: 200,
+                bottom: 300
+            }
+        ));
+    }
+
+    #[test]
+    fn activation_method_names_are_stable() {
+        assert_eq!(ActivationMethod::Direct.name(), "direct");
+        assert_eq!(ActivationMethod::AttachInput.name(), "attach_input");
+        assert_eq!(ActivationMethod::AltTrick.name(), "alt_trick");
     }
 }

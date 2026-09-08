@@ -447,7 +447,7 @@ pub fn tools_list() -> Value {
         },
         {
             "name": TOOL_SCREENSHOT_WINDOW,
-            "description": "截取指定窗口的渲染内容。client_only=false（默认）包含标题栏和边框；true 仅截客户区。hwnd 可为 @active；其余定位必须且只能用 hwnd / title / pid 之一。单窗口最高 1200 万像素，超限请先 resize_window。method=auto（默认）时 PrintWindow 输出近纯黑(部分 GPU 加速窗口)或失败先试 WGC 合成帧(实验)，仍不可用再回退屏幕采样，被遮挡区域按屏幕当前显示内容；method=wgc 直接走 Windows Graphics Capture GPU 合成帧(实验)，被遮挡窗口也产出完整内容，但最小化窗口不产帧(等待超时)、DRM 保护内容被拒或黑区，且边框策略随系统版本不同(Win10 不支持去边框)。响应文本 fallback= 标注 PrintWindow 未产出时的实际来源(wgc / screen)。",
+            "description": "截取指定窗口的渲染内容。client_only=false（默认）包含标题栏和边框；true 仅截客户区。hwnd 可为 @active；其余定位必须且只能用 hwnd / title / pid 之一。单窗口最高 1200 万像素，超限请先 resize_window。method=auto（默认）时 PrintWindow 输出近纯黑(部分 GPU 加速窗口)或失败先试 WGC 合成帧(实验)，仍不可用再回退屏幕采样，被遮挡区域按屏幕当前显示内容；method=wgc 直接走 Windows Graphics Capture GPU 合成帧(实验)，被遮挡窗口也产出完整内容，但最小化窗口不产帧(等待超时)、DRM 保护内容被拒或黑区，且边框策略随系统版本不同(Win10 不支持去边框)。incremental=true(仅 method=wgc，实验)启用增量差分：首次调用返回完整基线帧，后续调用只返回相对上次的变化区域图像(文本列出帧坐标矩形)，无变化时仅返回文本零图像；会话跨调用缓存：有变化时约 10-30ms，静态窗口约 100ms(等待确认无新帧)。响应文本 fallback= 标注 PrintWindow 未产出时的实际来源(wgc / screen)。",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
@@ -456,7 +456,8 @@ pub fn tools_list() -> Value {
                     "title": {"type": "string", "description": "窗口标题子串"},
                     "pid": {"type": "integer", "description": "窗口所属进程 PID"},
                     "client_only": {"type": "boolean", "description": "仅截客户区，默认 false"},
-                    "method": {"type": "string", "enum": ["auto", "wgc"], "description": "采集方式：auto=PrintWindow，近纯黑/失败先试 WGC 再回退屏幕采样（默认）；wgc=直接走 Windows Graphics Capture GPU 合成帧（实验）"}
+                    "method": {"type": "string", "enum": ["auto", "wgc"], "description": "采集方式：auto=PrintWindow，近纯黑/失败先试 WGC 再回退屏幕采样（默认）；wgc=直接走 Windows Graphics Capture GPU 合成帧（实验）"},
+                    "incremental": {"type": "boolean", "description": "增量差分(实验,仅 method=wgc 有效)：true 时首次调用返回基线全帧，后续调用只返回相对上次的变化区域图像，无变化时仅返回文本"}
                 },
                 "additionalProperties": false
             }
@@ -610,8 +611,21 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let method = args.get("method").and_then(Value::as_str).unwrap_or("auto");
+            let incremental = args
+                .get("incremental")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if incremental && method != "wgc" {
+                return Err(ToolError::new(
+                    INVALID_ARGUMENT,
+                    format!("增量差分仅支持 method=wgc，当前 method={method}"),
+                ));
+            }
             let capture = match method {
                 "auto" => capture_window(hwnd, client_only)?,
+                "wgc" if incremental => {
+                    crate::backend::wgc::capture_window_wgc_incremental(hwnd, client_only)?
+                }
                 "wgc" => crate::backend::wgc::capture_window_wgc(hwnd, client_only)?,
                 other => {
                     return Err(ToolError::new(
@@ -624,17 +638,63 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
                 .fallback
                 .map(|reason| format!(" fallback={reason}"))
                 .unwrap_or_default();
-            Ok(json!({
-                "content": [
-                    {"type": "text", "text": format!(
-                        "窗口截图: hwnd={} client_only={} method={} 矩形=({},{}) {}x{} 图像={} bytes{}",
-                        hwnd_str(hwnd), client_only, method, capture.rect.left, capture.rect.top,
-                        capture.rect.right - capture.rect.left,
-                        capture.rect.bottom - capture.rect.top, capture.png.len(), fallback
-                    )},
-                    {"type": "image", "data": B64.encode(&capture.png), "mimeType": "image/png"}
-                ]
-            }))
+            let reused = if capture.reused {
+                " 复用上次帧(无新帧)"
+            } else {
+                ""
+            };
+            match &capture.incremental {
+                Some(info) if info.baseline => Ok(json!({
+                    "content": [
+                        {"type": "text", "text": format!(
+                            "增量截图基线: hwnd={} client_only={} 矩形=({},{}) {}x{} 图像={} bytes;已建立差分基线，后续调用仅返回变化区域",
+                            hwnd_str(hwnd), client_only, capture.rect.left, capture.rect.top,
+                            capture.rect.right - capture.rect.left,
+                            capture.rect.bottom - capture.rect.top, capture.png.len()
+                        )},
+                        {"type": "image", "data": B64.encode(&capture.png), "mimeType": "image/png"}
+                    ]
+                })),
+                Some(info) if info.regions.is_empty() => Ok(json!({
+                    "content": [
+                        {"type": "text", "text": format!(
+                            "增量截图: hwnd={} client_only={} 与上次采集无变化，无图像返回",
+                            hwnd_str(hwnd), client_only
+                        )}
+                    ]
+                })),
+                Some(info) => {
+                    let regions = info
+                        .regions
+                        .iter()
+                        .map(|r| format!("({},{},{},{})", r.x, r.y, r.w, r.h))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let mut content = vec![json!({"type": "text", "text": format!(
+                        "增量截图: hwnd={} client_only={} 变化区域 {} 个(x,y,w,h,帧坐标): {regions};区域外与上次采集一致，图像=各区域裁剪",
+                        hwnd_str(hwnd), client_only, info.regions.len()
+                    )})];
+                    for region in &info.regions {
+                        content.push(json!({
+                            "type": "image",
+                            "data": B64.encode(&region.png),
+                            "mimeType": "image/png"
+                        }));
+                    }
+                    Ok(json!({"content": content}))
+                }
+                None => Ok(json!({
+                    "content": [
+                        {"type": "text", "text": format!(
+                            "窗口截图: hwnd={} client_only={} method={} 矩形=({},{}) {}x{} 图像={} bytes{reused}{fallback}",
+                            hwnd_str(hwnd), client_only, method, capture.rect.left, capture.rect.top,
+                            capture.rect.right - capture.rect.left,
+                            capture.rect.bottom - capture.rect.top, capture.png.len()
+                        )},
+                        {"type": "image", "data": B64.encode(&capture.png), "mimeType": "image/png"}
+                    ]
+                })),
+            }
         }
         TOOL_SCREENSHOT_ALL => {
             let shots = capture_all_monitors()?;

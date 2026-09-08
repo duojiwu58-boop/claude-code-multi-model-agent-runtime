@@ -196,6 +196,14 @@ public static class UiaProbe {
             b.Size = new Size(160, 48);
             b.Location = new Point(130, 106);
             f.Controls.Add(b);
+            // Second button: gives the incremental-diff test a deterministic
+            // focus-ring change (WinForms auto-focuses the first button on
+            // Show, so clicking it produces no pixel change).
+            var b2 = new Button();
+            b2.Text = "UIA_OK_probe2";
+            b2.Size = new Size(100, 40);
+            b2.Location = new Point(20, 20);
+            f.Controls.Add(b2);
             f.Show();
             Console.WriteLine(f.Handle.ToInt64());
             Console.Out.Flush();
@@ -249,6 +257,33 @@ while ($true) { Start-Sleep -Seconds 60 }
     $fha = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$false; method='auto' }
     $fhaText = if ($fha.result.content) { $fha.result.content[0].text } else { '' }
     Check 'screenshot_window auto probe (chain)' ((-not $fha.result.isError) -and ($fhaText -notmatch 'fallback=' -or $fhaText -match 'fallback=(wgc|screen) \(')) $fhaText
+
+    # --- 增量差分(WGC 会话缓存):基线 → 无变化 → 点击触发变化 → 变化 → 再无变化 ---
+    # 增量会话禁用光标捕获,差分与光标移动无关,判定确定。
+    $incBad = Send-Tool 'screenshot_window' @{ hwnd=$fh; method='auto'; incremental=$true }
+    Check 'incremental requires method=wgc' ($incBad.result.isError) ($incBad.result.content[0].text)
+    $inc1 = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$true; method='wgc'; incremental=$true }
+    $inc1Img = ($inc1.result.content | Where-Object { $_.type -eq 'image' }).Count
+    $inc1Text = if ($inc1.result.content) { $inc1.result.content[0].text } else { '' }
+    Check 'incremental baseline frame' ((-not $inc1.result.isError) -and $inc1Img -eq 1 -and $inc1Text -match '基线') ($inc1Text)
+    $inc2 = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$true; method='wgc'; incremental=$true }
+    $inc2Img = ($inc2.result.content | Where-Object { $_.type -eq 'image' }).Count
+    Check 'incremental no-change is text-only' ((-not $inc2.result.isError) -and $inc2Img -eq 0 -and $inc2.result.content[0].text -match '无变化') ($inc2.result.content[0].text)
+    # 点击探针第二按钮(焦点环从按钮1移到按钮2,必产生客户区像素变化),
+    # 等待 DWM 产帧。按钮2 逻辑中心 (70,40),按 DPI 缩放转物理坐标。
+    $scale = $prf.client_rect.width / 420
+    $b2x = [int](70 * $scale); $b2y = [int](40 * $scale)
+    $click = Send-Tool 'send_input' @{ hwnd=$fh; activate=$true; actions=@(@{kind='click'; x=$b2x; y=$b2y}) }
+    Check 'incremental setup click' (-not $click.result.isError) ($click.result.content[0].text)
+    Start-Sleep -Milliseconds 700
+    $inc3 = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$true; method='wgc'; incremental=$true }
+    $inc3Img = ($inc3.result.content | Where-Object { $_.type -eq 'image' }).Count
+    $inc3Text = if ($inc3.result.content) { $inc3.result.content[0].text } else { '' }
+    Check 'incremental reports change after click' ((-not $inc3.result.isError) -and $inc3Img -ge 1 -and $inc3Text -match '变化区域') ($inc3Text)
+    Start-Sleep -Milliseconds 300
+    $inc4 = Send-Tool 'screenshot_window' @{ hwnd=$fh; client_only=$true; method='wgc'; incremental=$true }
+    $inc4Img = ($inc4.result.content | Where-Object { $_.type -eq 'image' }).Count
+    Check 'incremental settles back to no-change' ((-not $inc4.result.isError) -and $inc4Img -eq 0) ($inc4.result.content[0].text)
   }
   if (!$probeProc.HasExited) { Stop-Process -Id $probeProc.Id -Force -ErrorAction SilentlyContinue }
   Remove-Item $probeFile, $probeOut -Force -ErrorAction SilentlyContinue

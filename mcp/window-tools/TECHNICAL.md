@@ -95,6 +95,40 @@ GetWindowRect/ClientToScreen → CreateCompatibleBitmap(原尺寸) → CreateCom
   受保护/无响应窗口可能失败 —— 失败即报错,**不退化为全屏截图**;
 - 位图按原尺寸分配,超大窗口在分配前被预算拒绝(见 §6);
 - 单窗口预算:单边 7680 px、总计 1200 万像素。
+- **auto 链**(v0.4.1):PrintWindow 近纯黑或失败 → 先试 WGC 合成帧 → 仍不可用再
+  屏幕采样;来源经 `fallback=` 动态标注,无标注 = PrintWindow 直出(零 WGC 开销)。
+
+### 4.2a screenshot_window(WGC 路径, v0.4.0 / v0.5.0)
+
+```
+rect 预检 → 全局缓存 Mutex → 设备缓存(硬件→WARP,只建一次)
+→ 会话缓存(键 = hwnd, client_only, incremental;LRU 上限 4;IsWindow 清理)
+→ 新会话:互操作 CreateForWindow → 自由线程帧池(2 缓冲)→ 会话
+  → 增量会话禁光标捕获 → StartCapture → 首帧轮询(100ms×10s 预算)
+→ 既有会话:立即 TryGetNextFrame → 空则等 100ms(DWM 交付周期)再取一次
+→ 帧 → IDirect3DDxgiInterfaceAccess::GetInterface → staging 拷贝 → BGRA
+```
+
+关键点(v0.5.0):
+
+- **缓存动机**(探针实测,902x632):每次全新建链 210-230ms,其中设备 ~60ms +
+  CreateForWindow ~34ms + 首帧 ~100ms + 编码 ~4ms;缓存后:窗口有变化 ~10-30ms,
+  静态窗口 ~100ms(等待确认无新帧)。
+- **无新帧 = 内容未变**:静态窗口 DWM 不产帧,`TryGetNextFrame` 以 null + S_OK
+  返回(windows-core 表现为 `Err(Error::empty())`);全帧复用上次 BGRA 重编码
+  (语义等价),增量直接判"无变化"。100ms 等待窗口兜住与动作并发竞态的调用,
+  避免误报。
+- **增量差分**(`incremental=true`,仅 method=wgc):逐行差分(4 字节像素步进)+
+  变化行聚带,带数 > 8 合并为单一外接盒;只回传变化区域裁剪 PNG,无变化纯文本
+  零图像。**不信任原生 DirtyRegions**:帧池缓冲有限,长间隔后脏区相对中间帧
+  而非客户端基线,会漏报;像素差分不依赖帧历史,任何间隔下都精确。
+- **差分确定性**:增量会话 `SetIsCursorCaptureEnabled(false)`——光标移动不产帧,
+  否则"无变化"判定被光标污染。
+- 线程模型:进程内 MTA 唯一,缓存对象跨 worker 线程直接访问合法;并发由缓存
+  Mutex 串行化(等待以毫秒计)。WinRT `IDirect3DDevice` 封装不缓存(无 Send,
+  转换实测 ~0ms),建会话时现取。
+- 会话边界(承接 v0.4.0):最小化不产帧(轮询+硬超时)、DRM 被拒或黑区、
+  系统级 CaptureSession 并发上限(缓存 4 主动规避)、Win10 无去边框。
 
 ### 4.3 screenshot_all
 
@@ -271,7 +305,7 @@ fn handle_request_isolated(request: &Value) -> Option<Value> {
 target/x86_64-pc-windows-msvc/release/mcp-window-tools.exe
 ```
 
-### 7.2 测试(25 项单元 + 36 项 E2E)
+### 7.2 测试(38 项单元 + 54 项 E2E;各版本精确计数见 CHANGELOG)
 
 | 组 | 覆盖 |
 |---|---|
@@ -281,7 +315,7 @@ target/x86_64-pc-windows-msvc/release/mcp-window-tools.exe
 | 按键名 | 字母/数字/F 键/方向键/非法值/越界整数 |
 | 输入批次 | 客户区坐标、down/up 配平、动作数与计划时长限制、schema 发布 |
 | panic 隔离 | 负载提取(三种形态)、隔离后保留请求 id、正常路径不受影响 |
-| 工具清单 | 10 工具齐全、新工具 schema 约束(必填 hwnd、annotations) |
+| 工具清单 | 12 工具齐全、新工具 schema 约束(必填 hwnd、annotations) |
 | 错误契约 | 错误码稳定性、retryable 码表推导、双轨响应形状 |
 | 活性 | 截图超时返回 WINDOW_HUNG、worker 边界行为 |
 | 可观测性 | 诊断字段完整性、错误环形缓冲容量与淘汰顺序、日志级别解析 |

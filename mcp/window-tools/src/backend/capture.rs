@@ -146,10 +146,33 @@ impl Drop for GdiHandle {
 /// `fallback=Some(...)` 表示 PrintWindow 路径未产出可用图像,实际来源改为
 /// 其他路径:`wgc (...)` = WGC 合成帧,`screen (...)` = 屏幕采样(窗口矩形
 /// 区域在屏幕上的当前显示,遮挡与阴影按屏幕现状)。
+/// `incremental=Some(...)` 表示增量差分调用(WGC 会话缓存),语义见
+/// [`IncrementalInfo`];`reused=true` 表示窗口静态无新帧,复用上次帧内容
+/// (与重新采集语义等价)。
 pub struct WindowCapture {
     pub png: Vec<u8>,
     pub rect: RECT,
     pub fallback: Option<String>,
+    pub incremental: Option<IncrementalInfo>,
+    pub reused: bool,
+}
+
+/// 增量差分信息(incremental 调用时 Some):
+/// - `baseline=true`:本帧为基线(首次采集或基线重建),`png` 为全帧;
+/// - `regions` 空且 `baseline=false`:与上次采集无变化,`png` 为空;
+/// - 其余:`regions` 为变化区域(帧坐标),各带裁剪后的 PNG。
+pub struct IncrementalInfo {
+    pub baseline: bool,
+    pub regions: Vec<DirtyRegion>,
+}
+
+/// 一个变化区域:帧坐标 (x, y, w, h) 与裁剪后的 PNG(仅含该区域内容)。
+pub struct DirtyRegion {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    pub png: Vec<u8>,
 }
 
 pub fn capture_window(hwnd: HWND, client_only: bool) -> Result<WindowCapture, ToolError> {
@@ -239,25 +262,29 @@ fn capture_window_inner(hwnd: HWND, client_only: bool) -> Result<WindowCapture, 
                 png,
                 rect,
                 fallback: None,
+                incremental: None,
+                reused: false,
             })
         }
         printed => {
             // GPU 加速窗口的 PrintWindow 常产出近纯黑,或直接失败:auto 链
-            // 先试 WGC(DWM 合成帧,免疫黑屏与被遮挡,仅非白名单路径才付出
-            // ~150-300ms 建链成本),WGC 不可用再回退屏幕采样(与像素扫描
-            // 工具同源)。WGC 失败只影响来源标注,不改变错误契约。
+            // 先试 WGC(DWM 合成帧,免疫黑屏与被遮挡;会话缓存让非白名单
+            // 路径的重复采集也只需 ~10-30ms),WGC 不可用再回退屏幕采样
+            // (与像素扫描工具同源)。WGC 失败只影响来源标注,不改变错误契约。
             let print_reason = if printed.is_ok() {
                 "PrintWindow 近纯黑"
             } else {
                 "PrintWindow 失败"
             };
-            match crate::backend::wgc::capture_window_wgc_inner(hwnd, client_only) {
+            match crate::backend::wgc::capture_window_wgc_cached(hwnd, client_only, false) {
                 Ok(wgc) => {
                     crate::log_info!("capture: {print_reason},WGC 产出 {} bytes", wgc.png.len());
                     Ok(WindowCapture {
                         png: wgc.png,
                         rect,
                         fallback: Some(wgc_fallback_reason(print_reason)),
+                        incremental: None,
+                        reused: wgc.reused,
                     })
                 }
                 Err(wgc_error) => {
@@ -268,6 +295,8 @@ fn capture_window_inner(hwnd: HWND, client_only: bool) -> Result<WindowCapture, 
                         png,
                         rect,
                         fallback: Some(screen_fallback_reason(print_reason, &wgc_error)),
+                        incremental: None,
+                        reused: false,
                     })
                 }
             }

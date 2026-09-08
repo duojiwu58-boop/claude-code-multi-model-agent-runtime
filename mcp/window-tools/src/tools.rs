@@ -37,6 +37,14 @@ pub const TOOL_INSPECT_ELEMENT_AT: &str = "inspect_element_at";
 pub const TOOL_INSPECT_FOCUSED: &str = "inspect_focused_element";
 /// 诊断自检工具:版本、运行时长、请求/错误统计、GDI 句柄数与最近错误记录。
 pub const TOOL_GET_DIAGNOSTICS: &str = "get_diagnostics";
+/// 多点特征比色:锚点+偏移链,AVX2 引擎,支持 hwnd 客户区或显示器 DDAPI 直扫。
+pub const TOOL_PIXEL_MATCH_MULTI: &str = "pixel_match_multi";
+/// 后台静默鼠标输入:PostMessageW 直投,不抢焦点不动物理光标。
+pub const TOOL_SEND_INPUT_BACKGROUND: &str = "send_input_background";
+/// 后台文本写入:EDIT 控件 EM_REPLACESEL 整段置换或 WM_CHAR 字符流。
+pub const TOOL_SEND_TEXT_BACKGROUND: &str = "send_text_background";
+/// 事件驱动等待窗口出现:WinEvent hook 零轮询唤醒。
+pub const TOOL_WAIT_FOR_WINDOW: &str = "wait_for_window";
 
 const MAX_WINDOWS_LIMIT: usize = 500;
 const MAX_SCAN_BANDS: usize = 256;
@@ -546,12 +554,12 @@ pub fn tools_list() -> Value {
         },
         {
             "name": TOOL_SCREENSHOT_ALL,
-            "description": "截取所有显示器（每台一张图）。最高保留三台 UHD 4K（3840x2160）显示器的总像素；超过时按相同比例缩放，并返回原始与实际尺寸。method=auto（默认）走屏幕 BitBlt，不含光标；method=wgc 走 Windows Graphics Capture 合成帧（实验），含光标，会话断开/锁定等无合成场景单屏报错。format=png(默认)无损；format=jpeg 有损但体积小 60-90%；max_dim>0 时输出最长边按比例缩小（默认 0 不限制，视觉模型 token 按分辨率计费）。",
+            "description": "截取所有显示器（每台一张图）。最高保留三台 UHD 4K（3840x2160）显示器的总像素；超过时按相同比例缩放，并返回原始与实际尺寸。method=auto（默认）走屏幕 BitBlt，不含光标；method=wgc 走 Windows Graphics Capture 合成帧（实验），含光标，会话断开/锁定等无合成场景单屏报错；method=ddapi 走 DXGI Desktop Duplication 显存复制（实验），不含光标，单屏不可用（锁定/安全桌面/静态桌面无缓存帧）时回退 BitBlt 并在 source 标注。format=png(默认)无损；format=jpeg 有损但体积小 60-90%；max_dim>0 时输出最长边按比例缩小（默认 0 不限制，视觉模型 token 按分辨率计费）。",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "method": {"type": "string", "enum": ["auto", "wgc"], "description": "采集方式：auto=屏幕 BitBlt（默认，不含光标）；wgc=Windows Graphics Capture 合成帧（实验，含光标）"},
+                    "method": {"type": "string", "enum": ["auto", "wgc", "ddapi"], "description": "采集方式：auto=屏幕 BitBlt（默认，不含光标）；wgc=Windows Graphics Capture 合成帧（实验，含光标）；ddapi=DXGI 桌面复制（实验，显示器级，不含光标，失败回退 BitBlt）"},
                     "format": {"type": "string", "enum": ["png", "jpeg"], "description": "输出编码：png 无损（默认）；jpeg 有损但体积小 60-90%"},
                     "quality": {"type": ["integer", "string"], "minimum": 1, "maximum": 100, "description": "jpeg 质量 1-100，默认 85，仅 format=jpeg 有效"},
                     "max_dim": {"type": ["integer", "string"], "minimum": 0, "maximum": 7680, "description": "输出最长边上限（物理像素），超过按比例双线性缩小；0=不限制（默认）"}
@@ -654,7 +662,7 @@ pub fn tools_list() -> Value {
                                 "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "鼠标键，默认 left"},
                                 "delta": {"type": ["integer", "string"], "description": "scroll：滚轮增量（正=上滚）"},
                                 "vkey": {"type": ["integer", "string"], "description": "虚拟键码或按键名（key_tap/key_down/key_up 必填）"},
-                                "steps": {"type": ["integer", "string"], "minimum": 1, "maximum": 200, "description": "move 插值步数，默认 1"}
+                                "steps": {"type": ["integer", "string"], "minimum": 1, "maximum": 200, "description": "move 插值步数(三阶贝塞尔拟人轨迹+缓入缓出+高斯抖动),默认 1"}
                             },
                             "required": ["kind"]
                         }
@@ -690,6 +698,123 @@ pub fn tools_list() -> Value {
             "description": "服务自检:版本、运行时长、请求/错误统计(按工具与错误码分组)、当前 GDI/USER 句柄数与最近错误记录。无参数。",
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
+            "name": TOOL_PIXEL_MATCH_MULTI,
+            "description": "多点特征比色(经典外挂式锚点+偏移链匹配)。在 search_rect 内找 anchor 颜色的全部命中,逐候选校验 offsets 相对偏移点(各带独立颜色/容差,偏移点必须落在 search_rect 内),按与期望锚点位置的欧氏距离升序返回前 max_matches 个。目标二选一:hwnd(客户区坐标,method=auto 屏幕采样含 occluded 遮挡标注 / wgc DWM 合成帧)或 monitor(1-based 显示器序号,DDAPI 显存帧零整图拷贝直扫,失败回退屏幕采样并在 fallback 标注)。x86_64 上 AVX2 向量化扫描(8 像素/次),4K 全区域毫秒级;响应含 engine/capture_elapsed_ms/scan_elapsed_ms 供性能验证。",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "hwnd": {"type": "string", "description": "精确窗口句柄，或 @active（与 monitor 二选一）"},
+                    "monitor": {"type": ["integer", "string"], "minimum": 1, "description": "显示器序号 1-based（与 hwnd 二选一，走 DDAPI 直扫）"},
+                    "anchor": {
+                        "type": "object",
+                        "properties": {
+                            "x": {"type": ["integer", "string"], "description": "特征点期望位置 X（客户区/显示器坐标，用于结果按距离排序）"},
+                            "y": {"type": ["integer", "string"], "description": "特征点期望位置 Y"},
+                            "color": {"type": "string", "description": "锚点颜色 #RRGGBB"},
+                            "tolerance": {"type": ["integer", "string"], "minimum": 0, "maximum": 255, "description": "锚点每通道容差，默认 0"}
+                        },
+                        "required": ["x", "y", "color"],
+                        "additionalProperties": false
+                    },
+                    "offsets": {
+                        "type": "array",
+                        "maxItems": 64,
+                        "description": "相对锚点命中位置的校验点链（可选；offset_x/offset_y 缺省 0）",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "offset_x": {"type": ["integer", "string"], "description": "相对锚点 X 偏移"},
+                                "offset_y": {"type": ["integer", "string"], "description": "相对锚点 Y 偏移"},
+                                "color": {"type": "string", "description": "校验点颜色 #RRGGBB"},
+                                "tolerance": {"type": ["integer", "string"], "minimum": 0, "maximum": 255, "description": "校验点每通道容差，默认 0"}
+                            },
+                            "required": ["color"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "search_rect": {
+                        "type": "object",
+                        "description": "查找范围（可选，缺省全客户区/全显示器；坐标相对目标坐标系）",
+                        "properties": {
+                            "x": {"type": ["integer", "string"]},
+                            "y": {"type": ["integer", "string"]},
+                            "width": {"type": ["integer", "string"], "minimum": 1},
+                            "height": {"type": ["integer", "string"], "minimum": 1}
+                        },
+                        "required": ["x", "y", "width", "height"],
+                        "additionalProperties": false
+                    },
+                    "method": {"type": "string", "enum": ["auto", "wgc"], "description": "hwnd 模式的采样来源：auto=屏幕（默认，实时但遮挡即错采）；wgc=DWM 合成帧（遮挡准确但帧异步）"},
+                    "max_matches": {"type": ["integer", "string"], "minimum": 1, "maximum": 4096, "description": "最多返回匹配数，默认 32"}
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": TOOL_SEND_INPUT_BACKGROUND,
+            "description": "后台静默鼠标输入:PostMessageW 直投窗口消息队列,不抢焦点、不动物理光标、不改变前台窗口。客户区坐标经 RealChildWindowFromPoint 命中最深子控件,换算子控件局部坐标投递 WM_MOUSEMOVE/WM_LBUTTONDOWN/WM_LBUTTONUP 等。actions 支持 click/down/up/right_click/move(每动作可带 x/y,缺省继承 client_x/client_y;down 必须同批 up 配平)。诚实边界:消息只是投递(posted),使用 RawInput/DirectInput 或消息泵不健全的应用可能不响应,请以截图或像素断言验证实际效果;目标提权且本服务未提权时返回 UIPI_BLOCKED。",
+            "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "hwnd": {"type": "string", "description": "精确窗口句柄（父窗口，或 @active）"},
+                    "client_x": {"type": ["integer", "string"], "description": "批次基准点（客户区 X）"},
+                    "client_y": {"type": ["integer", "string"], "description": "批次基准点（客户区 Y）"},
+                    "delay_ms": {"type": ["integer", "string"], "minimum": 0, "maximum": 5000, "description": "动作间延迟，默认 50"},
+                    "actions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 64,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string", "enum": ["click", "down", "up", "right_click", "move"]},
+                                "x": {"type": ["integer", "string"], "description": "客户区 X（缺省继承 client_x）"},
+                                "y": {"type": ["integer", "string"], "description": "客户区 Y（缺省继承 client_y）"},
+                                "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "鼠标键，默认 left（right_click 恒为右键）"}
+                            },
+                            "required": ["kind"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["hwnd", "client_x", "client_y", "actions"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": TOOL_SEND_TEXT_BACKGROUND,
+            "description": "后台静默写入文本到输入框。目标为标准 EDIT/RichEdit 控件时走 EM_SETSEL+EM_REPLACESEL 系统封送整段置换(瞬间完成,免击键漏字;clear_first=true 时先全选再整体置换,一步完成清空+写入);非编辑控件走 WM_CHAR 字符流投递(UTF-16 码元逐一投递,clear_first 不支持)。全程不抢焦点、不动键盘状态。目标线程挂起时发送按 5s 超时放弃;目标提权且本服务未提权时返回 UIPI_BLOCKED。建议先用 inspect_element_at 定位输入框精确句柄。",
+            "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "hwnd": {"type": "string", "description": "目标输入框句柄（编辑控件，而非父窗口；可为 @active）"},
+                    "text": {"type": "string", "description": "要写入的文本（最多 4096 字符）"},
+                    "clear_first": {"type": "boolean", "description": "先清空再写入，默认 false（仅 EDIT 控件有效）"}
+                },
+                "required": ["hwnd", "text"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": TOOL_WAIT_FOR_WINDOW,
+            "description": "事件驱动等待窗口出现(零轮询):SetWinEventHook 监听 EVENT_OBJECT_CREATE/EVENT_OBJECT_SHOW/EVENT_SYSTEM_FOREGROUND,操作系统事件直接唤醒返回窗口句柄、矩形、标题、类名与 PID,无需反复 list_windows 轮询。title_regex 为 Rust 正则(默认大小写不敏感,case_insensitive=false 可关闭),class 为类名子串(忽略大小写),pid 精确匹配;三者至少给一个且为 AND 关系。已存在的匹配窗口立即返回(source=existing)。超时返回正常响应 found=false(非错误)。",
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title_regex": {"type": "string", "description": "窗口标题正则表达式（可选）"},
+                    "class": {"type": "string", "description": "窗口类名子串（可选，忽略大小写）"},
+                    "pid": {"type": ["integer", "string"], "description": "窗口所属进程 PID（可选，精确匹配）"},
+                    "timeout_ms": {"type": ["integer", "string"], "minimum": 1, "maximum": 60000, "description": "等待超时（毫秒），默认 5000"},
+                    "case_insensitive": {"type": "boolean", "description": "title_regex 大小写不敏感，默认 true"}
+                },
+                "additionalProperties": false
+            }
         }
     ]})
 }
@@ -816,9 +941,9 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
                     shot.source_width, shot.source_height, shot.output_width, shot.output_height
                 );
                 if let Some(error) = shot.error {
-                    content.push(json!({"type": "text", "text": format!("{}: {dimensions}; method={method}; 错误: {error}", shot.label)}));
+                    content.push(json!({"type": "text", "text": format!("{}: {dimensions}; method={method}; source={}; 错误: {error}", shot.label, shot.source)}));
                 } else {
-                    content.push(json!({"type": "text", "text": format!("{}: {dimensions}; method={method}; 编码={} {} bytes", shot.label, encoding_label(format), shot.image.len())}));
+                    content.push(json!({"type": "text", "text": format!("{}: {dimensions}; method={method}; source={}; 编码={} {} bytes", shot.label, shot.source, encoding_label(format), shot.image.len())}));
                     content.push(json!({"type": "image", "data": B64.encode(&shot.image), "mimeType": shot.mime}));
                 }
             }
@@ -833,7 +958,31 @@ pub fn handle_tool_call(name: &str, args: &Value) -> Result<Value, ToolError> {
         }
         TOOL_PIXEL_SCAN_LINE => pixel_scan_line(resolve_explicit_hwnd(args)?, args),
         TOOL_PIXEL_FIND_COLOR => pixel_find_color(resolve_explicit_hwnd(args)?, args),
+        TOOL_PIXEL_MATCH_MULTI => {
+            // 目标二选一:hwnd(客户区)或 monitor(显示器);排他性运行时强制。
+            let has_hwnd = args.get("hwnd").is_some();
+            let has_monitor = args.get("monitor").is_some();
+            if has_hwnd == has_monitor {
+                return Err(ToolError::new(
+                    INVALID_ARGUMENT,
+                    "必须且只能提供 hwnd 或 monitor 之一",
+                ));
+            }
+            let hwnd = if has_hwnd {
+                Some(resolve_explicit_hwnd(args)?)
+            } else {
+                None
+            };
+            crate::backend::pixelmatch::pixel_match_multi(hwnd, args)
+        }
         TOOL_SEND_INPUT => send_input(resolve_explicit_hwnd(args)?, args),
+        TOOL_SEND_INPUT_BACKGROUND => {
+            crate::backend::background::send_input_background(resolve_explicit_hwnd(args)?, args)
+        }
+        TOOL_SEND_TEXT_BACKGROUND => {
+            crate::backend::background::send_text_background(resolve_explicit_hwnd(args)?, args)
+        }
+        TOOL_WAIT_FOR_WINDOW => crate::backend::winevent::wait_for_window(args),
         TOOL_INSPECT_ELEMENT_AT => {
             crate::backend::uia::inspect_element_at(resolve_explicit_hwnd(args)?, args)
         }
@@ -880,7 +1029,11 @@ mod tests {
             TOOL_ACTIVATE,
             TOOL_PIXEL_SCAN_LINE,
             TOOL_PIXEL_FIND_COLOR,
+            TOOL_PIXEL_MATCH_MULTI,
             TOOL_SEND_INPUT,
+            TOOL_SEND_INPUT_BACKGROUND,
+            TOOL_SEND_TEXT_BACKGROUND,
+            TOOL_WAIT_FOR_WINDOW,
             TOOL_INSPECT_ELEMENT_AT,
             TOOL_INSPECT_FOCUSED,
             TOOL_GET_DIAGNOSTICS,
@@ -1042,6 +1195,70 @@ mod tests {
             activate["inputSchema"]["properties"]["allow_alt_trick"]["type"],
             "boolean"
         );
+    }
+
+    #[test]
+    fn screenshot_all_publishes_ddapi_method_and_new_tools_have_tolerant_schemas() {
+        let catalog = tools_list();
+        let tools = catalog["tools"].as_array().unwrap();
+        let all = tools
+            .iter()
+            .find(|t| t["name"] == TOOL_SCREENSHOT_ALL)
+            .unwrap();
+        assert_eq!(
+            all["inputSchema"]["properties"]["method"]["enum"],
+            json!(["auto", "wgc", "ddapi"])
+        );
+        // 多点比色:anchor 必填字段与数值容错(整数字符串)
+        let multi = tools
+            .iter()
+            .find(|t| t["name"] == TOOL_PIXEL_MATCH_MULTI)
+            .unwrap();
+        assert_eq!(
+            multi["inputSchema"]["properties"]["anchor"]["required"],
+            json!(["x", "y", "color"])
+        );
+        assert_eq!(
+            multi["inputSchema"]["properties"]["max_matches"]["type"],
+            json!(["integer", "string"])
+        );
+        assert!(multi["inputSchema"].get("oneOf").is_none());
+        assert!(multi["inputSchema"].get("required").is_none()); // hwnd/monitor 排他性运行时强制
+                                                                 // 后台输入:required 明确,批次上限 64
+        let bg = tools
+            .iter()
+            .find(|t| t["name"] == TOOL_SEND_INPUT_BACKGROUND)
+            .unwrap();
+        assert_eq!(
+            bg["inputSchema"]["required"],
+            json!(["hwnd", "client_x", "client_y", "actions"])
+        );
+        assert_eq!(bg["inputSchema"]["properties"]["actions"]["maxItems"], 64);
+        assert_eq!(
+            bg["inputSchema"]["properties"]["actions"]["items"]["properties"]["kind"]["enum"],
+            json!(["click", "down", "up", "right_click", "move"])
+        );
+        // 后台文本:destructive 标注与 clear_first 布尔
+        let text = tools
+            .iter()
+            .find(|t| t["name"] == TOOL_SEND_TEXT_BACKGROUND)
+            .unwrap();
+        assert_eq!(text["annotations"]["destructiveHint"], true);
+        assert_eq!(
+            text["inputSchema"]["properties"]["clear_first"]["type"],
+            "boolean"
+        );
+        // 事件等待:只读、无 oneOf、超时上限
+        let wait = tools
+            .iter()
+            .find(|t| t["name"] == TOOL_WAIT_FOR_WINDOW)
+            .unwrap();
+        assert_eq!(wait["annotations"]["readOnlyHint"], true);
+        assert_eq!(
+            wait["inputSchema"]["properties"]["timeout_ms"]["maximum"],
+            60000
+        );
+        assert!(wait["inputSchema"].get("oneOf").is_none());
     }
 
     #[test]

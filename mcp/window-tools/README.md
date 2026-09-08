@@ -1,244 +1,332 @@
 # mcp-window-tools
 
 > Maintainers: architecture, internals, and Windows API pitfalls are documented in
-> [TECHNICAL.md](TECHNICAL.md).
+> [TECHNICAL.md](TECHNICAL.md) (Chinese).
 
-A personal Windows window/screenshot utility set exposed to Claude Code as a **stdio MCP** server.
-Standalone crate: it does not depend on the bridge and does not replace the `gemini-computer`
-native Computer Use executor.
+A personal Windows window/screenshot/input utility set exposed to Claude Code as a **stdio MCP**
+server. Standalone crate: it does not depend on the bridge and does not replace the
+`gemini-computer` native Computer Use executor. Current version **v0.8.0-experimental**,
+16 tools.
 
-## Tools
+The process is **PerMonitorV2 DPI aware**; all coordinates are **physical pixels** and,
+unless noted, `x`/`y`-style coordinates are relative to a window's **client area**.
 
-| Tool | Purpose |
-|---|---|
-| `list_windows` | Enumerate top-level windows, filter by title substring / process PID. Returns each window's hwnd (decimal string), pid, title, visibility, and screen rectangle. |
-| `get_window_rect` | Query one window's frame and client-area screen rectangles; pass an exact hwnd or `@active`. |
-| `screenshot_window` | Capture the rendered content of a specific window; `client_only` limits it to the client area, `hwnd: "@active"` captures the current foreground window. |
-| `screenshot_all` | Full-screen capture per monitor, each returned as a PNG plus a label. |
-| `resize_window` | Resize a precisely identified target window (optional move), subject to the target's own minimum size. |
-| `window_activate` | Request an exact hwnd to the foreground for manual comparison or layout inspection; Windows focus protection may reject it, and no input is sent. |
-| `pixel_scan_line` | Merge a vertical client-area pixel column into color bands for layout assertions (panel boundaries, control heights). |
-| `pixel_find_color` | Count pixels matching a color in a client-area region and return the minimum bounding box. |
-| `send_input` | Drive mouse/keyboard input into a window's client area; foreground-gated, whole-batch validated before emission. |
-| `inspect_element_at` | UIA hit-test at a client-area point; returns the accessibility element's control type, name, class, automation id, bounding rectangle, and keyboard focusability. |
-| `inspect_focused_element` | UIA properties of the currently keyboard-focused element; no window argument. |
-| `get_diagnostics` | Service self-check: version, uptime, request/error stats by tool and error code, GDI/USER handle counts, recent error ring. |
+## Tool overview
 
-Window targeting offers exactly one of: `hwnd` (decimal string, or `0x`/`0X`-prefixed hexadecimal,
-accepted since the hex-parse fix), `title` (title substring), or `pid` (the largest visible window
-of that process). One call must supply exactly one of these; `resize_window` accepts only the exact
-`hwnd` returned by `list_windows`, so it can never retarget a same-named window.
+| Tool | Kind | Purpose |
+|---|---|---|
+| `list_windows` | observe | Enumerate top-level windows; filter by title substring / class / PID. Returns hwnd, pid, title, class, visibility, minimized, elevation, and screen rect. |
+| `get_window_rect` | observe | Query one window's frame and client-area screen rects; exact hwnd or `@active`. |
+| `screenshot_window` | observe | Capture a window's rendered content (PNG/JPEG, optional downscale, incremental diff). |
+| `screenshot_all` | observe | Full-screen capture per monitor; `method`: `auto` (BitBlt) / `wgc` (composed frame) / `ddapi` (DXGI desktop duplication). |
+| `resize_window` | side effect | Resize a precisely identified window (optional move), subject to its own minimum size. |
+| `window_activate` | side effect | Request an exact hwnd to the foreground; Windows focus protection may reject it; no input is sent. |
+| `pixel_scan_line` | observe | Merge a vertical client-area pixel column into color bands for layout assertions. |
+| `pixel_find_color` | observe | Find a target color inside a client-area rect; returns match count and bounding box. |
+| `pixel_match_multi` | observe | Multi-point feature matching: anchor + offset chain, AVX2 engine, ~1 ms full-4K scan; client-area (hwnd) or monitor (DDAPI mapped-memory direct scan). |
+| `send_input` | side effect | Inject mouse/keyboard input into the foreground window; `move` follows a humanized cubic Bézier trajectory. |
+| `send_input_background` | side effect | Background-silent mouse: PostMessageW posting; no focus steal, physical cursor untouched. |
+| `send_text_background` | side effect | Background text write: EM_REPLACESEL whole-string replace on EDIT controls, WM_CHAR stream otherwise. |
+| `wait_for_window` | observe | WinEvent-driven window-appearance wait (zero polling); returns hwnd, rect, title, class, PID. |
+| `inspect_element_at` | observe | UIA hit-test at a client-area point. |
+| `inspect_focused_element` | observe | UIA properties of the keyboard-focused element. |
+| `get_diagnostics` | observe | Self-check: version, request/error stats, GDI/USER handle counts, recent errors. |
 
-The process is **PerMonitorV2 DPI-aware**; all coordinates are physical pixels.
+**Window targeting** is exactly one of: `hwnd` (decimal string, `0x` hex accepted) /
+`title` (substring) / `pid` (largest visible window of the process). Side-effect and
+single-query tools require an exact `hwnd` (`@active` = current foreground window).
 
 ## Tool parameters
 
 ### `list_windows`
 
-| Parameter | Type | Default | Notes |
+| Param | Type | Default | Notes |
 |---|---|---|---|
-| `title` | string | — | Title substring filter (case-insensitive) |
-| `class` | string | — | Window class substring filter (case-insensitive) |
-| `pid` | integer | — | Filter by process PID |
-| `visible_only` | boolean | `true` | Return only visible windows |
-| `limit` | integer | `100` | Maximum entries, cap `500` |
+| `title` | string | — | title substring (case-insensitive) |
+| `class` | string | — | class-name substring (case-insensitive) |
+| `pid` | integer | — | filter by process PID |
+| `visible_only` | boolean | `true` | only visible windows |
+| `interactive_only` | boolean | `true` | human-interactive heuristic (not minimized, ≥100×100, not a tool window, has title) |
+| `limit` | integer | `100` | max rows, capped at 500 |
 
-Each row also reports `class` and `minimized` alongside `hwnd`/`pid`/`title`/`visible`/`rect`.
+Each row reports `hwnd` (decimal string), `pid`, `title`, `class`, `visible`, `minimized`,
+`elevated` (true = injection from a non-elevated service would be silently dropped by UIPI),
+and the screen rect.
 
 ### `get_window_rect`
 
-| Parameter | Type | Notes |
+| Param | Type | Notes |
 |---|---|---|
-| `hwnd` | string | Exact window handle, or `@active` |
-
-Returns the frame rectangle and the client-area rectangle in screen coordinates.
+| `hwnd` | string | exact hwnd, or `@active` |
 
 ### `screenshot_window`
 
-| Parameter | Type | Default | Notes |
+| Param | Type | Default | Notes |
 |---|---|---|---|
-| `hwnd` | string | — | Window handle (decimal, or `0x`-prefixed hex); `@active` allowed |
-| `title` | string | — | Window title substring |
-| `pid` | integer | — | Window's process PID |
-| `client_only` | boolean | `false` | Client area only, excluding title bar and borders |
-| `method` | string | `auto` | Capture method: `auto`=PrintWindow, tries WGC then falls back to screen sampling on near-black/failure; `wgc`=Windows Graphics Capture GPU-composited frame (experimental) |
-| `incremental` | boolean | `false` | Incremental diff (experimental, `method=wgc` only): first call returns the full baseline frame, later calls return only changed-region images, text-only when unchanged |
+| `hwnd` / `title` / `pid` | — | — | exactly one; `hwnd` may be `@active` |
+| `client_only` | boolean | `false` | client area only |
+| `method` | string | `auto` | `auto`=PrintWindow, then WGC on near-black/failure, then screen sampling; `wgc`=Windows Graphics Capture composed frame (experimental) |
+| `format` | string | `png` | `png` lossless (pixel assertions); `jpeg` lossy, 60-90% smaller |
+| `quality` | integer | `85` | jpeg quality 1-100 |
+| `max_dim` | integer | `0` | output longest-edge cap (bilinear downscale); 0 = no limit |
+| `incremental` | boolean | `false` | incremental diff (experimental; `method=wgc` + png + `max_dim=0` only) |
 
-Exactly one of `hwnd` / `title` / `pid` is required. Minimized windows are
-deterministically rejected with `WINDOW_NOT_VISIBLE` under both methods (fast
-structured error).
+Response text annotates the actual source (`fallback=wgc (...)`, `fallback=screen (...)`)
+and marks reused cached frames. Minimized windows deterministically return
+`WINDOW_NOT_VISIBLE` (fast structured error, no timeout hang).
 
 ### `screenshot_all`
 
-| Parameter | Type | Default | Notes |
+| Param | Type | Default | Notes |
 |---|---|---|---|
-| `method` | string | `auto` | Capture method: `auto`=screen BitBlt (no cursor); `wgc`=Windows Graphics Capture composited frame (experimental, includes cursor) |
+| `method` | string | `auto` | `auto`=screen BitBlt (no cursor); `wgc`=WGC composed frame (with cursor); `ddapi`=DXGI desktop duplication (experimental, no cursor, per-monitor BitBlt fallback annotated) |
+| `format` | string | `png` | `png` / `jpeg` |
+| `quality` | integer | `85` | jpeg quality |
+| `max_dim` | integer | `0` | output longest-edge cap |
 
-One PNG per monitor, plus the label of each display.
+One image per monitor with dimensions, `method=`, and actual `source=screen/wgc/ddapi/bitblt`;
+a failing monitor does not abort the rest.
 
 ### `resize_window`
 
-| Parameter | Type | Notes |
+| Param | Type | Notes |
 |---|---|---|
-| `hwnd` | string | Exact handle returned by `list_windows` |
-| `width` | integer (min 40) | Target width |
-| `height` | integer (min 40) | Target height |
-| `x` | integer | Optional target X |
-| `y` | integer | Optional target Y |
-
-This is a side-effectful layout operation. It is constrained by the target window's own minimum size.
+| `hwnd` | string | exact hwnd only (no title/pid) |
+| `width` / `height` | integer (≥40) | target size (edge ≤7680) |
+| `x` / `y` | integer | optional target screen position |
 
 ### `window_activate`
 
-| Parameter | Type | Notes |
-|---|---|---|
-| `hwnd` | string | Exact window handle, or `@active` |
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `hwnd` | string | — | exact hwnd or `@active` |
+| `allow_alt_trick` | boolean | `false` | last-resort Alt-key injection into the current foreground window (side effect) |
 
-Requests foreground placement; it never sends mouse or keyboard input.
+Activation ladder: direct → AttachThreadInput → (optional) Alt trick; the response reports
+which level took effect (`activation_method`). No mouse/keyboard input is sent otherwise.
 
 ### `pixel_scan_line`
 
-| Parameter | Type | Default | Notes |
+| Param | Type | Default | Notes |
 |---|---|---|---|
-| `hwnd` | string | — | Exact handle, or `@active` |
-| `x` | integer | — | Column to scan (client-area X) |
-| `y_from` | integer | — | First row (client-area Y, inclusive) |
-| `y_to` | integer | — | Row bound (client-area Y, exclusive) |
-| `tolerance` | integer | `2` | Per-channel difference merging adjacent rows (0–255) |
-| `min_band` | integer | `2` | Bands shorter than this are dropped |
-| `max_bands` | integer | `256` | Band cap (1–256) |
-
-Samples the vertical column `x` from the on-screen window client area and merges consecutive
-rows whose colors differ by at most `tolerance` per channel into bands. Each band reports
-`y_from`/`y_to` (client-area rows, inclusive), `height`, and the average color `#RRGGBB`.
-Useful for layout assertions (panel boundaries, control heights, blank placeholders).
-Occluded or minimized areas are sampled as displayed on screen.
+| `hwnd` | string | — | exact hwnd or `@active` |
+| `x` | integer | — | scan column (client X) |
+| `y_from` / `y_to` | integer | — | row range (client Y, `y_to` exclusive) |
+| `tolerance` | integer | `2` | per-channel delta for band merging (0-255) |
+| `min_band` | integer | `2` | shorter bands ignored |
+| `max_bands` | integer | `256` | band cap (1-256) |
+| `method` | string | `auto` | `auto`=screen sampling (occlusion annotation); `wgc`=DWM frame (occlusion-accurate, async) |
 
 ### `pixel_find_color`
 
-| Parameter | Type | Notes |
-|---|---|---|
-| `hwnd` | string | Exact handle, or `@active` |
-| `x` / `y` | integer | Region top-left (client-area) |
-| `width` / `height` | integer (≥1) | Region size |
-| `color` | string | Target color `#RRGGBB` (hash optional) |
-| `tolerance` | integer (0–255, default `0`) | Per-channel diff |
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `hwnd` | string | — | exact hwnd or `@active` |
+| `x` / `y` | integer | — | region origin (client) |
+| `width` / `height` | integer (≥1) | — | region size |
+| `color` | string | — | `#RRGGBB` (`#` optional) |
+| `tolerance` | integer | `0` | per-channel delta (0-255) |
+| `method` | string | `auto` | same as `pixel_scan_line` |
 
-Searches the client-area region for matching pixels; returns `match_count` and the minimum
-bounding box (`bbox`, null when nothing matches). Complements `pixel_scan_line` for assertions
-like "this panel is exactly 74 px tall at y=773".
+### `pixel_match_multi`
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `hwnd` | string | — | exact hwnd or `@active` (mutually exclusive with `monitor`; client coords) |
+| `monitor` | integer (≥1) | — | monitor index (mutually exclusive with `hwnd`; monitor coords; DDAPI direct scan) |
+| `anchor` | object | — | `{x, y, color, tolerance}`: anchor color `#RRGGBB` and expected position (result ordering) |
+| `offsets` | array | `[]` | `{offset_x, offset_y, color, tolerance}` chain (≤64 items) |
+| `search_rect` | object | full area | `{x, y, width, height}` search region |
+| `method` | string | `auto` | hwnd-mode source: `auto` screen (occlusion annotation) / `wgc` DWM frame |
+| `max_matches` | integer | `32` | result cap (1-4096) |
+
+Semantics: find every pixel matching the anchor color in `search_rect`, verify the offset
+chain per candidate (each offset has its own color/tolerance and must stay inside
+`search_rect`), sort by Euclidean distance to the expected anchor, return the first
+`max_matches`. The response includes `matches`, `candidate_count`, `match_count`
+(pre-truncation), `truncated`, `engine` (avx2/scalar), and `capture_elapsed_ms` /
+`scan_elapsed_ms`.
+
+Performance: AVX2 full-4K (3840×2160) anchor scan measured at **~1 ms**
+(`cargo test --release -- --ignored` reproduces it); the pathological all-pixels-match
+input takes ~20 ms, dominated by result materialization. Monitor mode scans the mapped
+DDAPI staging memory directly (no whole-image copy); on DDAPI failure (locked session /
+static desktop with no cached frame) it falls back to screen sampling, annotated via
+`fallback`.
 
 ### `send_input`
 
-| Parameter | Type | Default | Notes |
+| Param | Type | Default | Notes |
 |---|---|---|---|
-| `hwnd` | string | — | Exact handle, or `@active` |
-| `activate` | boolean | `false` | Request foreground placement first; Windows focus protection may refuse |
-| `delay_ms` | integer | `50` | Delay between actions (0–5000) |
-| `actions` | array | — | Ordered input actions (below), 1–128 items |
-
-Each action: `{kind, x, y, button, delta, vkey, steps}` — only the fields relevant to the kind
-matter. Mouse coordinates are client-area physical pixels; `steps` (1–200) interpolates a
-`move` so a held button becomes a drag.
+| `hwnd` | string | — | exact hwnd or `@active` |
+| `activate` | boolean | `false` | bring to front first (same ladder as `window_activate`) |
+| `allow_alt_trick` | boolean | `false` | last-resort activation (side effect) |
+| `delay_ms` | integer | `50` | inter-action delay (0-5000) |
+| `actions` | array | — | ordered actions (1-128 items) |
 
 | kind | fields | effect |
 |---|---|---|
-| `move` | `x`, `y`, `steps` | Move pointer (interpolated when `steps` > 1) |
-| `click` | `x`, `y`, `button` | Press + release |
-| `down` / `up` | `x`, `y`, `button` | Press or release a button (`left`/`right`/`middle`) |
-| `scroll` | `x`, `y`, `delta` | Wheel notch (e.g. 120 per notch, positive = up) |
-| `key_tap` / `key_down` / `key_up` | `vkey` | Virtual key: integer 0–255 or a name (`Enter`, `A`, `F5`, `Left`, `Ctrl`, ...) |
+| `move` | `x`, `y`, `steps` | move pointer; `steps` (1-200) interpolation; drag while held |
+| `click` / `down` / `up` | `x`, `y`, `button` | press+release / press / release (`left`/`right`/`middle`) |
+| `scroll` | `x`, `y`, `delta` | wheel notches (120/notch, positive = up) |
+| `key_tap` / `key_down` / `key_up` | `vkey` | virtual key: 0-255 or name (`Enter`, `A`, `F5`, `Left`, `Ctrl`, …) |
 
-**Safety:** the target must remain the foreground window throughout the batch, and every mouse
-coordinate must stay inside its current client area. The whole batch is validated before any
-input is emitted; `down`/`key_down` must be balanced by `up`/`key_up` in the same batch. Keys
-still held when execution fails are released automatically. Scheduled delays are capped at 60
-seconds per batch. This is the only tool with significant side effects besides `resize_window`;
-invoke it only in trusted conversations.
+Since v0.8.0, `move` follows a **humanized trajectory**: cubic Bézier with random
+curvature + ease-in/out speed profile + ±2 px Gaussian jitter per step + Gaussian
+inter-step delay jitter (clamped to [0.5, 1.2]×mean), landing exactly on target.
 
-### `inspect_element_at`
+Safety: the window must stay foreground for the whole batch; every coordinate must be in
+the current client area; the batch is validated before any real input; `down`/`key_down`
+must be balanced within the batch; failure paths auto-release held keys; scheduled delay
+≤60 s; `UIPI_BLOCKED` if the target is elevated and this service is not.
 
-| Parameter | Type | Notes |
+### `send_input_background`
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `hwnd` | string | — | parent window exact hwnd or `@active` |
+| `client_x` / `client_y` | integer | — | batch base point (client); actions inherit by default |
+| `delay_ms` | integer | `50` | inter-action delay (0-5000) |
+| `actions` | array | — | ordered actions (1-64 items) |
+
+| kind | effect |
+|---|---|
+| `click` / `down` / `up` | press+release / press / release; `button` `left`/`right`/`middle`, default left |
+| `right_click` | right press+release |
+| `move` | post WM_MOUSEMOVE |
+
+Implementation: `RealChildWindowFromPoint` hit-testing to the deepest child → child-local
+coordinates → `PostMessageW` of `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/`WM_LBUTTONUP` etc.
+The response reports the hit child hwnd, class, and local coordinates per action.
+**No focus steal, physical cursor untouched, foreground unchanged**; `down` must be
+balanced by `up` in the same batch.
+
+Honest boundary: messages are only posted; apps using RawInput/DirectInput or with a
+broken message pump may not respond — verify with a screenshot or pixel assertion;
+`UIPI_BLOCKED` when the target is elevated.
+
+### `send_text_background`
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `hwnd` | string | — | target input control hwnd (`@active` allowed) |
+| `text` | string | — | text to write (≤4096 chars) |
+| `clear_first` | boolean | `false` | clear before write (EDIT controls only) |
+
+Standard EDIT/RichEdit controls: `EM_SETSEL` (optionally select-all) + `EM_REPLACESEL`
+system-marshaled whole-string replace — instant, no keystroke dropout; other controls:
+`WM_CHAR` stream (UTF-16 code units posted one by one, surrogate pairs split, newlines
+normalized to CR). 5 s send timeout against hung threads; no focus steal, keyboard state
+untouched. Locate the input control with `inspect_element_at` first.
+
+### `wait_for_window`
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `title_regex` | string | — | window-title regex (Rust regex syntax, case-insensitive by default) |
+| `class` | string | — | class-name substring (case-insensitive) |
+| `pid` | integer | — | exact PID |
+| `timeout_ms` | integer | `5000` | timeout (1-60000) |
+| `case_insensitive` | boolean | `true` | title-regex case sensitivity |
+
+At least one filter (AND-combined). A process-wide singleton WinEvent hook listens for
+`EVENT_OBJECT_CREATE` / `EVENT_OBJECT_SHOW` (top-level) / `EVENT_SYSTEM_FOREGROUND` and
+wakes the waiter directly; an already-existing match returns immediately
+(`source=existing`). Timeout is a normal response with `found=false` (not an error) —
+the zero-polling replacement for repeated `list_windows` calls.
+
+### `inspect_element_at` / `inspect_focused_element`
+
+| Param | Type | Notes |
 |---|---|---|
-| `hwnd` | string | Exact handle, or `@active` |
-| `x` / `y` | integer | Probe point (client-area, physical pixels) |
+| `hwnd` | string | exact hwnd or `@active` (`inspect_element_at` only) |
+| `x` / `y` | integer | probe point in client coords (`inspect_element_at` only) |
 
-UIA hit-test at the given client-area point: converts it to screen coordinates and calls
-`ElementFromPoint`, then reports the accessibility element's control type (name plus numeric UIA
-id), name, class name, automation id, bounding rectangle (physical pixels), and keyboard
-focusability. If another window covers the point, the occluding element is returned (screen
-as-is). Chromium-based apps may materialize their accessibility tree lazily; a first query can
-yield only the `RenderWidgetHostHWND` layer.
+UIA accessibility-tree queries returning control type (name + type code), name, class,
+AutomationId, screen bounding rect, and keyboard-focusability. Chromium accessibility
+trees activate lazily; targets without a UIA provider return `UIA_UNAVAILABLE`.
 
-### `inspect_focused_element`
+### `get_diagnostics`
 
-No parameters. Returns the UIA properties of the system's currently keyboard-focused element.
-Apps without a UIA provider fail with `UIA_UNAVAILABLE`.
+No parameters. Returns version, uptime, request/error stats (grouped by tool and error
+code), GDI/USER handle counts, and the last 20 errors. For per-request tracing, restart
+with `WT_LOG_LEVEL=info`.
 
-## HWND formats
+## HWND format
 
-hwnd values are decoded as decimal by default; a `0x`/`0X` prefix selects radix-16 parsing, with a
-u64→i64 range check. Invalid or out-of-range values fail with an explicit error naming the value
-attempted. `@active` is only valid as an `hwnd` value (e.g. `{"hwnd":"@active"}`); it reads the
-current Windows foreground HWND and never does fuzzy title matching.
+Decimal by default; `0x`/`0X` prefix parses as hexadecimal. `@active` is only valid as
+the `hwnd` value (`{"hwnd":"@active"}`).
 
-## Screenshot budgets
+## Error contract
 
-- `screenshot_window` keeps the original size, up to 7680 px per side and 12 megapixels total;
-  beyond that, shrink the target window with `resize_window` first.
-- `screenshot_all` guarantees unaltered output for up to three UHD 4K (3840×2160) displays with a
-  total budget of 24,883,200 pixels. Above the budget every monitor is scaled by the same ratio and
-  the result reports original and actual sizes.
-- `PrintWindow` is not guaranteed for GPU-accelerated, protected, or unresponsive windows.
-  Near-black output (or a failed `PrintWindow`) automatically falls back to on-screen sampling of
-  the same rectangle; the response text then carries a `fallback=` annotation and occluded areas
-  appear as currently displayed.
+Tool errors keep the MCP shape (`content[text]` + `isError: true`) and add machine-readable
+`error_code` and `retryable` fields. Codes are stable (additive only):
 
-This toolset is for window observation, layout verification, and UI driving. Mouse/keyboard
-input (`send_input`) changes real desktop state, so it is gated by a foreground check and
-should be invoked only in trusted conversations. There is no clipboard or process control.
-Desktop content enters the current Claude Code session as MCP tool results, so invoke it only
-in trusted conversations.
+| Code | Meaning | Retryable |
+|---|---|---|
+| `INVALID_ARGUMENT` | missing/out-of-range/malformed args, unbalanced batch | no |
+| `LIMIT_EXCEEDED` | size/pixel/batch/schedule budget exceeded | no |
+| `WGC_UNAVAILABLE` | WGC unavailable (device/DRM/no composition) | no |
+| `DDAPI_UNAVAILABLE` | DDAPI unavailable (locked session/no frame, no cache) | no |
+| `UIPI_BLOCKED` | elevated target vs non-elevated service | no |
+| `INTERNAL_ERROR` | unexpected internal failure | no |
+| `WINDOW_NOT_FOUND` | window gone / invalid handle | yes |
+| `WINDOW_NOT_VISIBLE` | exists but invisible / minimized | yes |
+| `WINDOW_HUNG` | target not responding | yes |
+| `NOT_FOREGROUND` | target not foreground | yes |
+| `ACTIVATION_DENIED` | focus protection rejected activation | yes |
+| `CAPTURE_FAILED` | GDI capture/encode failure | yes |
+| `INPUT_FAILED` | execution-time input failure | yes |
+| `UIA_UNAVAILABLE` | UIA service/element unavailable | yes |
 
-`window_activate`, `resize_window`, and `send_input` are state-changing operations;
-`list_windows`, `get_window_rect`, `screenshot_window`, `screenshot_all`, `pixel_scan_line`,
-and `pixel_find_color` are read-only observation.
+## Capture budgets
 
-## Building
+- `screenshot_window` keeps original size: edge ≤7680 px, total ≤12 MP; use
+  `resize_window` first if larger.
+- `screenshot_all` keeps up to three UHD 4K (3840×2160) monitors at original size; beyond
+  that everything scales by one uniform factor (reported).
+- Captures and UIA queries run on worker threads with a 15 s hard timeout; hung windows
+  can never stall the service.
+
+## Build & test
 
 ```bash
 cd mcp/window-tools
 cargo build --release
-# Output: target/x86_64-pc-windows-msvc/release/mcp-window-tools.exe
+# output: target/x86_64-pc-windows-msvc/release/mcp-window-tools.exe
 ```
-
-Tests (14) cover hwnd parsing (decimal, `0x`/`0X` hex, whitespace, negatives, overflow, invalid
-values), color parsing, color-band merging, vkey names, input-batch safety constraints, panic
-isolation, and the tool list:
 
 ```bash
-cargo test --locked
+cargo test --locked                       # 91 unit tests
+cargo test --release -- --ignored         # 4K scan perf smoke (prints measured ms)
+pwsh -File tests/run-e2e.ps1              # E2E regression (87 main + 7 hung; interactive desktop)
+cargo fmt --check && cargo clippy --all-targets -- -D warnings
 ```
 
-## Deployment and registration
+## Deployment
 
 ```powershell
-Copy-Item target\x86_64-pc-windows-msvc\release\mcp-window-tools.exe `
-  "C:\Program Files\ClaudeCodeBridge\claude-mcp-window-tools.exe"
-# In ~/.claude.json under mcpServers add:
+pwsh -File mcp/window-tools/deploy.ps1
+# build release → smoke test → stop running MCP process → backup → overwrite
+# target: C:\Program Files\ClaudeCodeBridge\claude-mcp-window-tools.exe
+# registration (~/.claude.json mcpServers):
 # "window-tools": {"type": "stdio", "command": "C:\\Program Files\\ClaudeCodeBridge\\claude-mcp-window-tools.exe", "args": []}
 ```
 
-Restart the Claude Code session afterwards; new MCP servers load only at session start.
-
-The crate is standalone and independent of the bridge installer: no bridge release packages it,
-and MCP registration is per-user in `~/.claude.json`.
+Claude Code reconnects the MCP on the next tool call — the new binary takes effect
+immediately (no session restart needed).
 
 ## Protocol
 
-Newline-delimited JSON-RPC 2.0 (the same pattern as `claude-computer-host`):
-`initialize` → `notifications/initialized` → `tools/list` → `tools/call`; tool failures are
-returned as `isError: true` text blocks; protocol version `2025-11-25` (compatible with
-`2025-06-18` / `2025-03-26`). Every request is wrapped in Rust panic-unwind isolation: an
-unwinding panic returns a `-32603` error and the stdio session keeps serving. Native process
-failures such as access violations, aborts, and OOM aborts are outside this guarantee.
+Newline-delimited JSON-RPC 2.0: `initialize` → `notifications/initialized` → `tools/list`
+→ `tools/call`; protocol version `2025-11-25` (accepts `2025-06-18` / `2025-03-26`).
+Every request is isolated with Rust panic unwinding: an unwindable panic returns a
+`-32603` error and the service keeps running. stdout is the only protocol channel;
+diagnostics go to stderr or the `WT_LOG_FILE` log file.
+
+## Usage boundary
+
+`window_activate`, `resize_window`, `send_input`, `send_input_background`,
+`send_text_background` mutate desktop state; everything else is read-only observation.
+Desktop content enters the current session as MCP tool results — use only in trusted
+sessions.

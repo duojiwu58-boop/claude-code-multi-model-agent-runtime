@@ -927,7 +927,8 @@ fn evict_lru(sessions: &mut Vec<CachedSession>) {
 }
 
 /// D3D11 设备:硬件优先,WARP 兜底(远程桌面等无硬件加速场景)。
-fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext), ToolError> {
+/// D3D11 设备创建(硬件→WARP 兜底):WGC 与 DDAPI 共用,进程内缓存各自持有。
+pub(crate) fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext), ToolError> {
     for driver in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
@@ -945,17 +946,13 @@ fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext), ToolError> {
             )
         };
         if hr.is_ok() {
-            crate::log_info!("wgc: D3D11 设备就绪 driver={}", driver.0);
+            crate::log_info!("d3d11: 设备就绪 driver={}", driver.0);
             return Ok((
                 device.expect("HRESULT 成功时设备必已写入"),
                 context.expect("HRESULT 成功时上下文必已写入"),
             ));
         }
-        crate::log_debug!(
-            "wgc: D3D11 driver={} 创建失败: {}",
-            driver.0,
-            hr.unwrap_err()
-        );
+        crate::log_debug!("d3d11: driver={} 创建失败: {}", driver.0, hr.unwrap_err());
     }
     Err(wgc_err(
         "创建 D3D11 设备失败（硬件与 WARP 均不可用）".to_string(),

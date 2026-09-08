@@ -9,360 +9,299 @@
 以 **stdio + 换行分隔 JSON-RPC 2.0** 提供窗口观察、布局验证与 UI 驱动工具。
 进程为 **PerMonitorV2 DPI 感知**,与 claude-computer-host 的协议约定一致。
 
-代码分层(2026-09-08 起为 lib + 薄 bin,模块边界见 `src/lib.rs` 文档):
+代码分层(自 v0.2.0 起为 lib + 薄 bin):
 
 ```
-protocol.rs  handle_request → handle_request_isolated      initialize / ping / tools/list / tools/call
-             └─ catch_unwind(AssertUnwindSafe(handle_request))   ← 单请求 panic unwind 隔离
-             └─ serve_stdio:每请求统计埋点 + 分级日志(stdout 绝不写诊断)
-tools.rs     工具目录/调度/选择器解析 + 工具 schema(tools_list)
-backend/     window.rs(枚举/矩形/resize/activate) capture.rs(GDI 采集/预算/RAII/超时)
-             input.rs(输入批次预校验/执行/释放守卫)
-parse.rs     纯解析原语:json_i32 / json_u32 / parse_hwnd_str / parse_hex_color
-error.rs     稳定错误契约:ToolError { code, message, retryable }
-log.rs       分级日志(stderr / WT_LOG_FILE,WT_LOG_LEVEL 控级)
+protocol.rs    handle_request → handle_request_isolated     initialize / ping / tools/list / tools/call
+               └─ catch_unwind(AssertUnwindSafe(...))       ← 单请求 panic unwind 隔离
+               └─ serve_stdio:每请求统计埋点 + 分级日志(stdout 绝不写诊断)
+tools.rs       工具目录/调度/选择器解析 + 工具 schema(tools_list)
+parse.rs       纯解析原语:json_i32 / json_u32 / parse_hwnd_str / parse_hex_color
+error.rs       稳定错误契约:ToolError { code, message, retryable },14 个稳定码
+log.rs         分级日志(stderr / WT_LOG_FILE,WT_LOG_LEVEL 控级)
 diagnostics.rs 运行统计/错误环形缓冲/GDI 自检(get_diagnostics 工具)
+backend/
+  window.rs     窗口枚举/矩形/标题(超时读取)/resize/activate(升级阶梯)/遮挡走查
+  capture.rs    GDI 采集:PrintWindow/BitBlt、预算、RAII 句柄守卫、worker+硬超时
+  wgc.rs        WGC 合成帧:设备缓存 + 会话 LRU 缓存 + 增量差分 + 显示器路径
+  ddapi.rs      DXGI Desktop Duplication:会话按显示器矩形缓存 + staging Map 直扫
+  input.rs      前台输入:批次预校验、配平、RAII 释放守卫、贝塞尔插值执行
+  bezier.rs     拟人轨迹纯数学:xorshift64*、三阶贝塞尔、缓入缓出、高斯抖动
+  background.rs 后台输入:PostMessageW 直投(鼠标) + EM_REPLACESEL/WM_CHAR(文本)
+  winevent.rs   WinEvent hook 线程 + 等待者表(wait_for_window)
+  pixelsimd.rs  找色引擎:AVX2(8 像素/32 字节)+ 标量回退 + 偏移链校验
+  pixelmatch.rs pixel_match_multi 编排:参数解析、采集源选择、排序截断
+  uia.rs        UIA 查询(COM 限定 worker 线程)
+  elevation.rs  UIPI 提权探测(OpenProcessToken ERROR_ACCESS_DENIED 技巧)
 ```
 
-运行模型:**单线程、无内部会话状态、顺序处理**。每个 stdin 行是一个完整请求,处理完再写一行响应。
-窗口布局与全局鼠标/键盘状态属于进程外部状态,不在“无内部会话状态”的含义内。
-例外:截图采集在 **worker 线程**执行并限时等待(见 §5.3),但同一时刻仍只有一个请求在处理。
+依赖(windows 0.61.3 与桥接器同版本):`png` / `jpeg-encoder` / `base64` / `serde_json` /
+`regex`(v0.8.0 起,wait_for_window 标题正则)。无 tokio、无 rand —— 异步打通用
+`std::sync::mpsc`,随机源为自研 xorshift64*(§7.3)。
+
+运行模型:**stdio 主循环单线程顺序处理**;可能阻塞的操作(截图、UIA)在
+**worker 线程**执行 + 硬超时;WinEvent 回调在**独立 hook 线程**的泵循环内
+(§5.4)。同一时刻只有一个工具请求在执行。
 
 ## 2. 坐标与 DPI 模型
 
 | 类别 | 语义 |
 |---|---|
-| 屏幕坐标 | 虚拟桌面**物理像素**(PerMonitorV2 下 GetWindowRect / ClientToScreen 均返回物理值,不受单显示器缩放影响) |
+| 屏幕坐标 | 虚拟桌面**物理像素**(PerMonitorV2 下 GetWindowRect/ClientToScreen 均返回物理值) |
 | `window_rect` | 窗口外框屏幕矩形(含标题栏/边框/阴影) |
-| `client_rect` | 客户区屏幕矩形(不含标题栏、边框、菜单) |
-| `pixel_scan_line` / `pixel_find_color` / `send_input` | **客户区相对坐标**,工具内部用 `client_rect_of` 换算；输入坐标还必须位于当前客户区内 |
+| `client_rect` | 客户区屏幕矩形(`client_rect_of` = GetClientRect + 两角 ClientToScreen,返回屏幕坐标矩形) |
+| 像素/输入工具的 `x`/`y` | **客户区相对物理像素**;`pixel_match_multi` 的 monitor 模式为**显示器相对** |
+| 后台输入的命中 | 客户区坐标 → 屏幕坐标 → `RealChildWindowFromPoint` → 子控件局部坐标 |
 
-理解:所有输入坐标都是"相对客户区"的物理像素;多点屏上不同缩放率不影响一致性,
-因为进程 DPI 感知下一切 API 都按物理像素工作。
+## 3. 目标窗口解析
 
-## 3. 目标窗口解析(所有工具的前置)
+`resolve_target`(观察类工具):`hwnd` / `title` / `pid` 三选一,selector 计数强制互斥;
+`@active` 是 `hwnd` 值的快捷方式(读前台窗口,不做模糊匹配)。模糊选择时可见优先、
+前台优先、面积最大优先;唯一匹配但不可见返回 `WINDOW_NOT_VISIBLE`。
 
-### 3.1 定位方式
+`resolve_explicit_hwnd`(副作用与单查工具):只接受 `hwnd`(可为 `@active`),
+title/pid 直接拒绝 —— 多窗口场景下防误操作。
 
-`resolve_target` 支持三种**互斥**的定位方式,一次调用必须且只能提供一种
-(selector 计数校验,防止模糊标题与 PID/HWND 叠加掩盖调用者意图):
+## 4. 采集管线
 
-| 方式 | 语义 |
-|---|---|
-| `hwnd` | 十进制字符串/整数 / `0x` 前缀十六进制 / `@active`(取当前前台窗口,要求可见) |
-| `title` | 标题子串(忽略大小写)模糊匹配 |
-| `pid` | 进程 PID,取该进程**面积最大的可见窗口** |
-
-`@active` **只**在 `hwnd` 槽位有效,不参与模糊匹配 —— 保证截图前后对比的目标稳定。
-
-### 3.2 模糊定位的优先级
-
-可见窗口池(无可见候选时才回退全量)→ **前台窗口优先** → **面积从大到小**。
-匹配到但不可见时明确报错。
-
-### 3.3 副作用工具的强制约束
-
-`resize_window` / `window_activate` / `pixel_scan_line` / `pixel_find_color` / `send_input`
-走 `resolve_explicit_hwnd`:**必须且只能给 hwnd**,不接受 title/pid 模糊定位 ——
-避免在多窗口场景对同名窗口误操作。
-
-### 3.4 历史 bug 与修复
-
-`parse_hwnd_str`(commit 22bf17e):旧实现剥掉 `0x` 前缀后仍按十进制解析,
-含 A-F 的十六进制句柄(如 `0x12E05FE`)必然失败,与错误提示承诺的 hex 支持矛盾。
-现实现:带 `0x`/`0X` 前缀按 16 进制解析,否则十进制;`u64 → i64` 范围检查。
-
-## 4. 工具实现详解
-
-### 4.1 list_windows
-
-- `EnumWindows` 回调收集 `WindowEntry {hwnd, pid, title, class, visible, minimized, rect}`;
-- 过滤:`title` / `class`(子串,忽略大小写)/ `pid` / `visible_only`;
-- 排序:可见优先 → 标题非空优先 → 面积从大到小;截断 `limit`(上限 500);
-- 每行额外输出 `class`(GetClassNameW)与 `minimized`(IsIconic)。
-
-### 4.2 screenshot_window(PrintWindow 路径)
+### 4.1 窗口截图 `screenshot_window`
 
 ```
-GetWindowRect/ClientToScreen → CreateCompatibleBitmap(原尺寸) → CreateCompatibleDC
-→ PrintWindow(hwnd, hdc, client_only ? PW_CLIENTONLY : PW_RENDERFULLCONTENT)
-→ GetDIBits(32bpp DIB, biHeight=-h 自上而下) → BGRA → RGBA → PNG
+method=auto(默认):
+  IsHungAppWindow 预检 → WINDOW_HUNG
+  IsIconic 预检 → WINDOW_NOT_VISIBLE(确定性拒绝,不挂超时)
+  PrintWindow(PW_RENDERFULLCONTENT / PW_CLIENTONLY) → GetDIBits 32bpp BGRA
+    ├─ 可用(近纯黑检测:亮度<8 占比>98% 判黑,只按 RGB,alpha 不可靠)→ 编码输出
+    └─ 近纯黑/失败 → WGC 缓存会话(§5.1) → 成功标注 fallback=wgc (...)
+                     └─ WGC 失败 → 屏幕 BitBlt 采样(遮挡按屏幕现状)标注 fallback=screen (...)
+method=wgc: 直接 WGC 缓存会话(被遮挡窗口也产出完整内容;DRM 拒绝/黑区;
+            最小化确定性 WINDOW_NOT_VISIBLE;Win10 无去边框)
+incremental=true(仅 wgc): 基线全帧 → 逐行像素差分聚带(≤8 区,超则合并外接盒)
+             → 变化区域裁剪 PNG / 纯文本零图像。不信任原生 DirtyRegions:
+             帧池缓冲有限,长间隔脏区相对的是中间帧,会漏报。
 ```
 
-关键点:
+来源标注是**契约的一部分**(`fallback=wgc|screen (...)`,带原因),E2E 有断言。
 
-- **PW_RENDERFULLCONTENT**:捕获窗口自身渲染内容,**可截被遮挡窗口**;部分 GPU 加速/
-  受保护/无响应窗口可能失败 —— 失败即报错,**不退化为全屏截图**;
-- 位图按原尺寸分配,超大窗口在分配前被预算拒绝(见 §6);
-- 单窗口预算:单边 7680 px、总计 1200 万像素。
-- **auto 链**(v0.4.1):PrintWindow 近纯黑或失败 → 先试 WGC 合成帧 → 仍不可用再
-  屏幕采样;来源经 `fallback=` 动态标注,无标注 = PrintWindow 直出(零 WGC 开销)。
+### 4.2 全屏截图 `screenshot_all`
 
-### 4.2a screenshot_window(WGC 路径, v0.4.0 / v0.5.0)
+| method | 来源 | 光标 | 备注 |
+|---|---|---|---|
+| `auto` | 屏幕 BitBlt(StretchBlt 预算缩放) | 不含 | 默认;免疫 PrintWindow 类黑屏 |
+| `wgc` | 每屏一次性 `CreateForMonitor` 会话(不落缓存) | 含 | 首帧预算 3s;无合成场景单屏报错 |
+| `ddapi` | DXGI Desktop Duplication(§5.2) | 不含 | 单屏失败回退 BitBlt,`source=bitblt` 标注 |
 
-```
-IsIconic 预检(最小化 → WINDOW_NOT_VISIBLE,v0.6.1)→ rect 预检
-→ 全局缓存 Mutex → 设备缓存(硬件→WARP,只建一次)
-→ 会话缓存(键 = hwnd, client_only, incremental;LRU 上限 4;IsWindow 清理)
-→ 新会话:互操作 CreateForWindow → 自由线程帧池(2 缓冲)→ 会话
-  → 增量会话禁光标捕获 → StartCapture → 首帧轮询(100ms×10s 预算)
-→ 既有会话:立即 TryGetNextFrame → 空则等 100ms(DWM 交付周期)再取一次
-→ 帧 → IDirect3DDxgiInterfaceAccess::GetInterface → staging 拷贝 → BGRA
-```
+总预算:三台 UHD 4K(3840×2160)不缩放;超出按统一比例 `resize_bgra` 双线性缩放
+(与 StretchBlt 语义对齐),`max_dim` 再套一层。
 
-关键点(v0.5.0):
+### 4.3 像素采样源
 
-- **缓存动机**(探针实测,902x632):每次全新建链 210-230ms,其中设备 ~60ms +
-  CreateForWindow ~34ms + 首帧 ~100ms + 编码 ~4ms;缓存后:窗口有变化 ~10-30ms,
-  静态窗口 ~100ms(等待确认无新帧)。
-- **无新帧 = 内容未变**:静态窗口 DWM 不产帧,`TryGetNextFrame` 以 null + S_OK
-  返回(windows-core 表现为 `Err(Error::empty())`);全帧复用上次 BGRA 重编码
-  (语义等价),增量直接判"无变化"。100ms 等待窗口兜住与动作并发竞态的调用,
-  避免误报。
-- **增量差分**(`incremental=true`,仅 method=wgc):逐行差分(4 字节像素步进)+
-  变化行聚带,带数 > 8 合并为单一外接盒;只回传变化区域裁剪 PNG,无变化纯文本
-  零图像。**不信任原生 DirtyRegions**:帧池缓冲有限,长间隔后脏区相对中间帧
-  而非客户端基线,会漏报;像素差分不依赖帧历史,任何间隔下都精确。
-- **差分确定性**:增量会话 `SetIsCursorCaptureEnabled(false)`——光标移动不产帧,
-  否则"无变化"判定被光标污染。
-- **尺寸变化检测(v0.6.1)**:帧纹理固定于建池时的 item 尺寸,窗口调整大小后
-  纹理不变,只有 `ContentSize()` 跟随变化(实测 640x480 窗口 tex 恒 422x292、
-  ContentSize 626x473);重建触发以 ContentSize 为准(纹理与 ContentSize 不符
-  同样触发),恢复/最小化动画期的瞬时 ContentSize(如 146x28)由 2 次尝试
-  上限自愈。
-- 线程模型:进程内 MTA 唯一,缓存对象跨 worker 线程直接访问合法;并发由缓存
-  Mutex 串行化(等待以毫秒计)。WinRT `IDirect3DDevice` 封装不缓存(无 Send,
-  转换实测 ~0ms),建会话时现取。
-- 会话边界:最小化确定性拒绝(v0.6.1,IsIconic → WINDOW_NOT_VISIBLE——尺寸预检
-  拦不住最小化:GetWindowRect 位置 -32000 但尺寸仍为正)、DRM 被拒或黑区、
-  系统级 CaptureSession 并发上限(缓存 4 主动规避)、Win10 无去边框。
-
-### 4.3 screenshot_all
-
-- `EnumDisplayMonitors` 枚举逐屏;
-- 总预算 **3×UHD 4K(24,883,200 px)**:不超时保持 1.0 缩放;超过时所有屏用**同一比例**
-  缩放(保持相对视觉布局一致);
-- 每屏再套单图预算;尺寸不同 BitBlt 路径走 `StretchBlt`(缩放发生在采集阶段,
-  不额外分配原图缓冲);
-- 单屏失败不失败整体:错误以文本块随 PNG 一并返回。
-- **method=wgc**(v0.6.0):每屏一个一次性 `CreateForMonitor` 会话(首帧预算 3s,
-  不落缓存),帧含光标;超预算时 `resize_bgra` CPU 双线性缩放(纯函数,
-  与 StretchBlt 语义对齐)。实测 3×2560x1440 共 644ms。
-
-### 4.4 resize_window / window_activate
-
-- `SetWindowPos(SWP_NOZORDER|SWP_NOOWNERZORDER|SWP_NOACTIVATE)`,返回 requested/applied 双矩形;
-- 最小 40×40(窗口自身最小尺寸约束会进一步收紧);
-- `window_activate` 用 `SetForegroundWindow` + 前后台比对,**Windows 焦点保护拒绝时明确报错**,
-  不假装成功。
-
-### 4.5 pixel_scan_line(布局断言基元)
-
-```
-capture_client_region_bgra(hwnd, x, y_from, 1, y_to-y_from)
-  → 客户区矩形 + 屏幕 BitBlt(1px 列)→ GetDIBits
-→ 逐行 (r,g,b) → merge_color_bands
-```
-
-- 采样的是**屏幕当前显示**(窗口被遮挡/最小化的区域按屏幕上实际内容采样),不是
-  PrintWindow —— 布局验证针对"用户看到的",且 1px 窗口渲染成本过低、屏幕复制成本可忽略;
-- **合并算法**:相邻行每通道差 ≤ `tolerance`(默认 2)归入同一带;只保留高度 ≥ `min_band`
-  的带(默认 2,过滤抗锯齿/渲染噪声行);带颜色取带内平均值(四舍五入);
-- 返回带区间(客户区行号,含)、高度、平均色 `#RRGGBB`;`max_bands`(默认 256)截断并标 `truncated`。
-
-### 4.6 pixel_find_color
-
-区域扫描(块匹配,非逐行):统计与目标色每通道差 ≤ `tolerance` 的像素数,同时维护
-最小包围盒;无匹配时 `bbox: null`。与 `pixel_scan_line` 配合即可做
-"该面板在 y=773 处恰好高 74px" 一类断言(实测用于校验 GUI 日志面板高度钳制)。
-
-### 4.7 send_input(唯一有副作用的注入工具)
-
-**动作模型**(有序数组,坐标一律客户区物理像素):
-
-| kind | 字段 | 实现 |
+| 来源 | 用途 | 语义 |
 |---|---|---|
-| `move` | x,y,steps | `SetCursorPos` + 按 `steps` 插值(每步 ≥10ms);按住按钮时即为拖拽 |
-| `click` | x,y,button | SetCursorPos → mouse_event(down) → mouse_event(up) |
-| `down` / `up` | x,y,button | 单一按下/释放;必须在**同一批次**配平 |
-| `scroll` | x,y,delta | SetCursorPos 后 `mouse_event(MOUSEEVENTF_WHEEL, delta)`,120/格,正=上滚 |
-| `key_tap` / `key_down` / `key_up` | vkey | `keybd_event`;tap = down+up |
+| `capture_client_region_bgra` | auto 像素工具 | 屏幕 BitBlt,实时;被遮挡区域采到遮挡方像素(响应 `occluded`) |
+| `capture_screen_rect_bgra` | DDAPI 回退 | 虚拟桌面矩形 BitBlt(v0.8.0 从 client 版拆出) |
+| `wgc::capture_client_region_wgc` | wgc 像素工具 | DWM 合成帧裁剪,遮挡准确但帧异步 |
+| `ddapi::DupFrame` | monitor 模式 | staging Map 后**按行距直扫**,零整图拷贝;`DupMappedFrame` Drop 时 Unmap |
 
-- **整批预校验**:产生真实输入前解析所有动作,校验坐标、动作参数与 down/up 配平;
-- **坐标守卫**:每个鼠标动作执行前重新取得客户区,拒绝负数或越界坐标;
-- **前景守卫**:批次开始及每个动作执行前都确认目标仍是前台窗口(防止延迟期间焦点切换后误投);
-  `activate:true` 先 `SetForegroundWindow`,失败(焦点保护)则报错;
-- **失败清理**:执行途中发生错误或 unwind panic 时,RAII guard 释放本批仍按下的鼠标键/键盘键;
-- 按键名解析表:ASCII 字母/数字直通、Enter/Space/Tab/Esc/Backspace/Delete/Insert/
-  Home/End/PageUp/PageDown/方向键/Ctrl/Shift/Alt/Win/F1-F24;
-- ScanCode 储备方向(未实现):当前 `keybd_event` + VK 对 Qt/Electron/IDE 等常规窗口是标准路径;
-  若未来遇到 DirectInput 独占/Raw Input/特殊 IME 等读 lParam 扫描码的冷门客户端不认键,
-  再加可选参数走 SendInput + MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) + KEYEVENTF_SCANCODE
-  (扩展键方向键/Insert/Del/Home/End/PgUp/PgDn 还需补 KEYEVENTF_EXTENDEDKEY);
-- `delay_ms`(0–5000,默认 50)作用于动作之间,也是插值步进间隔;
-- 每批最多 128 个动作,按动作间隔与 move 步进估算的计划延迟最多 60 秒,避免阻塞单线程服务。
+### 4.4 采样降级链的架构事实
 
-## 5. 协议层与 panic 隔离
+DDAPI(DXGI Desktop Duplication)是**显示器级**复制 —— DXGI 不存在按窗口的
+Duplication,因此它服务全屏截图与显示器像素扫描,不参与窗口级截图;
+窗口链保持 `PrintWindow → WGC → 屏幕采样`。
 
-### 5.1 JSON-RPC 骨架
+## 5. 缓存与并发结构
 
-- `initialize`:协议协商,接受 `2025-11-25` / `2025-06-18` / `2025-03-26`,其余回落到 `2025-11-25`;
-- `tools/call` 的**错误约定**:工具参数错误、未知工具名及执行失败返回
-  `result: {content:[…], isError:true}`(文本块);JSON 解析错误、非法 JSON-RPC 请求与未知
-  JSON-RPC method 才返回 JSON-RPC `error`,客户端可区分“工具失败”与“协议调用不可用”;
-- 每请求输出一行,写完 flush;stdin 读失败退出循环。
+### 5.1 WGC 会话缓存(`wgc.rs`)
 
-### 5.2 catch_unwind 隔离(2026-09-07 新增)
+- **D3D11 设备**进程级缓存(硬件→WARP,`create_device` 与 DDAPI 共用);
+  WinRT `IDirect3DDevice` 封装不缓存(未实现 Send,转换实测 ~0ms)。
+- **会话**按 `(hwnd, client_only, incremental)` 键缓存,LRU 上限 4(与系统
+  CaptureSession 配额保持距离);每次调用顺手清扫已销毁窗口。
+- 帧语义:窗口静态时 DWM 不产帧,`TryGetNextFrame` 返回 null+S_OK;既有会话
+  立即取帧,空则等一个 DWM 交付周期(~100ms)再取,仍无帧复用上次 BGRA 重编码。
+- 尺寸变化以 `frame.ContentSize()` 为准(帧纹理固定于建池尺寸),不符即重建,
+  恢复动画期瞬时值由 2 次尝试上限自愈。
+- 增量会话 `SetIsCursorCaptureEnabled(false)`:光标移动不产帧,差分确定。
+- 两处 WinRT 坑:首帧需轮询(100ms 间隔/10s 预算);`IDirect3DSurface` 对 COM QI
+  一律 E_NOINTERFACE,必须 `cast::<IDirect3DDxgiInterfaceAccess>()` 再 `GetInterface`。
+- COM 限定 worker 线程 MTA(`with_mta`),接口指针随闭包返回释放后才
+  `CoUninitialize`。
 
-此前单次可展开的 Rust panic 会带崩整个 stdio 进程,客户端表现为 **Connection closed**
-(实测复现)。现实现提供的是 **panic unwind 隔离**,不是任意原生崩溃隔离:
-访问违规、进程 abort、OOM abort 或不可跨 FFI 展开的 panic 仍可能终止进程。
-现结构:
+### 5.2 DDAPI 会话缓存(`ddapi.rs`)
 
-```rust
-fn handle_request_isolated(request: &Value) -> Option<Value> {
-    match catch_unwind(AssertUnwindSafe(|| handle_request(request))) {
-        Ok(response) => response,
-        Err(payload) => Some(jsonrpc_error(id, -32603,
-            format!("请求执行崩溃，已隔离（进程继续运行）: {}", panic_payload_message(&payload)))),
-    }
-}
-```
+- 会话按**显示器矩形**(`DXGI_OUTPUT_DESC.DesktopCoordinates` 匹配)缓存,
+  键由 `EnumDisplayMonitors` 的矩形给出 —— 与用户可见的显示器序号一致。
+- 取帧:`AcquireNextFrame(0)` 非阻塞 + 10ms 空转,新帧预算 500ms;
+  桌面静止无帧 → 复用 `last_bgra`(语义等价);首帧无缓存 → `DDAPI_UNAVAILABLE`。
+- 数据通路:`CopyResource`(GPU,入队)→ `ReleaseFrame`(桌面资源立即归还)→
+  调用级 staging 纹理 `Map`(CPU 同步等待)→ 扫描/编码 → Drop 时 Unmap。
+  映射仅在调用内有效,指针绝不过夜。
+- 会话失效(ACCESS_LOST/INVALID_CALL/DEVICE_REMOVED:锁屏、UAC 安全桌面、
+  驱动重置)自动销毁重建一次,再失败上抛。
 
-坑位(已写入单元测试与注释,**实测验证**):
+### 5.3 提权探测(`elevation.rs`)
 
-- `panic_payload_message` 必须接收 **`&Box<dyn Any + Send>`** 并对 Box 直接调
-  `downcast_ref`。接收 `&(dyn Any + Send)` 时,`&Box<dyn>` 经 Deref 强转后的 fat pointer
-  downcast 会**静默失败**;这与 std panic hook 通过 `PanicInfo::payload()` 拿 `&dyn` 的路径不同;
-- GDI 句柄由 RAII 守卫 `GdiHandle`(ScreenDc/MemDc/Bitmap)持有:正常错误路径不再手工释放,
-  panic 展开时 Drop 同样执行,崩溃路径也零句柄泄漏。释放方式与获取方式严格配对
-  (GetDC 用 ReleaseDC、内存 DC 用 DeleteDC、位图用 DeleteObject)。
+提权进程的 token 拒绝非提权调用方 `OpenProcessToken(TOKEN_QUERY)` ——
+ERROR_ACCESS_DENIED 本身即提权信号。`send_input`/`window_activate`/
+`send_input_background`/`send_text_background` 前置 `ensure_uipi_injectable`,
+提权目标 + 未提权服务 → 结构化 `UIPI_BLOCKED`(UIPI 静默丢弃输入,无错误码,
+不提前拒绝会让模型陷入"点了没反应"重试死循环)。
 
-### 5.3 错误契约(2026-09-08 起)
+### 5.4 WinEvent hook 线程(`winevent.rs`)
 
-工具错误响应保留 MCP 惯用形状并**新增**机器可读字段(向后兼容,只增不改):
+- 进程级单例 hook 线程:`SetWinEventHook(EVENT_MIN..EVENT_MAX, OUTOFCONTEXT)`
+  + 独立 `GetMessageW` 泵循环,回调在该线程执行。
+- 等待者表 `Mutex<Vec<WaiterEntry>>`(上限 8),std mpsc 通道打通回调与等待调用;
+  `HOOK_READY: OnceLock<Result<(), &'static str>>` 是 Copy,免克隆同步。
+- 竞态封口:注册等待者 → hook 就绪 → 枚举现有窗口 —— 注册前已存在与 hook
+  安装间隙内出现的窗口都被枚举兜住。
+- 回调快速过滤链:无等待者 → 非目标事件 → 本进程窗口 → 不可见 → WS_CHILD
+  (仅 CREATE/SHOW,控件级创建事件是噪声)→ 匹配。标题读取(SendMessageTimeoutW
+  500ms)只在确有标题正则等待者时执行,且克隆等待者表后**在锁外**读。
 
-```json
-{"content":[{"type":"text","text":"中文明细"}],"isError":true,
- "error_code":"NOT_FOREGROUND","retryable":true}
-```
+## 6. 输入子系统
 
-| code | retryable | 触发场景 |
+### 6.1 前台注入(`input.rs`)
+
+批次先整体校验再执行:`down/key_down` 必须同批 `up/key_up` 配平,坐标必须位于
+客户区,批 ≤128 动作、计划延迟 ≤60s。`InputReleaseGuard` 在错误路径 Drop 时
+按逆序自动释放已按下键(RAII)。执行中每步复检前台状态(`ensure_input_foreground`),
+丢失前台即中止 —— 输入绝不落到其他窗口。
+
+### 6.2 拟人轨迹(`bezier.rs`,v0.8.0)
+
+- 随机源:xorshift64*(零依赖),线程局部,时间 + 进程原子计数播种;
+  `ThreadId::as_u64` 不稳定,勿用。高斯 = Box-Muller 极坐标法,钳制 ±4σ。
+- 轨迹:三阶贝塞尔,控制点在起终连线 1/3、2/3 处 + 垂直高斯偏移
+  (σ=距离×0.08,钳 ±0.4×距离);采样参数经缓入缓出 `3t²-2t³` 向两端聚拢;
+  每点 ±2px 高斯抖动;**终点强制精确落地**(纯 move 动作必须确定性落点)。
+- 步间延迟:高斯 σ=0.15×均值,钳 [0.5,1.2]×均值 —— 60s 预算护栏最多被
+  超出 20%,有界。
+- 全部函数以显式 `&mut XorShift64` 为参,单测固定种子完全复现。
+
+### 6.3 后台投递(`background.rs`)
+
+- 鼠标:`RealChildWindowFromPoint`(屏幕坐标)命中最深子控件 → `ScreenToClient`
+  子控件局部坐标 → `PostMessageW`(WM_MOUSEMOVE/LBUTTONDOWN/UP、RBUTTON…,
+  wParam 按批次按住状态维护 MK_* 位)。不抢焦点、不动物理光标、不改前台。
+- 文本:类名含 "EDIT"(忽略大小写,兼容 RichEdit20W/WindowsForms10.Edit 等)
+  → `EM_SETSEL`(clear_first 时全选)+ `EM_REPLACESEL`(wParam=TRUE,lParam 指向
+  NUL 结尾 UTF-16;EM_REPLACESEL 在系统跨进程封送消息列表内);其他控件 →
+  `WM_CHAR` UTF-16 码元逐一投递(代理对分两条,换行统一 CR)。发送走
+  `SendMessageTimeoutW` 5s + SMTO_ABORTIFHUNG,挂起线程绝不拖死服务。
+- **诚实边界是特性**:投递 ≠ 生效。RawInput/DirectInput 应用可能无视 posted
+  消息;EM_REPLACESEL 只对处理该消息的编辑控件有效。响应带 `delivery` 字段
+  与提示,验证手段是截图/像素断言(README 同款措辞)。
+
+## 7. 找色引擎(`pixelsimd.rs` / `pixelmatch.rs`)
+
+- 锚点扫描:每 32 字节(8 像素)一次 `_mm256_loadu_si256`;逐字节 |差| =
+  `or(subs_epu8(a,b), subs_epu8(b,a))`(饱和减,天然无符号);阈值判定 =
+  `cmpeq_epi8(min_epu8(diff, tol), diff)`(避免有符号比较在 |差|>127 时翻车);
+  movemask 取 32 位逐字节标志,`m & (m>>1) & (m>>2) & 0x1111_1111` 聚合出
+  逐像素命中(忽略 alpha 字节)。行首 8 对齐补扫 + 行尾标量补扫。
+- 运行时 `is_x86_feature_detected!("avx2")` 探测,标量回退语义一致 ——
+  单测对多种行宽(1/3/7/8/9/16/17/31/40/64)互证两条路径。
+- 偏移链校验:候选 ± 偏移点必须落在 search_rect 内(i64 运算防溢出),
+  各偏移点独立颜色/容差;锚点自身扫描阶段已确认,不复检。
+- 实测(--release):4K 全区域零命中 0.99ms、全命中(病态,830 万结果物化)21.5ms。
+- 像素读取器 `PixelReader::{Contiguous, Strided}`:Strided 供 DDAPI 映射内存
+  按行距直读;`read` 是 unsafe fn(有 `# Safety` 契约文档)。
+
+## 8. 错误契约(`error.rs`)
+
+`ToolError { code: &'static str, message: String, retryable: bool }`,retryable 由
+**单一码表**推导(14 个码,只增不改)。协议层响应保留 MCP 惯用形状
+(`content[text]` + `isError`)并追加 `error_code`/`retryable`。
+
+不可重试:`INVALID_ARGUMENT` `LIMIT_EXCEEDED` `WGC_UNAVAILABLE`
+`DDAPI_UNAVAILABLE` `UIPI_BLOCKED` `INTERNAL_ERROR`;
+可重试:`WINDOW_NOT_FOUND` `WINDOW_NOT_VISIBLE` `WINDOW_HUNG` `NOT_FOREGROUND`
+`ACTIVATION_DENIED` `CAPTURE_FAILED` `INPUT_FAILED` `UIA_UNAVAILABLE`。
+
+## 9. 预算与限制一览
+
+| 常量 | 位置 | 值 |
 |---|---|---|
-| INVALID_ARGUMENT | 否 | 参数缺失/越界/格式错误/批次未配平 |
-| WINDOW_NOT_FOUND | 是 | 句柄失效、GetWindowRect 失败、无匹配窗口 |
-| WINDOW_NOT_VISIBLE | 是 | 窗口最小化/不可见、空截图矩形 |
-| WINDOW_HUNG | 是 | IsHungAppWindow 预检命中、截图超时 |
-| NOT_FOREGROUND | 是 | 输入注入目标非前台(执行期复检) |
-| ACTIVATION_DENIED | 是 | SetForegroundWindow 被焦点保护拒绝 |
-| CAPTURE_FAILED | 是 | GDI 资源/PrintWindow/GetDIBits/PNG 编码失败 |
-| LIMIT_EXCEEDED | 否 | 尺寸/像素/批次/计划延迟超预算 |
-| INPUT_FAILED | 是 | SetCursorPos/GetCursorPos 等执行期失败 |
-| INTERNAL_ERROR | 否 | 内部不可预期(JSON 序列化失败等) |
+| MAX_CAPTURE_DIM / MAX_WINDOW_CAPTURE_PIXELS | capture.rs | 7680 px / 1200 万像素 |
+| MAX_ALL_CAPTURE_PIXELS | capture.rs | 3×3840×2160(三台 UHD 4K 不缩放) |
+| CAPTURE_TIMEOUT_MS | capture.rs | 15s(worker 硬超时;超时线程泄漏是记录在案的边界) |
+| 近纯黑判定 | capture.rs | 亮度<8 占比>98%(只按 RGB,alpha 不可靠) |
+| MAX_INPUT_ACTIONS / 计划延迟 | input.rs | 128 动作 / 60s |
+| MAX_BG_ACTIONS / MAX_TEXT_CHARS | background.rs | 64 动作 / 4096 字符 / 5s 文本超时 |
+| MAX_OFFSETS / MAX_MATCHES | pixelmatch.rs | 64 偏移 / 4096 匹配(默认 32) |
+| MAX_CACHED_SESSIONS(WGC LRU) | wgc.rs | 4(增量脏区上限 8) |
+| WGC 首帧轮询 | wgc.rs | 100ms 间隔 / 10s 预算(显示器 3s) |
+| DDAPI 新帧预算 | ddapi.rs | 500ms(10ms 空转) |
+| MAX_WAITERS / 等待超时 | winevent.rs | 8 / 60s(默认 5s;hook 就绪 5s) |
+| 标题读取超时 | window.rs | SendMessageTimeoutW 500ms + SMTO_ABORTIFHUNG |
+| 贝塞尔默认 | bezier.rs | curvature 0.08 / 抖动 σ 0.9px 钳 ±2px / 延迟钳 [0.5,1.2]×均值 |
 
-`retryable` 由 `error.rs` 单一码表推导,保证全路径语义一致。码一旦发布保持稳定(只增不改)。
+## 10. 线程、超时与资源模型
 
-### 5.4 活性保障(2026-09-08 起)
+- stdio 主循环:`handle_request_isolated` 对每个请求 `catch_unwind`,可展开
+  panic → `-32603` 并继续服务;access violation/abort 不在保证内。
+- 阻塞操作(截图/UIA)经 `run_with_timeout` 在 worker 线程执行;超时后 worker
+  无法终止(Rust 无强制杀线程),可能阻塞并泄漏当次资源 —— 挂起预检
+  (SMTO_ABORTIFHUNG 标题 + IsHungAppWindow)已把概率压到趋近于零,剩余是
+  驱动级卡死的极端边界。
+- GDI 句柄 RAII:`GdiHandle`(ScreenDc/MemDc/Bitmap)配对释放,panic 展开路径
+  同样不泄漏;WGC `FrameGuard`/`OneShotSessionGuard` 同策略。
+- COM:UIA 限定每次查询的 worker 线程(APARTMENTTHREADED,接口先释放再
+  CoUninitialize);WGC 限定 worker 线程 MTA(进程内 MTA 唯一);DDAPI 纯原生
+  D3D11/DXGI,无需 CoInitialize。
+- WinEvent hook 线程进程生命周期内不退出;回调绝不 panic(全部取返回值)。
 
-挂起窗口(消息队列无响应)绝不能卡死单线程服务,三层防护:
+## 11. 可观测性
 
-1. **标题读取**不走 `GetWindowTextW`(对其他进程窗口内部发 WM_GETTEXT,目标线程挂起时
-   调用方被拖死):改用 `SendMessageTimeoutW(WM_GETTEXT, 500ms, SMTO_ABORTIFHUNG)`,
-   挂起窗口标题为空,枚举照常完成;
-2. **截图预检**:`capture_window` 先 `IsHungAppWindow`,命中直接返回 WINDOW_HUNG,
-   绝不进入 PrintWindow(把 WM_PRINT 投递进目标线程的阻塞调用);
-3. **硬超时**:采集在 worker 线程执行,`run_capture_with_timeout`(15s)限时等待,
-   超时返回 WINDOW_HUNG 继续服务。边界:Rust 无法终止线程,超时后 worker 可能仍卡在
-   PrintWindow(线程与当次句柄泄漏,进程退出回收)——预检已把概率压到趋近于零,剩余是
-   驱动级卡死的极端场景。
+- stdout 是唯一协议通道;诊断走 stderr(`WT_LOG_LEVEL`,默认 warn)或
+  `WT_LOG_FILE` 落盘。`WT_LOG_LEVEL=info` 拿逐请求轨迹。
+- `get_diagnostics`:版本、uptime、请求/工具/错误码统计、GDI/USER 句柄数
+  (GetGuiResources)、最近 20 条错误环形缓冲。protocol 层每请求自动埋点。
 
-坑位:winver 等普通窗口 IsHungAppWindow 恒为 false;真实挂起窗口的制造法见
-`tests/e2e-hung.ps1`(独立 STA 线程创建窗口后 busy-sleep 从不取消息)。
+## 12. 测试布局
 
-### 5.5 可观测性(2026-09-08 起)
+- 单元测试 91 项:解析原语、错误码表、颜色带合并、输入批次约束、贝塞尔
+  (端点/包络/复现/延迟钳制)、AVX2↔标量互证、偏移链 ROI 约束、DDAPI 矩形
+  匹配、WinEvent 匹配器与等待者守卫、后台批次与 MAKELPARAM、schema 契约
+  (无 oneOf、数值字段 `["integer","string"]` 容错)。
+- 性能冒烟(ignore):4K 全区域扫描,--release 下打印实测毫秒。
+- E2E(`tests/run-e2e.ps1`):主套件 87 项 + 挂起窗口 7 项,需交互桌面;
+  含正向标题断言、句柄/内存泄漏、LRU 淘汰日志证据、来源标注契约。
+  探针为 C#(Add-Type):STA + Application.Run 泵消息;ps1 必须 UTF-8 BOM。
+- 质量门禁:CI `cargo fmt --check` + `clippy --all-targets -- -D warnings` + test。
 
-- **日志**:stderr 为唯一即时通道,stdout 保持纯协议。级别 `WT_LOG_LEVEL`
-  (error|warn|info|debug,默认 warn);`WT_LOG_FILE` 可选落盘。info 级每请求一行
-  `method tool -> code in Nms`。初始化:日志配置读取放 `serve_stdio` 开头。
-- **自检**:`get_diagnostics` 工具(只增不删的 schema)返回版本、uptime、请求/方法/工具/
-  错误码统计、GDI/USER 句柄自检(`GetGuiResources`)、最近 20 条错误环形缓冲。
-- **排障流**:默认 warn 级零成本;异常时 `WT_LOG_LEVEL=info` 重启会话即可拿到逐请求轨迹,
-  再以 `get_diagnostics` 看错误分布与句柄数(GDI 恒增是泄漏信号,正常采集后回落为 0)。
+## 13. Windows API 陷阱速查(实测踩过的坑)
 
-## 6. 预算与校验
+- **SendMessageTimeoutW 返回 LRESULT 只是"发送成功"**,WM_GETTEXT 实际拷贝长度
+  在 `lpdwResult` 里;误用返回值会得到"所有标题只剩 1 个字符"。
+- **HWND 是裸指针包装不满足 Send**,跨线程传 isize 重建。
+- **`&Box<dyn Any>` 经 Deref 强转后 downcast_ref 静默失败**,panic 负载直接对
+  Box 调。
+- WGC:`TryGetNextFrame` 首帧到达前返回 null+S_OK,必须轮询;
+  `IDirect3DSurface` 对 QI 一律 E_NOINTERFACE,走 `IDirect3DDxgiInterfaceAccess`。
+- WGC 帧纹理固定于建池尺寸,**尺寸变化检测以 ContentSize() 为准**。
+- windows-rs 0.61:`_mm256_subs_epu8/min/cmpeq/movemask` 是安全 intrinsic
+  (仅 loadu/add 需 unsafe);`D3D11Texture2D` 等接口的 `cast` 需
+  `use windows::core::Interface as _`;`Unmap` 返回 `()`(`let _ =` 会吃
+  let_unit_value);`IsWindow` 收 `Option<HWND>`、`IsWindowVisible` 收 `HWND`。
+- EM_REPLACESEL 的 lParam 是**指针**,跨进程生效依赖系统封送列表
+  (EM_REPLACESEL 在内),文本必须 NUL 结尾且不含内嵌 NUL。
+- UIA:`CUIAutomation` 是 GUID 常量,CoCreateInstance 由返回值类型推断接口;
+  常量驼峰命名作 match pattern 会触发 rustc 原生 `non_upper_case_globals`
+  (非 clippy 前缀版)。
+- 提权探测:OpenProcessToken 返回 ERROR_ACCESS_DENIED 即提权信号,无需权限。
+- 测试脚本:PS5.1 管道中文进原生进程按 ANSI 编码损坏(走 ProcessStartInfo
+  字节流或全 ASCII);`ReadToEnd` 在 stdin 未关闭时永久阻塞(异步等待要
+  ReadLine);`run-e2e.ps1 -Exe` 转发在 PS5.1 下坏掉,直接
+  `& e2e-main.ps1 -Exe <路径>`。
+- 最小化窗口 `GetWindowRect` 位置 (-32000,-32000) 但尺寸为正,尺寸预检拦不住,
+  必须显式 `IsIconic`。
+- e2e 探针 C# 内禁止中文注释(PS5.1 Add-Type 乱码编译失败)。
 
-| 常量 | 值 | 用途 |
-|---|---|---|
-| `MAX_CAPTURE_DIM` | 7680 px | 单边硬上限 |
-| `MAX_WINDOW_CAPTURE_PIXELS` | 12,000,000 | 单窗口/单屏/单扫描区域像素上限 |
-| `MAX_ALL_CAPTURE_PIXELS` | 3×3840×2160 = 24,883,200 | 多屏截图总预算 |
-| `MAX_WINDOWS_LIMIT` | 500 | list_windows 条目上限 |
-| `MAX_SCAN_BANDS` | 256 | 颜色带条数上限 |
-| `MAX_INPUT_ACTIONS` | 128 | 单个输入批次动作上限 |
-| `MAX_INPUT_SCHEDULED_DELAY_MS` | 60,000 ms | 动作间隔与 move 步进的计划延迟上限 |
+## 14. 版本演进(摘要)
 
-- `checked_pixels`:所有位图分配前先以 i64 计算面积,防 i32 乘法溢出(小分配/越界);
-- `json_i32` / `json_u32`:JSON 数字先做类型与范围校验再转,防 PID/坐标被静默截断指向其他进程;
-- 三个新工具返回统一 `content` 包装(与既有工具一致,符合 MCP `CallToolResult` 规范)。
-
-## 7. 构建、测试、部署
-
-### 7.1 构建
-
-仓库根目录 `.cargo/config.toml` 有全局 `[build] target = "x86_64-pc-windows-msvc"`,
-所以**产物不在** `target/release/`,而在:
-
-```
-target/x86_64-pc-windows-msvc/release/mcp-window-tools.exe
-```
-
-### 7.2 测试(42 项单元 + 76 项 E2E(主 69 + 挂起 7);各版本精确计数见 CHANGELOG)
-
-| 组 | 覆盖 |
-|---|---|
-| hwnd 解析 | 十进制 / 0x 十六进制 / 空白 / 负数 / 溢出 / 非法 |
-| 颜色解析 | 带/不带 `#`、大小写、长度错误、非 ASCII |
-| 颜色带合并 | 相邻相似合并、平均色、min_band 过滤、tolerance 边界 |
-| 按键名 | 字母/数字/F 键/方向键/非法值/越界整数 |
-| 输入批次 | 客户区坐标、down/up 配平、动作数与计划时长限制、schema 发布 |
-| panic 隔离 | 负载提取(三种形态)、隔离后保留请求 id、正常路径不受影响 |
-| 工具清单 | 12 工具齐全、新工具 schema 约束(必填 hwnd、annotations) |
-| 错误契约 | 错误码稳定性、retryable 码表推导、双轨响应形状 |
-| 活性 | 截图超时返回 WINDOW_HUNG、worker 边界行为 |
-| 可观测性 | 诊断字段完整性、错误环形缓冲容量与淘汰顺序、日志级别解析 |
-
-单元测试 25 项;真实 GUI E2E 套件已入库:`tests/run-e2e.ps1`
-(主套件 29 项 + 真实挂起窗口套件 7 项,需要交互桌面,本地门禁运行)。
-
-### 7.3 部署
-
-```powershell
-# 一条命令:构建 → 冒烟 → 杀旧进程 → 备份 → 覆盖(脚本已入库)
-pwsh -File mcp/window-tools/deploy.ps1
-```
-
-注册在 `~/.claude.json` 的 `mcpServers.window-tools`(stdio,直接指向
-`C:\Program Files\ClaudeCodeBridge\claude-mcp-window-tools.exe`);
-Claude Code 在下一次工具调用时会**自动重连** MCP(2026-09-08 实测),无需重启会话。
-
-CI 门禁:`.github/workflows/window-tools.yml`(fmt --check / clippy -D warnings /
-单元测试 / release 构建),触发条件为该目录或 workflow 自身变更。
-
-## 8. windows-rs 0.61 签名陷阱(写代码前先 grep 源码确认)
-
-| API | 0.61.3 签名 | 备注 |
-|---|---|---|
-| `BitBlt` | `-> windows_core::Result<()>` | 不是 BOOL,错误用 `.map_err`/`.is_ok()` |
-| `StretchBlt` | `-> BOOL` | 与 BitBlt 不对称,一眼容易被带偏 |
-| `mouse_event` / `keybd_event` | `Win32::UI::Input::KeyboardAndMouse` | **需要 feature `Win32_UI_Input_KeyboardAndMouse`**(并不在 `Win32_UI_Input` 下直接导出) |
-| `MOUSE_EVENT_FLAGS` | 常量本身是带类型新类型 | 函数参数不认裸 `u32`,需用 `MOUSEEVENTF_*` 常量 |
-| `GetClassNameW` | `(&mut [u16]) -> i32` | 直接传 buffer slice |
-| `IsIconic` / `GetCursorPos` / `SetCursorPos` | WindowsAndMessaging | SetCursorPos 返回 `Result<()>` |
-
-## 9. 设计约定与扩展点
-
-- **只读与破坏性泾渭分明**:annotations 矩阵中 `readOnlyHint` / `destructiveHint` 与
-  工具语义严格对应(仅 `resize_window`、`send_input` 为破坏性操作);
-- 幂等性:观察类工具 `idempotentHint: true`;注入类为 false;
-- 扩展新动作:在 `send_input` 的 `kind` 匹配中加分支 + README 表 + 单测,无需改动协议层;
-- 扩展新观察维度:在 `pixel_scan_line` 的合并算法上叠加(如按列/区域聚合),保持返回带结构兼容。
+v0.2.x 架构与活性 → v0.3 UIA → v0.4/0.5 WGC 与增量差分 → v0.6 显示器 WGC 与
+使用期修复 → v0.7 多模型容错/UIPI/遮挡感知/JPEG+max_dim/激活阶梯 →
+v0.8 后台静默输入、多点比色(AVX2)、DDAPI、WinEvent 事件驱动、贝塞尔拟人轨迹。
+详见 [CHANGELOG.md](CHANGELOG.md)。

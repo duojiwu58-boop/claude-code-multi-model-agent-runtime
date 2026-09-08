@@ -3,6 +3,59 @@
 本项目遵循向后兼容演进:工具 schema 只增不删,错误响应保留 MCP 惯用形状
 (content[text] + isError) 并新增机器可读字段。错误码一旦发布保持稳定(只增不改)。
 
+## [0.8.0-experimental] - 2026-09-08
+
+### 新增
+
+- **`pixel_match_multi` 多点特征比色**(backend/pixelsimd.rs + pixelmatch.rs):
+  锚点色全区域搜索 + 相对偏移链校验(各偏移点独立颜色/容差,ROI 约束),
+  按与期望锚点欧氏距离升序返回。x86_64 运行时探测 AVX2 向量化分支
+  (8 像素/32 字节,饱和减 |差| + min 阈值 + movemask 位聚合),标量回退语义
+  一致(单测互证)。目标二选一:hwnd 客户区(auto 屏幕/wgc 合成帧)或
+  monitor(DDAPI staging Map 直扫,零整图拷贝,失败回退屏幕采样)。
+  响应带 engine 与 capture/scan 分段时间。实测 4K(3840x2160)全区域锚点
+  扫描 ~1 ms;全屏同色病态输入(每像素命中)~20 ms(结果物化主导)。
+- **`screenshot_all method=ddapi`**(backend/ddapi.rs):DXGI Desktop
+  Duplication 显存复制 — DuplicateOutput 会话缓存(按显示器矩形),新帧
+  AcquireNextFrame → CopyResource 到调用级 staging → ReleaseFrame → Map;
+  静态桌面复用缓存帧,会话失效(锁屏/安全桌面/驱动重置)自动重建一次。
+  单屏不可用回退 BitBlt,MonitorShot 增 `source` 字段(screen/wgc/ddapi/bitblt)。
+  D3D11 设备与 WGC 共用创建路径(create_device pub(crate))。新错误码
+  `DDAPI_UNAVAILABLE`(不可重试)。
+- **`send_input_background` 后台静默鼠标**(backend/background.rs):
+  RealChildWindowFromPoint 命中子控件 + 子控件局部坐标 + PostMessageW 直投
+  WM_MOUSEMOVE/LBUTTONDOWN/… — 不抢焦点、不动物理光标、不改前台窗口。
+  click/down/up/right_click/move,批次预校验 + 配平 + UIPI 前置拒绝。
+- **`send_text_background` 后台文本**(同模块):EDIT/RichEdit 走
+  EM_SETSEL+EM_REPLACESEL 系统封送整段置换(clear_first 一步清空+写入),
+  非编辑控件走 WM_CHAR 字符流(UTF-16 码元逐条,代理对分两条,换行转 CR)。
+- **`wait_for_window` 事件驱动等待**(backend/winevent.rs):进程级单例
+  SetWinEventHook(OUTOFCONTEXT)+ 专用泵消息线程,监听 OBJECT_CREATE/
+  OBJECT_SHOW(WS_CHILD 过滤)/SYSTEM_FOREGROUND;std mpsc 打通回调与等待
+  调用(项目无 tokio,等价物),注册→hook 就绪→枚举现有窗口封竞态;超时返回
+  正常响应 found=false。新增依赖 regex 1.11.1。
+- **`send_input` move 拟人化轨迹**(backend/bezier.rs):三阶贝塞尔随机弧线 +
+  缓入缓出速度分布 + 每步 ±2px 高斯抖动 + 步间延迟高斯扰动
+  (钳制 [0.5,1.2]×均值);xorshift64* + Box-Muller 零依赖随机源,线程局部
+  时间+原子计数播种。终点精确落地,固定种子可复现(单测)。
+
+### 变更
+
+- 工具目录 12 → 16;`#![recursion_limit = "256"]`(json! 宏单函数体超默认
+  递归上限);windows features 增 SystemServices/UI_Controls(MK_*/EM_*);
+  版本 0.8.0-experimental。
+- `capture_client_region_bgra` 拆出公共 `capture_screen_rect_bgra`(屏幕矩形
+  采样,DDAPI 回退与客户端路径共用);`window_title`/`window_class`/
+  `create_device` pub(crate) 供新后端复用。
+
+### 验证
+
+- 单元测试 56 → 91(新增:贝塞尔端点/包络/复现/延迟钳制、AVX2↔标量路径
+  互证、偏移链 ROI 约束、步进读取器行距、DDAPI 错误码、WinEvent 匹配器与
+  等待者守卫、后台批次校验与 MAKELPARAM)+ 1 项性能冒烟(ignore,
+  --release 实测 4K 零命中 0.99ms / 全命中 21.5ms);fmt/clippy -D warnings
+  全绿。
+
 ## [0.6.1-experimental] - 2026-09-08
 
 ### 修复

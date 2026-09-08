@@ -30,6 +30,10 @@ pub const UIA_UNAVAILABLE: &str = "UIA_UNAVAILABLE";
 /// WGC(Windows Graphics Capture)不可用:D3D11 设备创建失败、目标窗口受 DRM 保护、
 /// 捕获被系统拒绝或帧格式意外。环境/能力问题,重试无意义。
 pub const WGC_UNAVAILABLE: &str = "WGC_UNAVAILABLE";
+/// DDAPI(DXGI Desktop Duplication)不可用:DuplicateOutput 被拒、会话失效
+/// (锁定/安全桌面/驱动重置)、显示器不匹配或桌面无新帧且无缓存。
+/// 环境/能力问题,同一次调用内重试无意义(调用方可按需回退其他采集方式)。
+pub const DDAPI_UNAVAILABLE: &str = "DDAPI_UNAVAILABLE";
 /// 目标进程以更高完整性级别运行(典型:管理员提权),UIPI 会静默拦截本服务
 /// (未提权)注入的输入——不报错、无效。需以管理员权限重启 MCP 服务或改选
 /// 非提权窗口,会话内重试无意义。
@@ -91,6 +95,7 @@ mod tests {
         assert!(!ToolError::new(LIMIT_EXCEEDED, "x").retryable);
         assert!(!ToolError::new(INTERNAL_ERROR, "x").retryable);
         assert!(!ToolError::new(WGC_UNAVAILABLE, "x").retryable);
+        assert!(!ToolError::new(DDAPI_UNAVAILABLE, "x").retryable);
         assert!(!ToolError::new(UIPI_BLOCKED, "x").retryable);
         for code in [
             WINDOW_NOT_FOUND,

@@ -369,6 +369,10 @@ impl Drop for InputReleaseGuard {
 }
 
 /// 把屏幕坐标位置的指针按 steps 步插值移动；已按下按钮时即为拖拽。
+/// v0.8.0 起走拟人化轨迹:三次贝塞尔随机弧线 + 缓入缓出速度分布 +
+/// 每步 ±2px 高斯抖动(bezier.rs),步间延迟同样高斯扰动 —— 替代此前的
+/// 硬性等距线性插值。落点由轨迹生成器保证精确,步间延迟钳制在
+/// [0.5,1.2]×per_step_ms,计划延迟预算最多被超出 20%。
 fn move_cursor_steps(
     hwnd: HWND,
     from: POINT,
@@ -376,17 +380,27 @@ fn move_cursor_steps(
     steps: i32,
     per_step_ms: u64,
 ) -> Result<(), ToolError> {
-    let mut current = from;
-    for step in 1..=steps {
+    let points = super::bezier::with_rng(|rng| {
+        super::bezier::human_trajectory(
+            (f64::from(from.x), f64::from(from.y)),
+            (f64::from(to.x), f64::from(to.y)),
+            steps as usize,
+            rng,
+            super::bezier::DEFAULT_CURVATURE,
+            super::bezier::DEFAULT_JITTER_PX,
+        )
+    });
+    for (index, &(x, y)) in points.iter().enumerate() {
         ensure_input_foreground(hwnd)?;
-        let f = f64::from(step) / f64::from(steps);
-        current.x = from.x + ((f64::from(to.x) - f64::from(from.x)) * f) as i32;
-        current.y = from.y + ((f64::from(to.y) - f64::from(from.y)) * f) as i32;
         unsafe {
-            SetCursorPos(current.x, current.y)
+            SetCursorPos(x, y)
                 .map_err(|e| ToolError::new(INPUT_FAILED, format!("SetCursorPos 失败: {e}")))?;
         }
-        std::thread::sleep(std::time::Duration::from_millis(per_step_ms));
+        if index + 1 < points.len() {
+            let delay =
+                super::bezier::with_rng(|rng| super::bezier::human_delay_ms(rng, per_step_ms));
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
     }
     Ok(())
 }

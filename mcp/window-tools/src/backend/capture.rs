@@ -543,6 +543,8 @@ struct MonitorRecord {
 /// 单台显示器的采集结果:tools 层读取元数据组装 MCP 响应,单台失败不中断其余。
 pub struct MonitorShot {
     pub label: String,
+    /// 实际来源:screen(BitBlt) / wgc / ddapi / bitblt(DDAPI 失败回退)。
+    pub source: &'static str,
     pub source_width: i32,
     pub source_height: i32,
     pub output_width: i32,
@@ -587,8 +589,10 @@ fn enum_monitors() -> Vec<MonitorRecord> {
 /// 截取所有显示器,返回每台一张图(带标签、尺寸与编码元数据,单台失败
 /// 不中断其余)。`method`: `auto` = 屏幕 BitBlt(默认,不含光标);
 /// `wgc` = Windows Graphics Capture 合成帧(实验,含光标;会话断开/锁定等
-/// 无合成场景单屏报错)。`format` 控制编码与 max_dim 降采样。
-/// 整体限时执行:GPU 驱动级卡死也不阻塞服务。
+/// 无合成场景单屏报错);`ddapi` = DXGI Desktop Duplication 显存复制
+/// (实验,显示器级、不含光标,单屏不可用时回退 BitBlt 并在 source 标注)。
+/// `format` 控制编码与 max_dim 降采样。整体限时执行:GPU 驱动级卡死也不
+/// 阻塞服务。
 pub fn capture_all_monitors(
     method: &str,
     format: CaptureFormat,
@@ -600,9 +604,12 @@ pub fn capture_all_monitors(
         "wgc" => run_capture_with_timeout(CAPTURE_TIMEOUT_MS, move || {
             capture_all_monitors_wgc_inner(format)
         }),
+        "ddapi" => run_capture_with_timeout(CAPTURE_TIMEOUT_MS, move || {
+            capture_all_monitors_ddapi_inner(format)
+        }),
         other => Err(ToolError::new(
             INVALID_ARGUMENT,
-            format!("未知采集方式 '{other}'，支持 auto / wgc"),
+            format!("未知采集方式 '{other}'，支持 auto / wgc / ddapi"),
         )),
     }
 }
@@ -668,6 +675,7 @@ fn capture_all_monitors_wgc_inner(format: CaptureFormat) -> Result<Vec<MonitorSh
                 )?;
                 results.push(MonitorShot {
                     label,
+                    source: "wgc",
                     source_width: width,
                     source_height: height,
                     output_width,
@@ -679,6 +687,7 @@ fn capture_all_monitors_wgc_inner(format: CaptureFormat) -> Result<Vec<MonitorSh
             }
             Err(error) => results.push(MonitorShot {
                 label,
+                source: "wgc",
                 source_width: width,
                 source_height: height,
                 output_width,
@@ -687,6 +696,119 @@ fn capture_all_monitors_wgc_inner(format: CaptureFormat) -> Result<Vec<MonitorSh
                 mime: format.mime(),
                 error: Some(error),
             }),
+        }
+    }
+    Ok(results)
+}
+
+/// DDAPI 显示器路径:每台显示器经 DXGI Desktop Duplication 取显存帧
+/// (首帧预算 500ms,静态桌面复用会话缓存帧),帧不含光标。单屏不可用
+/// (锁定/安全桌面/驱动异常)时回退屏幕 BitBlt,来源在 source 标注。
+/// 超预算缩放与 max_dim 语义与其余路径一致。
+fn capture_all_monitors_ddapi_inner(format: CaptureFormat) -> Result<Vec<MonitorShot>, ToolError> {
+    let monitors = enum_monitors();
+    if monitors.is_empty() {
+        return Err(ToolError::new(CAPTURE_FAILED, "未找到任何显示器"));
+    }
+    let total_scale = monitors_total_scale(&monitors)?;
+    // 回退路径的屏幕 DC 每屏共用一份(失败屏才实际使用)。
+    let hdc_screen = unsafe { GetDC(None) };
+    if hdc_screen.0.is_null() {
+        return Err(ToolError::new(CAPTURE_FAILED, "GetDC 未返回屏幕设备上下文"));
+    }
+    let _screen_dc = GdiHandle::ScreenDc(hdc_screen);
+
+    let mut results = Vec::new();
+    for (index, m) in monitors.iter().enumerate() {
+        let width = m.rect.right - m.rect.left;
+        let height = m.rect.bottom - m.rect.top;
+        let label = monitor_label(index, m);
+        let (fitted_w, fitted_h) =
+            fit_capture_dimensions(width, height, MAX_WINDOW_CAPTURE_PIXELS, total_scale)?;
+        let (output_width, output_height) = apply_max_dim(fitted_w, fitted_h, format.max_dim);
+        match crate::backend::ddapi::capture_frame_for_rect(m.rect) {
+            Ok(frame) => {
+                let bgra = frame.to_bgra();
+                let scaled = resize_bgra(
+                    &bgra,
+                    frame.width(),
+                    frame.height(),
+                    output_width as u32,
+                    output_height as u32,
+                )?;
+                match encode_frame(
+                    &scaled,
+                    output_width as u32,
+                    output_height as u32,
+                    CaptureFormat {
+                        max_dim: 0,
+                        ..format
+                    },
+                ) {
+                    Ok((image, mime, _)) => results.push(MonitorShot {
+                        label,
+                        source: "ddapi",
+                        source_width: width,
+                        source_height: height,
+                        output_width,
+                        output_height,
+                        image,
+                        mime,
+                        error: None,
+                    }),
+                    Err(error) => results.push(MonitorShot {
+                        label,
+                        source: "ddapi",
+                        source_width: width,
+                        source_height: height,
+                        output_width,
+                        output_height,
+                        image: Vec::new(),
+                        mime: format.mime(),
+                        error: Some(error),
+                    }),
+                }
+            }
+            Err(ddapi_error) => {
+                // DDAPI 不可用(锁定/安全桌面/驱动异常/静态桌面无帧)→
+                // 逐屏回退 BitBlt,来源标注携带原因,单屏失败不中断其余。
+                crate::log_debug!("ddapi: 显示器回退 BitBlt: {ddapi_error}");
+                match capture_rect_from_screen(
+                    hdc_screen,
+                    ScreenCaptureSpec {
+                        source_width: width,
+                        source_height: height,
+                        output_width,
+                        output_height,
+                        left: m.rect.left,
+                        top: m.rect.top,
+                    },
+                    format,
+                ) {
+                    Ok((image, mime, _)) => results.push(MonitorShot {
+                        label: format!("{label} [DDAPI 不可用,已回退: {ddapi_error}]"),
+                        source: "bitblt",
+                        source_width: width,
+                        source_height: height,
+                        output_width,
+                        output_height,
+                        image,
+                        mime,
+                        error: None,
+                    }),
+                    Err(error) => results.push(MonitorShot {
+                        label,
+                        source: "bitblt",
+                        source_width: width,
+                        source_height: height,
+                        output_width,
+                        output_height,
+                        image: Vec::new(),
+                        mime: format.mime(),
+                        error: Some(error),
+                    }),
+                }
+            }
         }
     }
     Ok(results)
@@ -775,6 +897,7 @@ fn capture_all_monitors_inner(format: CaptureFormat) -> Result<Vec<MonitorShot>,
         ) {
             Ok((image, mime, _)) => results.push(MonitorShot {
                 label,
+                source: "screen",
                 source_width: width,
                 source_height: height,
                 output_width,
@@ -785,6 +908,7 @@ fn capture_all_monitors_inner(format: CaptureFormat) -> Result<Vec<MonitorShot>,
             }),
             Err(error) => results.push(MonitorShot {
                 label,
+                source: "screen",
                 source_width: width,
                 source_height: height,
                 output_width,
@@ -961,16 +1085,6 @@ pub fn capture_client_region_bgra(
             format!("扫描区域尺寸必须为正数，实际为 {width}x{height}"),
         ));
     }
-    let pixels = checked_pixels(width, height)?;
-    if pixels > MAX_WINDOW_CAPTURE_PIXELS {
-        return Err(ToolError::new(
-            LIMIT_EXCEEDED,
-            format!(
-                "扫描区域 {width}x{height} 超过上限（{} 像素）",
-                MAX_WINDOW_CAPTURE_PIXELS
-            ),
-        ));
-    }
     let client = client_rect_of(hwnd)?;
     let client_width = client.right - client.left;
     let client_height = client.bottom - client.top;
@@ -985,6 +1099,33 @@ pub fn capture_client_region_bgra(
             INVALID_ARGUMENT,
             format!(
                 "扫描区域 ({x},{y}) {width}x{height} 超出窗口客户区 {client_width}x{client_height}"
+            ),
+        ));
+    }
+    capture_screen_rect_bgra(client.left + x, client.top + y, width, height)
+}
+
+/// 从屏幕 BitBlt 采样虚拟桌面上的一个矩形区域，返回原始 BGRA(像素工具与
+/// DDAPI 回退共用)。左上角为屏幕物理坐标;被遮挡区域按屏幕当前显示内容。
+pub(crate) fn capture_screen_rect_bgra(
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+) -> Result<Vec<u8>, ToolError> {
+    if width <= 0 || height <= 0 {
+        return Err(ToolError::new(
+            INVALID_ARGUMENT,
+            format!("采样区域尺寸必须为正数，实际为 {width}x{height}"),
+        ));
+    }
+    let pixels = checked_pixels(width, height)?;
+    if pixels > MAX_WINDOW_CAPTURE_PIXELS {
+        return Err(ToolError::new(
+            LIMIT_EXCEEDED,
+            format!(
+                "采样区域 {width}x{height} 超过上限（{} 像素）",
+                MAX_WINDOW_CAPTURE_PIXELS
             ),
         ));
     }
@@ -1033,14 +1174,14 @@ pub fn capture_client_region_bgra(
             width,
             height,
             Some(hdc_screen),
-            client.left + x,
-            client.top + y,
+            left,
+            top,
             SRCCOPY,
         )
     }
     .is_ok();
     if !copied {
-        Err(ToolError::new(CAPTURE_FAILED, "扫描区域像素复制失败"))
+        Err(ToolError::new(CAPTURE_FAILED, "采样区域像素复制失败"))
     } else {
         let lines = unsafe {
             GetDIBits(
@@ -1056,12 +1197,18 @@ pub fn capture_client_region_bgra(
         if lines <= 0 {
             Err(ToolError::new(
                 CAPTURE_FAILED,
-                "GetDIBits 未返回任何扫描像素行",
+                "GetDIBits 未返回任何采样像素行",
             ))
         } else {
             Ok(bgra)
         }
     }
+}
+
+/// 按 EnumDisplayMonitors 顺序取第 index 台显示器的屏幕矩形(外部 1-based
+/// 序号先减一)。显示器不存在返回 None。
+pub(crate) fn monitor_rect_at(index: usize) -> Option<RECT> {
+    enum_monitors().get(index).map(|m| m.rect)
 }
 
 #[cfg(test)]

@@ -8,6 +8,10 @@
 //! - [`error`] — 稳定错误契约:错误码 + 可重试语义,调用方按码分支;
 //! - [`log`] — 分级日志(stderr/文件,stdout 协议通道绝不污染);
 //! - [`diagnostics`] — 运行统计、错误环形缓冲与 GDI 自检(get_diagnostics 工具)。
+//!
+//! v0.8.0 起工具目录扩展到 16 个(json! 宏单函数体超出默认递归上限)。
+
+#![recursion_limit = "256"]
 
 pub mod backend;
 pub mod diagnostics;

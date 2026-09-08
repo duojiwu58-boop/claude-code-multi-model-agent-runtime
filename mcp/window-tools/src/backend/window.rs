@@ -75,7 +75,7 @@ const TITLE_QUERY_TIMEOUT_MS: u32 = 500;
 ///
 /// 注意:SendMessageTimeoutW 的返回 LRESULT 只是"发送是否成功"(成功=1),
 /// WM_GETTEXT 实际拷贝的字符数在 lpdwResult 里,二者不可混淆。
-fn window_title(hwnd: HWND) -> String {
+pub(crate) fn window_title(hwnd: HWND) -> String {
     let mut buf = [0u16; 512];
     let mut len = 0usize;
     let ok = unsafe {
@@ -101,7 +101,8 @@ pub fn is_window_hung(hwnd: HWND) -> bool {
     unsafe { IsHungAppWindow(hwnd) }.as_bool()
 }
 
-fn window_class(hwnd: HWND) -> String {
+/// 窗口类名(后台文本工具用它判定 EDIT 控件)。
+pub(crate) fn window_class(hwnd: HWND) -> String {
     let mut buf = [0u16; 256];
     let len = unsafe { GetClassNameW(hwnd, &mut buf) };
     if len <= 0 {

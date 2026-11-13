@@ -1770,9 +1770,15 @@ fn gemini_flash_thinking_controls_support_37_and_newer_versions() {
         "gemini-3.10-flash",
         "gemini-3.8-flash-preview",
         "Gemini-4.0-Flash",
+        "gemini-4-argon",
+        "models/gemini-4-argon",
+        "Gemini-4-Argon-preview",
+        "gemini-4-hydrogen",
+        " MODELS/Gemini-4-Hydrogen ",
+        "gemini-4-hydrogen-preview",
     ] {
         profile.model = model.to_string();
-        assert!(supports_gemini_flash_thinking_levels(&profile), "{model}");
+        assert!(supports_gemini_thinking_levels(&profile), "{model}");
     }
 
     for model in [
@@ -1780,14 +1786,16 @@ fn gemini_flash_thinking_controls_support_37_and_newer_versions() {
         "gemini-3.8-pro",
         "gemini-flash",
         "other-4.0-flash",
+        "gemini-4-argonish",
+        "gemini-4-hydrogenish",
     ] {
         profile.model = model.to_string();
-        assert!(!supports_gemini_flash_thinking_levels(&profile), "{model}");
+        assert!(!supports_gemini_thinking_levels(&profile), "{model}");
     }
 
     profile.model = "gemini-3.8-flash".to_string();
     profile.transport = ProviderTransport::OpenAiChat;
-    assert!(!supports_gemini_flash_thinking_levels(&profile));
+    assert!(!supports_gemini_thinking_levels(&profile));
 
     assert_eq!(
         normalize_gemini_thinking_level("minimal", "gemini-4.0-flash"),
@@ -1849,6 +1857,26 @@ async fn admin_gemini_thinking_level_is_hot_persisted_and_profile_scoped() {
         load_persisted_gemini_thinking_level(&state_path).as_deref(),
         Some("low")
     );
+
+    for model in ["gemini-4-argon", "gemini-4-hydrogen"] {
+        state.routing.write().unwrap().profiles[0].model = model.to_string();
+        for level in ["medium", "high", "low"] {
+            let response = admin_set_gemini_thinking_level(
+                State(state.clone()),
+                Json(json!({"level": level})),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                effective_gemini_thinking_level(&state).unwrap().as_deref(),
+                Some(level)
+            );
+            assert_eq!(
+                load_persisted_gemini_thinking_level(&state_path).as_deref(),
+                Some(level)
+            );
+        }
+    }
 
     state.routing.write().unwrap().profiles[0]
         .openai_capabilities
@@ -6029,6 +6057,10 @@ fn selects_profile_identity_and_honors_disable_switch() {
     assert_eq!(upstream_identity_label(&profile, "gemini-3.6-flash"), None);
 }
 
+include!("gemini_background_tests.rs");
+include!("gemini_image_tests.rs");
+include!("gemini_latest_tests.rs");
+
 fn interactions_test_profile(file_name: &str) -> ProviderProfile {
     let mut capabilities = OpenAiCapabilities::gemini_interactions();
     capabilities.gemini_builtin_tools = vec![
@@ -7489,6 +7521,14 @@ async fn retries_known_mixed_tools_rejection_with_function_tools_only() {
         Arc::new(RwLock::new(InteractionContinuationCache::default())),
     )
     .await;
+    assert!(response
+        .headers()
+        .get_all(BRIDGE_WARNING_HEADER)
+        .iter()
+        .any(|value| value
+            .to_str()
+            .unwrap()
+            .contains("client function tools only")));
     assert_eq!(response.status(), StatusCode::OK);
     let requests = requests.lock().await;
     assert_eq!(requests.len(), 2);
@@ -7555,6 +7595,11 @@ async fn retries_unavailable_interaction_continuation_with_full_history() {
         ]
     });
     let response = forward_gemini_interactions_profile(profile, request, continuations).await;
+    assert!(response
+        .headers()
+        .get_all(BRIDGE_WARNING_HEADER)
+        .iter()
+        .any(|value| value.to_str().unwrap().contains("full-history recovery")));
     assert_eq!(response.status(), StatusCode::OK);
     let requests = requests.lock().await;
     assert_eq!(requests.len(), 2);
@@ -7862,7 +7907,8 @@ fn forces_no_tools_after_three_identical_completed_tool_cycles() {
     )
     .unwrap();
 
-    assert_eq!(translated["generation_config"]["tool_choice"], "none");
+    assert!(translated["generation_config"].get("tool_choice").is_none());
+    assert!(translated.get("tools").is_none());
     let system = translated["system_instruction"].as_str().unwrap();
     assert!(system.contains("Accuracy and complete evidence"));
     assert!(system.contains("same completed tool call and result repeated three times"));
@@ -7898,7 +7944,8 @@ fn repeated_tool_loop_detection_ignores_signature_only_assistant_messages() {
     let translated =
         translate_gemini_interactions_request(&request, &profile, &continuations).unwrap();
 
-    assert_eq!(translated["generation_config"]["tool_choice"], "none");
+    assert!(translated["generation_config"].get("tool_choice").is_none());
+    assert!(translated.get("tools").is_none());
 }
 
 #[test]
@@ -8692,6 +8739,453 @@ fn normalizes_gemini_38_thinking_levels_and_rejects_assistant_prefill() {
     let translated =
         translate_gemini_interactions_request(&request, &profile, &continuations).unwrap();
     assert_eq!(translated["generation_config"]["thinking_level"], "minimal");
+}
+
+#[test]
+fn gemini_4_thinking_levels_are_supported_on_all_request_paths() {
+    let mut profile = interactions_test_profile("gemini-4.json");
+    let continuations = RwLock::new(InteractionContinuationCache::default());
+    let request = json!({"messages": [{"role": "user", "content": "Hello"}]});
+    for model in [
+        "gemini-4-carbon",
+        "models/gemini-4-carbon-preview",
+        "gemini-4-argon",
+        "models/gemini-4-argon",
+        "gemini-4-argon-preview",
+        "gemini-4-hydrogen",
+        " MODELS/Gemini-4-Hydrogen ",
+        "gemini-4-hydrogen-preview",
+    ] {
+        profile.model = model.to_string();
+        profile.openai_capabilities.default_reasoning_effort = Some("none".to_string());
+        let translated =
+            translate_gemini_interactions_request(&request, &profile, &continuations).unwrap();
+        assert_eq!(translated["generation_config"]["thinking_level"], "low");
+
+        let probe = profile_probe_request(model);
+        let translated =
+            translate_gemini_interactions_request(&probe, &profile, &continuations).unwrap();
+        assert_eq!(translated["generation_config"]["thinking_level"], "low");
+
+        let mut disabled = request.clone();
+        disabled["thinking"] = json!({"type": "disabled"});
+        disabled["output_config"] = json!({"effort": "high"});
+        let translated =
+            translate_gemini_interactions_request(&disabled, &profile, &continuations).unwrap();
+        assert_eq!(translated["generation_config"]["thinking_level"], "low");
+
+        for (effort, expected) in [
+            ("none", "low"),
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            (
+                "max",
+                if is_gemini_4_hydrogen_model(model) {
+                    "xhigh"
+                } else {
+                    "high"
+                },
+            ),
+            (
+                "xhigh",
+                if is_gemini_4_hydrogen_model(model) {
+                    "xhigh"
+                } else {
+                    "high"
+                },
+            ),
+        ] {
+            let mut explicit = request.clone();
+            explicit["output_config"] = json!({"effort": effort});
+            let translated =
+                translate_gemini_interactions_request(&explicit, &profile, &continuations).unwrap();
+            assert_eq!(translated["generation_config"]["thinking_level"], expected);
+
+            profile.openai_capabilities.gemini_thinking_level_override = Some(effort.to_string());
+            let translated =
+                translate_gemini_interactions_request(&disabled, &profile, &continuations).unwrap();
+            assert_eq!(translated["generation_config"]["thinking_level"], expected);
+            profile.openai_capabilities.gemini_thinking_level_override = None;
+        }
+    }
+}
+
+#[test]
+fn gemini_4_argon_defaults_budgets_and_profile_precedence() {
+    let mut profile = interactions_test_profile("gemini-4.json");
+    profile.model = "gemini-4-argon".to_string();
+    profile.openai_capabilities.default_reasoning_effort = None;
+    profile.openai_capabilities.max_output_tokens = None;
+    let cache = RwLock::new(InteractionContinuationCache::default());
+    let base = json!({"messages": [{"role": "user", "content": "Hello"}]});
+    for (thinking, expected) in [
+        (Value::Null, "medium"),
+        (json!({"type": "adaptive"}), "medium"),
+        (json!({"type": "enabled", "budget_tokens": 1024}), "low"),
+        (json!({"type": "enabled", "budget_tokens": 2048}), "medium"),
+        (json!({"type": "enabled", "budget_tokens": 8192}), "high"),
+    ] {
+        let mut request = base.clone();
+        request["thinking"] = thinking;
+        let body = translate_gemini_interactions_request(&request, &profile, &cache).unwrap();
+        assert_eq!(body["generation_config"]["thinking_level"], expected);
+        assert_eq!(body["generation_config"]["max_output_tokens"], 65_536);
+        assert!(body["generation_config"].get("thinking_budget").is_none());
+    }
+    for stream in [false, true] {
+        for (budget, expected) in [
+            (1, 1),
+            (32_768, 32_768),
+            (65_536, 65_536),
+            (262_144, 262_144),
+        ] {
+            let mut request = base.clone();
+            request["stream"] = json!(stream);
+            request["max_tokens"] = json!(budget);
+            request["temperature"] = json!(0.2);
+            request["top_p"] = json!(0.9);
+            request["top_k"] = json!(5);
+            let body = translate_gemini_interactions_request(&request, &profile, &cache).unwrap();
+            assert_eq!(body["generation_config"]["max_output_tokens"], expected);
+            for field in ["temperature", "top_p", "top_k", "thinking_budget"] {
+                assert!(body["generation_config"].get(field).is_none());
+            }
+            if budget > 65_536 {
+                assert!(gemini_4_request_diagnostics(&request, &profile)
+                    .join(" ")
+                    .contains("background"));
+            }
+        }
+    }
+    profile.openai_capabilities.max_output_tokens = Some(4096);
+    let body = translate_gemini_interactions_request(&base, &profile, &cache).unwrap();
+    assert_eq!(body["generation_config"]["max_output_tokens"], 4096);
+    assert!(gemini_4_request_diagnostics(&base, &profile)
+        .join(" ")
+        .contains("empty answers"));
+
+    for (effort, expected) in [
+        ("none", "low"),
+        ("minimal", "low"),
+        ("medium", "medium"),
+        ("max", "high"),
+    ] {
+        profile.openai_capabilities.reasoning_effort_override = Some(effort.to_string());
+        let mut request = base.clone();
+        request["thinking"] = json!({"type": "disabled"});
+        request["output_config"] = json!({"effort": "low"});
+        apply_provider_request_overrides(&profile, &mut request).unwrap();
+        let body = translate_gemini_interactions_request(&request, &profile, &cache).unwrap();
+        assert_eq!(body["generation_config"]["thinking_level"], expected);
+    }
+}
+
+#[tokio::test]
+async fn gemini_4_argon_connectivity_probe_sends_low_thinking() {
+    let (base_url, requests, server) = spawn_probe_mock(
+        "/interactions",
+        StatusCode::OK,
+        json!({"status": "incomplete", "model": "gemini-4-argon",
+            "usage": {"total_input_tokens": 1, "total_output_tokens": 0, "total_thought_tokens": 1}}),
+    ).await;
+    let mut profile = probe_profile(
+        "gemini-4.json",
+        ProviderTransport::GeminiInteractions,
+        &base_url,
+        &format!("{base_url}/interactions"),
+        None,
+        Some("test-key".to_string()),
+    );
+    profile.model = "gemini-4-argon".to_string();
+    let state = probe_state(
+        vec![profile],
+        "gemini-4.json".to_string(),
+        None,
+        "http://unused.invalid".to_string(),
+    );
+    let (status, _) = run_profile_probe(&state, "gemini-4.json", Duration::from_secs(10)).await;
+    assert_eq!(status, StatusCode::OK);
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].0["generation_config"]["thinking_level"], "low");
+    assert_eq!(captured[0].0["generation_config"]["max_output_tokens"], 1);
+    assert_eq!(captured[0].0["store"], false);
+    server.abort();
+}
+
+#[test]
+fn gemini_review_streaming_sentinel_idless_and_empty_thoughts() {
+    for store in [false, true] {
+        let cache = Arc::new(RwLock::new(InteractionContinuationCache::default()));
+        let mut translator = GeminiInteractionsStreamTranslator::new(
+            "gemini-4-argon".into(),
+            "argon.json".into(),
+            computer_request_fixture(),
+            cache.clone(),
+            1,
+            store,
+        );
+        translator
+            .process_payload(r#"{"type":"step.start","index":0,"step":{"type":"thought"}}"#)
+            .unwrap();
+        translator
+            .process_payload(r#"{"type":"step.stop","index":0}"#)
+            .unwrap();
+        assert!(translator.assistant_content.is_empty());
+        translator.process_payload(r#"{"type":"step.start","index":1,"step":{"type":"function_call","id":"c1","name":"click"}}"#).unwrap();
+        for (kind, fragment) in [
+            ("arguments_delta", r#"{"x":10,"#),
+            ("arguments", r#""y":20,"intent":"click"}"#),
+        ] {
+            let event =
+                json!({"type":"step.delta","index":1,"delta":{"type":kind,"arguments":fragment}});
+            assert!(translator
+                .process_payload(&event.to_string())
+                .unwrap()
+                .is_empty());
+        }
+        translator
+            .process_payload(r#"{"type":"step.stop","index":1}"#)
+            .unwrap();
+        assert_eq!(translator.native_computer_calls[0]["arguments"]["x"], 10);
+        translator
+            .process_payload(
+                r#"{"type":"interaction.completed","interaction":{"status":"requires_action"}}"#,
+            )
+            .unwrap();
+        let result = translator.finish();
+        if store {
+            assert!(result.unwrap_err().contains("without an interaction id"));
+        } else {
+            let events = format!("{:?}", result.unwrap());
+            assert!(!events.contains(&usize::MAX.to_string()));
+            assert!(events.contains("computer_action_batch"));
+            assert!(cache.read().unwrap().calls.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn gemini_review_vision_resolves_managed_key_and_uses_low() {
+    let (url, captured, server) = spawn_probe_mock("/interactions", StatusCode::OK,
+        json!({"steps":[{"type":"model_output","content":[{"type":"text","text":"Visible evidence"}]}]})).await;
+    let mut source = interactions_test_profile("vision.json");
+    source.model = " MODELS/Gemini-4-Argon ".into();
+    source.api_key = None;
+    source.upstream_url = format!("{url}/interactions");
+    let state = probe_state(
+        vec![source.clone()],
+        "vision.json".into(),
+        Some("managed-key".into()),
+        url,
+    );
+    let job = VisionJob {
+        message_index: 0,
+        context: "Describe".into(),
+        media: vec![],
+    };
+    let observation = analyze_vision_job(&state, &source, &job).await.unwrap();
+    assert_eq!(observation, "Visible evidence");
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests[0].1["x-goog-api-key"], "managed-key");
+    assert_eq!(requests[0].0["model"], "gemini-4-argon");
+    assert_eq!(requests[0].0["generation_config"]["thinking_level"], "low");
+    assert!(source.api_key.is_none());
+    server.abort();
+}
+
+#[test]
+fn gemini_review_normalization_and_budget_diagnostics() {
+    let mut profile = interactions_test_profile("argon.json");
+    let cache = RwLock::new(InteractionContinuationCache::default());
+    for model in [" MODELS/Gemini-4-Argon ", " models/GEMINI-3.8-FLASH "] {
+        profile.model = model.into();
+        assert!(supports_gemini_thinking_levels(&profile));
+        assert_eq!(normalize_gemini_thinking_level("none", model), Some("low"));
+        let body =
+            translate_gemini_interactions_request(&profile_probe_request(model), &profile, &cache)
+                .unwrap();
+        assert_eq!(body["model"], normalized_gemini_model_name(model));
+        assert_eq!(body["generation_config"]["thinking_level"], "low");
+        assert!(gemini_count_tokens_url(&profile)
+            .unwrap()
+            .ends_with(&format!(
+                "/models/{}:countTokens",
+                normalized_gemini_model_name(model)
+            )));
+        let prefill = json!({"messages":[{"role":"user","content":"Finish"},{"role":"assistant","content":"The answer is"}]});
+        assert!(
+            translate_gemini_interactions_request(&prefill, &profile, &cache)
+                .unwrap_err()
+                .contains("assistant prefill")
+        );
+    }
+    profile.model = "gemini-4-argon".into();
+    profile.openai_capabilities.max_output_tokens = Some(65_536);
+    let request = json!({"max_tokens":128000,"output_config":{"effort":"max"}});
+    assert!(gemini_4_request_diagnostics(&request, &profile)
+        .join(" ")
+        .contains("128000 to 65536"));
+    assert!(gemini_interaction_request_diagnostics(&request)
+        .join(" ")
+        .contains("model-specific"));
+    profile.openai_capabilities.max_output_tokens = Some(4096);
+    assert!(gemini_4_request_diagnostics(&json!({}), &profile)
+        .join(" ")
+        .contains("client or profile"));
+    profile.openai_capabilities.max_output_tokens = Some(262_144);
+    assert!(
+        gemini_4_request_diagnostics(&json!({"max_tokens":1024}), &profile)
+            .iter()
+            .all(|message| !message.contains("Reduced"))
+    );
+}
+
+#[test]
+fn gemini_review_partial_duplicate_and_missing_results_do_not_resume() {
+    let cache = RwLock::new(InteractionContinuationCache::default());
+    let profile = interactions_test_profile("argon.json");
+    let first = json!({"messages":[{"role":"user","content":"Read both"}]});
+    let assistant = vec![
+        json!({"type":"tool_use","id":"a","name":"Read","input":{}}),
+        json!({"type":"tool_use","id":"b","name":"Read","input":{}}),
+    ];
+    remember_interaction_continuation(
+        &cache,
+        &profile.file_name,
+        &first,
+        "prior",
+        &assistant,
+        &[("a".into(), "Read".into()), ("b".into(), "Read".into())],
+    );
+    for ids in [
+        vec![Some("a")],
+        vec![Some("a"), None],
+        vec![Some("a"), Some("a")],
+        vec![Some("a"), Some("wrong")],
+        vec![],
+    ] {
+        let parts: Vec<Value> = ids
+            .into_iter()
+            .map(|id| json!({"type":"tool_result","tool_use_id":id,"content":"ok"}))
+            .collect();
+        let request = json!({"messages":[first["messages"][0].clone(),{"role":"assistant","content":assistant}, {"role":"user","content":parts}]});
+        assert!(interaction_continuation_for_request(
+            &profile.file_name,
+            &request,
+            request["messages"].as_array().unwrap(),
+            &cache
+        )
+        .is_none());
+        let translated = translate_gemini_interactions_request(&request, &profile, &cache).unwrap();
+        assert!(translated.get("previous_interaction_id").is_none());
+    }
+}
+
+#[tokio::test]
+async fn gemini_review_locked_control_rejects_without_changing_state() {
+    let mut profile = interactions_test_profile("argon.json");
+    profile.model = "gemini-4-argon".into();
+    profile.openai_capabilities.reasoning_effort_override = Some("high".into());
+    let state = probe_state(
+        vec![profile],
+        "argon.json".into(),
+        None,
+        "http://unused.invalid".into(),
+    );
+    *state.gemini_thinking_level.write().unwrap() = Some("low".into());
+    assert!(gemini_thinking_level_locked(&state));
+    let response =
+        admin_set_gemini_thinking_level(State(state.clone()), Json(json!({"level":"medium"})))
+            .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), 8192)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("locked"));
+    assert_eq!(
+        current_gemini_thinking_level(&state).unwrap().as_deref(),
+        Some("low")
+    );
+    assert_eq!(
+        effective_gemini_thinking_level(&state).unwrap().as_deref(),
+        Some("high")
+    );
+}
+
+#[tokio::test]
+async fn gemini_review_retries_429_and_bounds_header_wait_only() {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = attempts.clone();
+    let mock = Router::new()
+        .route(
+            "/retry",
+            post(move || {
+                let count = count.clone();
+                async move {
+                    if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "0")],
+                            "busy",
+                        )
+                            .into_response()
+                    } else {
+                        Json(json!({"id":"ok","status":"completed","steps":[]})).into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/headers",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                "late"
+            }),
+        )
+        .route(
+            "/body",
+            post(|| async {
+                let chunks = stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Ok::<_, Infallible>("data: done\n\n")
+                });
+                Response::new(axum::body::Body::from_stream(chunks))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let client = Client::new();
+    let mut profile = interactions_test_profile("argon.json");
+    profile.upstream_url = format!("http://{address}/retry");
+    let response = forward_gemini_interactions_profile(
+        profile,
+        json!({"messages":[{"role":"user","content":"hello"}]}),
+        Arc::new(RwLock::new(InteractionContinuationCache::default())),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let error = send_gemini_with_header_timeout(
+        || client.post(format!("http://{address}/headers")),
+        "test",
+        Duration::from_millis(50),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("headers timed out"));
+    let response = send_gemini_with_header_timeout(
+        || client.post(format!("http://{address}/body")),
+        "test",
+        Duration::from_millis(100),
+    )
+    .await
+    .unwrap();
+    assert!(response.text().await.unwrap().contains("done"));
+    server.abort();
 }
 
 fn responses_test_profile(file_name: &str, base_url: &str, model: &str) -> ProviderProfile {

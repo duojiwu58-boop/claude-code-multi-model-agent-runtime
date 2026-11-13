@@ -43,6 +43,7 @@ struct GeminiInteractionsStreamTranslator {
     native_computer_calls: Vec<Value>,
     completed: bool,
     finished: bool,
+    background_context_input: Option<u64>,
 }
 
 impl GeminiInteractionsStreamTranslator {
@@ -79,6 +80,7 @@ impl GeminiInteractionsStreamTranslator {
             native_computer_calls: Vec::new(),
             completed: false,
             finished: false,
+            background_context_input: None,
         }
     }
 
@@ -124,6 +126,9 @@ impl GeminiInteractionsStreamTranslator {
         if let Some(usage) = event.pointer("/metadata/total_usage") {
             self.capture_usage(usage);
         }
+        if let Some(usage) = event.get("usage") {
+            self.capture_usage(usage);
+        }
         let events = match event_type {
             "interaction.created"
             | "interaction.in_progress"
@@ -139,7 +144,9 @@ impl GeminiInteractionsStreamTranslator {
                         self.status = Some(status.to_string());
                     }
                 }
-                if event_type == "interaction.requires_action" {
+                if event_type == "interaction.requires_action"
+                    || self.status.as_deref().is_some_and(gemini_terminal_status)
+                {
                     self.completed = true;
                 }
                 Ok(Vec::new())
@@ -510,6 +517,9 @@ impl GeminiInteractionsStreamTranslator {
                         .and_then(Value::as_str)
                     {
                         append_streamed_tool_arguments(arguments, value)?;
+                        if active.anthropic_index == usize::MAX {
+                            return Ok(events);
+                        }
                         push_anthropic_event(
                             &mut events,
                             "content_block_delta",
@@ -595,11 +605,13 @@ impl GeminiInteractionsStreamTranslator {
                 thinking,
                 signature,
             } => {
-                let mut block = json!({"type": "thinking", "thinking": thinking});
-                if let Some(signature) = signature {
-                    block["signature"] = json!(signature);
+                if !thinking.is_empty() || signature.is_some() {
+                    let mut block = json!({"type": "thinking", "thinking": thinking});
+                    if let Some(signature) = signature {
+                        block["signature"] = json!(signature);
+                    }
+                    self.assistant_content.push(block);
                 }
-                self.assistant_content.push(block);
             }
             InteractionStreamingBlock::Text { text, annotations } => {
                 if !annotations.is_empty() {
@@ -701,9 +713,13 @@ impl GeminiInteractionsStreamTranslator {
                 "Gemini Interactions stream finished with status '{status}'"
             ));
         }
-        let interaction_id = self.interaction_id.clone().ok_or_else(|| {
-            "Gemini Interactions stream completed without an interaction id".to_string()
-        })?;
+        let interaction_id = self.interaction_id.clone().filter(|id| !id.is_empty());
+        if self.store_interactions && interaction_id.is_none() {
+            return Err(
+                "Gemini Interactions stream completed without an interaction id".to_string(),
+            );
+        }
+        let interaction_id = interaction_id.unwrap_or_default();
         let mut computer_batch_events = Vec::new();
         if let Some((block, call)) =
             computer_batch_tool_block(&interaction_id, &self.request, &self.native_computer_calls)
@@ -765,8 +781,13 @@ impl GeminiInteractionsStreamTranslator {
             delta["provider_metadata"] = metadata;
         }
         let mut usage = gemini_interaction_usage_to_anthropic(&self.usage, self.input_tokens);
+        if let Some(input) = self.background_context_input {
+            gemini_background_context_usage(&mut usage, input);
+        }
         if let Some(object) = usage.as_object_mut() {
-            object.remove("input_tokens");
+            if self.background_context_input.is_some() {
+                object.remove("input_tokens");
+            }
         }
         if let Some(server_tool_use) = self.server_tools.anthropic_usage() {
             usage["server_tool_use"] = server_tool_use;
@@ -931,6 +952,19 @@ struct GeminiInteractionsStreamOptions {
     estimated_input_tokens: u64,
     store_interactions: bool,
     flex_requested: bool,
+    background: Option<GeminiBackgroundTransport>,
+}
+
+fn gemini_stream_idle_timeout(model: &str, background: bool, flex: bool) -> Duration {
+    if background {
+        GEMINI_BACKGROUND_LIFETIME
+    } else if flex {
+        GEMINI_FLEX_STREAM_IDLE_TIMEOUT
+    } else if is_gemini_4_model(model) {
+        GEMINI_ARGON_REASONING_TIMEOUT
+    } else {
+        UPSTREAM_STREAM_IDLE_TIMEOUT
+    }
 }
 
 fn gemini_interactions_stream_response(
@@ -947,6 +981,11 @@ fn gemini_interactions_stream_response(
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
+    let idle_timeout = gemini_stream_idle_timeout(
+        &model,
+        options.background.is_some(),
+        options.flex_requested || actual_service_tier.as_deref() == Some("flex"),
+    );
     let mut translator = GeminiInteractionsStreamTranslator::new(
         model,
         profile_file,
@@ -955,15 +994,21 @@ fn gemini_interactions_stream_response(
         options.estimated_input_tokens,
         options.store_interactions,
     );
-    let actual_flex = actual_service_tier.as_deref() == Some("flex");
     translator.service_tier = actual_service_tier;
-    let idle_timeout = if options.flex_requested || actual_flex {
-        GEMINI_FLEX_STREAM_IDLE_TIMEOUT
-    } else {
-        UPSTREAM_STREAM_IDLE_TIMEOUT
+    if options.background.is_some() {
+        translator.background_context_input = Some(options.estimated_input_tokens);
+    }
+    // The resumable transport bounds each upstream read itself. An outer 15m
+    // timer would interrupt it just as it starts reconnecting after that read.
+    let bytes: GeminiByteStream = match options.background {
+        Some(transport) => resumable_gemini_background_stream(upstream, transport),
+        None => Box::pin(
+            upstream
+                .bytes_stream()
+                .map(|r| r.map_err(|e| e.to_string())),
+        ),
     };
-    let event_stream =
-        gemini_interactions_event_stream(upstream.bytes_stream(), translator, idle_timeout);
+    let event_stream = gemini_interactions_event_stream(bytes, translator, idle_timeout);
     Sse::new(event_stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()

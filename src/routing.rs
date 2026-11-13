@@ -302,6 +302,7 @@ async fn anthropic_messages(
             }
             let mut diagnostics = request_override_diagnostics;
             diagnostics.extend(gemini_interaction_request_diagnostics(&request));
+            diagnostics.extend(gemini_4_request_diagnostics(&request, &active_profile));
             if let Some(diagnostic) = gemini_interaction_pdf_tool_diagnostic(
                 &request,
                 &active_profile.openai_capabilities,

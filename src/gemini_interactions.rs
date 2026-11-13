@@ -913,6 +913,69 @@ fn interaction_assistant_steps(
     steps
 }
 
+// Only replay structured tool history when the supplied transcript is complete.
+// Missing signatures or orphan/duplicate results must never be repaired with invented state.
+fn interaction_history_supports_native_replay(messages: &[Value]) -> bool {
+    let mut pending = HashSet::new();
+    let mut seen = HashSet::new();
+    for message in messages {
+        let Some(parts) = message["content"].as_array() else {
+            continue;
+        };
+        let role = message["role"].as_str().unwrap_or_default();
+        let signed = parts.iter().any(|part| {
+            part["type"] == "thinking" && part["signature"].as_str().is_some_and(|s| !s.is_empty())
+        });
+        for part in parts {
+            match part["type"].as_str() {
+                Some("thinking") if !part["signature"].as_str().is_some_and(|s| !s.is_empty()) => {
+                    return false
+                }
+                Some("tool_use") => {
+                    if role != "assistant"
+                        || !signed
+                        || !part["input"].is_object()
+                        || !part["name"].as_str().is_some_and(|s| !s.is_empty())
+                    {
+                        return false;
+                    }
+                    let Some(id) = part["id"].as_str().filter(|s| !s.is_empty()) else {
+                        return false;
+                    };
+                    if !seen.insert(id) {
+                        return false;
+                    }
+                    pending.insert(id);
+                }
+                Some("tool_result") => {
+                    if role != "user" {
+                        return false;
+                    }
+                    let Some(id) = part["tool_use_id"].as_str() else {
+                        return false;
+                    };
+                    if !pending.remove(id) {
+                        return false;
+                    }
+                }
+                Some("text")
+                    if part["text"]
+                        .as_str()
+                        .is_some_and(is_legacy_interaction_tool_call_text) =>
+                {
+                    return false
+                }
+                // These blocks need provider-native state not represented by this replay mapper.
+                Some(
+                    "server_tool_use" | "mcp_tool_use" | "mcp_tool_result" | "redacted_thinking",
+                ) => return false,
+                _ => {}
+            }
+        }
+    }
+    !seen.is_empty() && pending.is_empty()
+}
+
 fn interaction_messages_have_tool_history(messages: &[Value]) -> bool {
     messages.iter().any(|message| {
         message
@@ -1462,6 +1525,96 @@ fn interaction_tool_choice(choice: &Value) -> Option<Value> {
     }
 }
 
+fn normalized_gemini_model_name(model: &str) -> String {
+    let model = display_model_name(model);
+    let model = model.trim();
+    let model = if model
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("models/"))
+    {
+        &model[7..]
+    } else {
+        model
+    };
+    model.trim().to_ascii_lowercase()
+}
+
+fn is_gemini_4_argon_model(model: &str) -> bool {
+    let model = normalized_gemini_model_name(model);
+    model == "gemini-4-argon" || model.starts_with("gemini-4-argon-")
+}
+
+fn is_gemini_4_hydrogen_model(model: &str) -> bool {
+    let model = normalized_gemini_model_name(model);
+    model == "gemini-4-hydrogen" || model.starts_with("gemini-4-hydrogen-")
+}
+
+// Inspect actual message content, including historical tool screenshots. Do not
+// mistake tool schemas or text mentioning images for image input.
+fn is_gemini_4_carbon_model(model: &str) -> bool {
+    let model = normalized_gemini_model_name(model);
+    model == "gemini-4-carbon" || model.starts_with("gemini-4-carbon-")
+}
+
+fn is_gemini_4_model(model: &str) -> bool {
+    is_gemini_4_argon_model(model)
+        || is_gemini_4_carbon_model(model)
+        || is_gemini_4_hydrogen_model(model)
+}
+
+fn gemini_thinking_choices(model: &str) -> &'static [&'static str] {
+    if is_gemini_4_hydrogen_model(model) {
+        &["low", "medium", "high", "xhigh"]
+    } else {
+        &["low", "medium", "high"]
+    }
+}
+
+fn gemini_default_thinking_level(model: &str) -> &'static str {
+    if is_gemini_4_hydrogen_model(model) {
+        "high"
+    } else {
+        "medium"
+    }
+}
+
+fn gemini_4_output_limit(request: &Value, model: &str) -> u64 {
+    if is_gemini_4_argon_model(model) {
+        argon_output_limit(request)
+    } else {
+        1_048_576
+    }
+}
+
+fn interaction_request_contains_image(request: &Value) -> bool {
+    fn contains_image(content: &Value) -> bool {
+        content.as_array().is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| match part.get("type").and_then(Value::as_str) {
+                    Some("image") => true,
+                    Some("tool_result") => contains_image(&part["content"]),
+                    _ => false,
+                })
+        })
+    }
+    request["messages"].as_array().is_some_and(|messages| {
+        messages
+            .iter()
+            .any(|message| contains_image(&message["content"]))
+    })
+}
+
+fn argon_output_limit(request: &Value) -> u64 {
+    // Live API verification: background image requests are routed to the
+    // text-only gemini-4-argon-agent backend. Standard Argon accepts images.
+    if interaction_request_contains_image(request) {
+        65_536
+    } else {
+        1_048_576
+    }
+}
+
 fn interaction_thinking_level(
     request: &Value,
     capabilities: &OpenAiCapabilities,
@@ -1475,14 +1628,7 @@ fn interaction_thinking_level(
         return Some(level.to_string());
     }
     if request.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
-        return Some(
-            if model.starts_with("gemini-3") || is_gemini_37_or_newer_flash_model(model) {
-                "low"
-            } else {
-                "none"
-            }
-            .to_string(),
-        );
+        return normalize_gemini_thinking_level("none", model).map(str::to_owned);
     }
     request
         .pointer("/output_config/effort")
@@ -1507,7 +1653,15 @@ fn interaction_thinking_level(
                         })
                         .or_else(|| {
                             (thinking.get("type").and_then(Value::as_str) == Some("adaptive"))
-                                .then_some("high")
+                                .then_some(
+                                    if is_gemini_4_argon_model(model)
+                                        || is_gemini_4_carbon_model(model)
+                                    {
+                                        "medium"
+                                    } else {
+                                        "high"
+                                    },
+                                )
                         })
                 })
                 .map(str::to_owned)
@@ -1519,17 +1673,26 @@ fn interaction_thinking_level(
                 .and_then(|effort| normalize_gemini_thinking_level(effort, model))
                 .map(str::to_owned)
         })
+        .or_else(|| {
+            is_gemini_4_model(model).then(|| gemini_default_thinking_level(model).to_string())
+        })
 }
 
 fn normalize_gemini_thinking_level<'a>(effort: &'a str, model: &str) -> Option<&'a str> {
+    let model = normalized_gemini_model_name(model);
+    // Model-specific support is narrower than the API-wide thinking enum.
+    // https://ai.google.dev/gemini-api/docs/thinking
     match effort {
         "none" | "minimal"
-            if model.starts_with("gemini-3") || is_gemini_37_or_newer_flash_model(model) =>
+            if model.starts_with("gemini-3")
+                || is_gemini_37_or_newer_flash_model(&model)
+                || is_gemini_4_model(&model) =>
         {
             Some("low")
         }
         "none" | "minimal" | "low" => Some(effort),
         "medium" => Some("medium"),
+        "xhigh" | "max" if is_gemini_4_hydrogen_model(&model) => Some("xhigh"),
         "high" | "xhigh" | "max" => Some("high"),
         _ => None,
     }
@@ -1784,6 +1947,46 @@ fn repeated_interaction_tool_loop(messages: &[Value]) -> Option<RepeatedInteract
     })
 }
 
+fn gemini_4_request_diagnostics(request: &Value, profile: &ProviderProfile) -> Vec<String> {
+    if !is_gemini_4_model(&profile.model) {
+        return Vec::new();
+    }
+    let mut diagnostics = Vec::new();
+    if request.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
+        let level =
+            interaction_thinking_level(request, &profile.openai_capabilities, &profile.model)
+                .unwrap_or_else(|| "medium".to_string());
+        diagnostics.push(format!(
+            "Gemini 4 cannot disable thinking; effective thinking level is '{level}'"
+        ));
+    }
+    let requested = request
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(65_536);
+    let limit = profile
+        .openai_capabilities
+        .max_output_tokens
+        .map_or(requested, |cap| requested.min(cap));
+    let effective = limit.min(gemini_4_output_limit(request, &profile.model));
+    if limit > effective && interaction_request_contains_image(request) {
+        diagnostics.push("Gemini 4 Argon image input uses native vision without background execution; max_output_tokens is capped at 65536 because the background backend rejects images".to_string());
+    }
+    if requested > effective {
+        diagnostics.push(format!("Reduced Gemini 4 max_output_tokens from {requested} to {effective} by the profile/model limit"));
+    }
+    if effective > 65_536 {
+        diagnostics.push(
+            "Gemini 4 long decode uses background execution and requires gemini_store=true"
+                .to_string(),
+        );
+    }
+    if effective < 32_768 {
+        diagnostics.push("Gemini 4 max_output_tokens includes thinking and final output; a budget below 32768 can produce truncated or empty answers. The lower client or profile limit was preserved".to_string());
+    }
+    diagnostics
+}
+
 fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
     let mut diagnostics = Vec::new();
     let mut add = |message: &str| {
@@ -1833,7 +2036,10 @@ fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
             "none" | "minimal" => add(&format!(
                 "Mapped Anthropic output_config.effort '{effort}' to the minimum supported Gemini thinking level 'low'"
             )),
-            "low" | "medium" | "high" | "xhigh" | "max" => {}
+            "xhigh" | "max" => add(&format!(
+                "Mapped Anthropic output_config.effort '{effort}' using the model-specific Gemini thinking levels"
+            )),
+            "low" | "medium" | "high" => {}
             _ => add(&format!(
                 "Ignored unsupported Anthropic output_config.effort '{effort}'"
             )),
@@ -2358,12 +2564,30 @@ fn interaction_continuation_for_request(
         if let Some(parts) = message.get("content").and_then(Value::as_array) {
             for part in parts {
                 if part.get("type").and_then(Value::as_str) == Some("tool_result") {
-                    if let Some(call_id) = part.get("tool_use_id").and_then(Value::as_str) {
-                        result_ids.push(call_id.to_string());
-                    }
+                    let call_id = part
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())?;
+                    result_ids.push(call_id.to_string());
                 }
             }
         }
+    }
+    let expected: HashSet<&str> = messages[..input_start]
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .and_then(|message| message.get("content").and_then(Value::as_array))
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|part| part.get("id").and_then(Value::as_str))
+        .collect();
+    let returned: HashSet<&str> = result_ids.iter().map(String::as_str).collect();
+    // Guard both call-id and transcript shortcuts. Full-history translation
+    // handles recovery; it must not conceal a partial batch behind a cached ID.
+    if returned.len() != result_ids.len() || returned != expected {
+        return None;
     }
     if !result_ids.is_empty() {
         let matched = {
@@ -2478,9 +2702,10 @@ fn translate_gemini_interactions_request_with_continuation(
     if messages.is_empty() {
         return Err("Gemini Interactions requires at least one message".to_string());
     }
-    let model = display_model_name(&profile.model);
+    let model = normalized_gemini_model_name(&profile.model);
     if (model.to_ascii_lowercase().starts_with("gemini-3")
-        || is_gemini_37_or_newer_flash_model(&model))
+        || is_gemini_37_or_newer_flash_model(&model)
+        || is_gemini_4_model(&model))
         && messages
             .last()
             .and_then(|message| message.get("role"))
@@ -2516,8 +2741,9 @@ fn translate_gemini_interactions_request_with_continuation(
             "Stored Gemini continuation was not selected for a request with tool history"
         );
     }
-    let text_tool_history =
-        continuation.is_none() && interaction_messages_have_tool_history(messages);
+    let text_tool_history = continuation.is_none()
+        && interaction_messages_have_tool_history(messages)
+        && !interaction_history_supports_native_replay(messages);
     let input = if let Some(continuation) = &continuation {
         messages[continuation.input_start..]
             .iter()
@@ -2547,6 +2773,7 @@ fn translate_gemini_interactions_request_with_continuation(
     if let Some(max_tokens) = request
         .get("max_tokens")
         .and_then(Value::as_u64)
+        .or_else(|| is_gemini_4_model(&profile.model).then_some(65_536))
         .map(|requested| {
             profile
                 .openai_capabilities
@@ -2554,6 +2781,11 @@ fn translate_gemini_interactions_request_with_continuation(
                 .map_or(requested, |limit| requested.min(limit))
         })
     {
+        let max_tokens = if is_gemini_4_model(&profile.model) {
+            max_tokens.min(gemini_4_output_limit(request, &profile.model))
+        } else {
+            max_tokens
+        };
         generation_config.insert("max_output_tokens".to_string(), json!(max_tokens));
     }
     if let Some(stop_sequences) = request.get("stop_sequences").and_then(Value::as_array) {
@@ -2583,7 +2815,7 @@ fn translate_gemini_interactions_request_with_continuation(
         .as_ref()
         .and_then(|_| requested_computer_cancel_tool_name(request));
     let tools = translated_interaction_tools(request, &profile.openai_capabilities)?;
-    if !tools.is_empty() {
+    if !tools.is_empty() && repeated_tool_loop.is_none() {
         let tool_choice = requested_cancel_tool
             .as_ref()
             .map(|name| json!({"allowed_tools": {"mode": "any", "tools": [name]}}))
@@ -2600,7 +2832,6 @@ fn translate_gemini_interactions_request_with_continuation(
         }
     }
     if let Some(repeated) = &repeated_tool_loop {
-        generation_config.insert("tool_choice".to_string(), json!("none"));
         warn!(
             provider = %profile.file_name,
             repeats = repeated.repeats,
@@ -2612,10 +2843,22 @@ fn translate_gemini_interactions_request_with_continuation(
     let mut body = Map::new();
     body.insert(
         "model".to_string(),
-        json!(display_model_name(&profile.model)),
+        json!(normalized_gemini_model_name(&profile.model)),
     );
     body.insert("input".to_string(), Value::Array(input));
     body.insert("store".to_string(), Value::Bool(store_interaction));
+    if is_gemini_4_model(&profile.model)
+        && generation_config
+            .get("max_output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            > 65_536
+    {
+        if !store_interaction {
+            return Err("Gemini 4 long decode requires gemini_store=true; reduce max_tokens to 65536 or enable storage explicitly".to_string());
+        }
+        body.insert("background".to_string(), json!(true));
+    }
     body.insert(
         "stream".to_string(),
         Value::Bool(
@@ -2635,7 +2878,7 @@ fn translate_gemini_interactions_request_with_continuation(
     if let Some(service_tier) = interaction_service_tier(request, &profile.openai_capabilities) {
         body.insert("service_tier".to_string(), json!(service_tier));
     }
-    if !tools.is_empty() {
+    if !tools.is_empty() && repeated_tool_loop.is_none() {
         body.insert("tools".to_string(), Value::Array(tools));
     }
     if let Some(continuation) = continuation {
@@ -3095,10 +3338,13 @@ fn translate_gemini_interactions_response_for_request(
             "Gemini Interactions returned non-terminal status '{status}' to a synchronous request"
         ));
     }
-    let steps = upstream
-        .get("steps")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Gemini Interactions response has no steps array".to_string())?;
+    // Argon may exhaust a tiny budget before producing any step and omit the
+    // field entirely (observed with the production 1-token store=false probe).
+    let steps: &[Value] = match upstream.get("steps") {
+        Some(Value::Array(steps)) => steps,
+        None | Some(Value::Null) if status == "incomplete" => &[],
+        _ => return Err("Gemini Interactions response has no steps array".to_string()),
+    };
     let mut content = Vec::new();
     let mut calls = Vec::new();
     let computer_context = request.and_then(computer_conversation_context);
@@ -3235,6 +3481,20 @@ fn translate_gemini_interactions_response_for_request(
     })
 }
 
+async fn send_gemini_with_header_timeout(
+    build: impl Fn() -> reqwest::RequestBuilder,
+    provider: &str,
+    timeout: Duration,
+) -> Result<reqwest::Response, String> {
+    // Bounds connection/headers and 429 retries, not the lifetime of an SSE body.
+    tokio::time::timeout(timeout, send_with_rate_limit_retry(build, provider))
+        .await
+        .map_err(|_| {
+            "Gemini response headers timed out (including rate-limit retries)".to_string()
+        })?
+        .map_err(|err| err.to_string())
+}
+
 async fn forward_gemini_interactions_profile(
     profile: ProviderProfile,
     request: Value,
@@ -3262,33 +3522,63 @@ async fn forward_gemini_interactions_profile(
     };
     let mut mixed_tools_fallback = false;
     let mut continuation_fallback = false;
+    let mut runtime_diagnostics = Vec::new();
+    if interaction_request.get("previous_interaction_id").is_none()
+        && request
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                interaction_messages_have_tool_history(messages)
+                    && !interaction_history_supports_native_replay(messages)
+            })
+    {
+        runtime_diagnostics.push("Gemini stored tool history unavailable: replaying textual observations without original thought state".to_string());
+    }
+    if let Err(message) = prepare_gemini_4_context_budget(
+        &profile,
+        &request,
+        &mut interaction_request,
+        &mut runtime_diagnostics,
+    )
+    .await
+    {
+        return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
+    }
     let upstream = loop {
-        let upstream_request = profile
-            .client
-            .post(&profile.upstream_url)
-            .header("x-goog-api-key", api_key)
-            .json(&interaction_request);
-        let upstream_request = apply_upstream_total_timeout(upstream_request, stream_requested);
-        let upstream_request = if !stream_requested
-            && interaction_request
-                .get("service_tier")
-                .and_then(Value::as_str)
-                == Some("flex")
+        let timeout = if interaction_request
+            .get("service_tier")
+            .and_then(Value::as_str)
+            == Some("flex")
         {
-            upstream_request.timeout(GEMINI_FLEX_REQUEST_TIMEOUT)
+            GEMINI_FLEX_REQUEST_TIMEOUT
+        } else if is_gemini_4_model(&profile.model) {
+            GEMINI_ARGON_REASONING_TIMEOUT
         } else {
-            upstream_request
+            UPSTREAM_REQUEST_TIMEOUT
         };
-        let response = match upstream_request.send().await {
-            Ok(response) => response,
-            Err(err) => {
-                error!(
-                    "Provider '{}' Gemini Interactions request to '{}' failed: {err}",
-                    profile.file_name, profile.upstream_url
-                );
-                return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &err.to_string());
+        let build = || {
+            let builder = profile
+                .client
+                .post(&profile.upstream_url)
+                .header("x-goog-api-key", api_key)
+                .json(&interaction_request);
+            if stream_requested {
+                builder
+            } else {
+                builder.timeout(timeout)
             }
         };
+        let response =
+            match send_gemini_with_header_timeout(build, &profile.file_name, timeout).await {
+                Ok(response) => response,
+                Err(message) => {
+                    return attach_bridge_diagnostics(
+                        anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &message),
+                        &profile.file_name,
+                        &runtime_diagnostics,
+                    );
+                }
+            };
         mark_profile_probe_response_headers();
         let status = response.status();
         if status.is_success() {
@@ -3308,6 +3598,10 @@ async fn forward_gemini_interactions_profile(
                 && remove_interaction_tools_incompatible_with_computer_use(&mut interaction_request)
             {
                 mixed_tools_fallback = true;
+                runtime_diagnostics.push(
+                    "Gemini rejected mixed tools; retried with computer_use as the sole tool"
+                        .to_string(),
+                );
                 warn!(
                     provider = %profile.file_name,
                     upstream_error = %message,
@@ -3319,6 +3613,10 @@ async fn forward_gemini_interactions_profile(
                 && remove_interaction_server_tools(&mut interaction_request)
             {
                 mixed_tools_fallback = true;
+                runtime_diagnostics.push(
+                    "Gemini rejected mixed tools; retried with client function tools only"
+                        .to_string(),
+                );
                 warn!(
                     provider = %profile.file_name,
                     "Gemini rejected mixed function and server-side tools; retrying this request with Claude Code function tools only"
@@ -3358,7 +3656,25 @@ async fn forward_gemini_interactions_profile(
                     remove_interaction_server_tools(&mut interaction_request);
                 }
             }
+            if let Err(message) = prepare_gemini_4_context_budget(
+                &profile,
+                &request,
+                &mut interaction_request,
+                &mut runtime_diagnostics,
+            )
+            .await
+            {
+                return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
+            }
             continuation_fallback = true;
+            let native_replay = request["messages"]
+                .as_array()
+                .is_some_and(|messages| interaction_history_supports_native_replay(messages));
+            runtime_diagnostics.push(if native_replay {
+                "Gemini stored continuation unavailable; retried with full-history recovery preserving native tool calls, results and thought signatures"
+            } else {
+                "Gemini stored continuation unavailable; retried with full-history recovery (tool observations are textual; original thought state cannot be restored)"
+            }.to_string());
             warn!(
                 provider = %profile.file_name,
                 "Gemini did not implement this stored continuation; retrying with safe full-history recovery"
@@ -3373,7 +3689,11 @@ async fn forward_gemini_interactions_profile(
         let response_status =
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let (response_status, error_type) = openai_error_contract(response_status, &message);
-        return anthropic_error(response_status, error_type, &message);
+        return attach_bridge_diagnostics(
+            anthropic_error(response_status, error_type, &message),
+            &profile.file_name,
+            &runtime_diagnostics,
+        );
     };
     let model = display_model_name(&profile.model);
     if stream_requested {
@@ -3381,18 +3701,25 @@ async fn forward_gemini_interactions_profile(
             .get("service_tier")
             .and_then(Value::as_str)
             == Some("flex");
-        return gemini_interactions_stream_response(
+        let provider_file = profile.file_name.clone();
+        let response = gemini_interactions_stream_response(
             upstream,
             model,
-            profile.file_name,
+            profile.file_name.clone(),
             request,
             continuations,
             GeminiInteractionsStreamOptions {
                 estimated_input_tokens,
                 store_interactions: profile.openai_capabilities.gemini_store,
                 flex_requested,
+                background: interaction_request
+                    .get("background")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    .then(|| GeminiBackgroundTransport::new(&profile)),
             },
         );
+        return attach_bridge_diagnostics(response, &provider_file, &runtime_diagnostics);
     }
     let actual_service_tier = upstream
         .headers()
@@ -3410,7 +3737,20 @@ async fn forward_gemini_interactions_profile(
             )
         }
     };
-    let translated = match translate_gemini_interactions_response_for_request(
+    let upstream_body = if interaction_request
+        .get("background")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        match poll_gemini_background(GeminiBackgroundTransport::new(&profile), upstream_body).await
+        {
+            Ok(body) => body,
+            Err(message) => return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &message),
+        }
+    } else {
+        upstream_body
+    };
+    let mut translated = match translate_gemini_interactions_response_for_request(
         &upstream_body,
         &model,
         actual_service_tier.as_deref(),
@@ -3426,6 +3766,14 @@ async fn forward_gemini_interactions_profile(
             return anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &message);
         }
     };
+    if interaction_request
+        .get("background")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        // Billed input across hops is not the conversation's context size.
+        gemini_background_context_usage(&mut translated.message["usage"], estimated_input_tokens);
+    }
     if profile.openai_capabilities.gemini_store {
         remember_interaction_continuation(
             &continuations,
@@ -3436,5 +3784,9 @@ async fn forward_gemini_interactions_profile(
             &translated.calls,
         );
     }
-    Json(translated.message).into_response()
+    attach_bridge_diagnostics(
+        Json(translated.message).into_response(),
+        &profile.file_name,
+        &runtime_diagnostics,
+    )
 }

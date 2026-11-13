@@ -297,6 +297,85 @@ Kimi Formula 官方工具通过本地 MCP 显式启用；空数组表示完全�
 
 ## Gemini 原生 Interactions（推荐）
 
+### Gemini 4 Argon / Carbon / Hydrogen 推理档位
+
+截至 2026-11-14，三个 Gemini 4 模型均使用 `gemini-interactions`，共享 1M 上下文预算及后台长输出路径。
+Carbon 与 Argon 支持 low/medium/high，默认 medium；Hydrogen 支持 low/medium/high/xhigh，默认 high。
+Hydrogen 的客户端 xhigh/max 保留为 xhigh，其他两个模型映射为 high；none/minimal/disabled 均映射为 low。
+`/admin/status` 返回模型对应的 `gemini_thinking_choices`，GUI 对 Hydrogen 显示“极高”第四档。
+持久化的 xhigh 在切换到 Carbon/Argon 后有效值为 high，管理端拒绝直接给这两个模型设置 xhigh。
+详见 [官方 Thinking](https://aistudio.google.com/docs/thinking) 与 [Long decode](https://aistudio.google.com/docs/long-decode)。
+
+`gemini-4-argon` 配置示例见
+[`gemini-4-argon.example.json`](examples/providers/gemini-4-argon.example.json)。
+依据 2026-10-15 核对的 [Google 推理文档](https://ai.google.dev/gemini-api/docs/thinking)
+和 [Argon 模型文档](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/4-argon)，
+Argon 只支持 `low`、`medium`、`high`，默认 `medium`，不能关闭推理。
+API 报错中的通用枚举包含 `minimal`，不代表 Argon 支持该值。
+
+| 客户端参数 | Argon 实际档位 |
+| --- | --- |
+| `thinking.type: disabled`、effort `none` / `minimal` / `low` | `low` |
+| effort `medium` | `medium` |
+| effort `high` / `xhigh` / `max` | `high` |
+| 无参数或 `thinking.type: adaptive` 且未指定 effort | `medium`（无参数时优先采用配置默认值） |
+
+优先级沿用现有 Gemini 控制链：配置顶层 `reasoning_effort` 强制值 > 管理界面保存的
+Gemini Thinking 档位 > 客户端禁用思考 > 客户端 effort > 客户端思考预算/自适应模式 >
+`capabilities.default_reasoning_effort` > 模型默认值。界面选择下一请求生效，状态持久化；
+Gemini Thinking 是现有 Gemini 配置共用的设置，不是按模型分别保存。
+顶层 `reasoning_effort` 存在时，`/admin/status` 返回 `gemini_thinking_locked: true`，
+GUI 显示“配置已锁定”并禁用档位选择；管理端修改返回明确的 400，且不覆盖持久化设置。
+删除顶层强制值后可恢复 GUI 控制，原有档位优先级不变。
+Anthropic `budget_tokens` 沿用桥接器的近似映射：小于 2048 为 low，2048–8191 为 medium，
+8192 及以上为 high；这是桥接策略，不是 Google 的精确 token 预算，绝不发送 `thinking_budget`。
+
+根据 [官方迁移指南](https://ai.google.dev/gemini-api/docs/latest-model)，建议日常使用 medium，
+简单任务用 low，困难推理用 high。`max_output_tokens` 同时包含思考和答案；未指定客户端预算时默认
+65536，示例 profile 允许最高 262144，官方建议普通应用至少 32768。桥接器保留用户显式设置的小预算并附带诊断，
+不擅自提高预算。连通性探测仍只用 1 token，允许有效的 incomplete/空答案响应。
+有效预算超过 65536 时自动使用 Developer API `background=true`；要求 profile 的
+`gemini_store=true`，否则明确报错，不自动开启存储。客户端预算与 profile 上限仍取较小者。
+例如客户端发送 `max_tokens: 262144` 且 profile 上限至少为 262144，才启用长输出。
+非流式请求轮询同一 interaction 并返回所有 model_output；SSE 保存每个 event_id，断线后
+通过 GET 的 `last_event_id` 续传，并去除近期重复事件，不重新提交生成请求。无法找到安全检查点时
+明确报错。单次读取/取响应头等待最多 15 分钟，后台任务最长 24 小时，连续无进展的重连最多 5 次；收到新的有效事件后重置计数。
+客户端丢弃后台流或轮询 future 时，尝试取消已知 ID 的活动任务；进程崩溃或尚未取得 ID 时无法保证取消。
+当前没有跨进程的后台作业恢复或独立任务管理 API。Gemini 4 普通 SSE 空闲超时为 15 分钟；Flex 保持原有超时策略。
+普通 SSE 的最终 message_delta 返回上游实际 input_tokens，以修正开头的本地估算。
+
+输入、思考与输出共用最多 1048576 token。普通请求按完整可见历史估算并预留输出空间；
+估算输入加输出预算超过窗口 75% 时，先调用原生 countTokens，失败则拒绝冒险提交。
+窗口不足时降低输出预算并附带诊断；输入已占满窗口时明确报错。原生计数仍无法重建存储会话的
+隐藏思考状态，最终由上游验证。后台多跳累计计费用量保留在 provider_metadata.google.interaction_usage；
+非流式 usage.input_tokens 使用可见历史估算，累计输入另存 usage.billed_input_tokens；累计缓存输入也
+另存 usage.billed_cache_read_input_tokens，不作为上下文缓存量重复计入，避免触发过早上下文压缩。
+后台轮询响应体上限为 64 MiB。采样参数不发送；思考摘要、签名和有状态续接沿用已有实现。
+
+Interactions 和 Token Count 统一去除模型名首尾空格、可选的 `models/` 前缀以及显示后缀，
+并使用小写模型 ID。三个 Gemini 4 模型均会拒绝以 assistant 结尾的 prefill 请求，依据
+[官方 Argon 开发指南](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/guides/gemini-4-argon)
+的聊天序列限制。
+
+请求预算因 profile、模型或上下文上限被降低时会附带 `x-claude-bridge-warning`；低预算提示同时
+涵盖客户端和 profile 配置。`xhigh/max` 按模型支持范围映射。
+运行时发生工具组合降级或有状态续接回退时，通过同一响应头说明原因。
+无状态模式（gemini_store=false）或续接 ID 不可用时，完整的已签名客户端工具历史按原生 thought、function_call、function_result 回放，保留调用 ID、参数、错误结果和签名。
+只有历史缺少签名、工具结果缺失/重复/孤立或包含无法恢复的服务端工具状态时，才使用明确诊断的有损文本恢复；不伪造签名。
+Argon 的图片输入仍保留已实测的 65536 上限，避免进入拒绝图片的后台后端；该限制不扩展到 Carbon/Hydrogen。
+429 使用统一的有限重试及 Retry-After 策略；等待响应头和重试的总时间受模型超时限制，
+拿到响应头后普通 SSE 使用空闲超时；后台 SSE 另有上述 24 小时总时限。
+
+视觉代理的 Gemini Interactions 路径支持桥接托管凭据，使用 `low` 思考档位及原有 4096
+输出预算以减少推理挤占观察结果的风险；这并不保证所有视觉任务都能在预算内完成。
+`gemini_store: false` 的流式响应允许不返回 interaction ID，并且不会写入续接缓存；
+存储模式仍必须返回非空 ID。空且无签名的 thought 不进入续接内容。
+Computer Use 参数增量仅内部累积，完成后统一输出动作批次，不向客户端泄漏内部占位索引。
+
+工具结果续接要求末尾结果 ID 与上一轮 assistant 的工具调用集合完整匹配，缺失、重复或
+无效 ID 不使用 call-ID 或 transcript 增量捷径，改走现有完整历史恢复；恢复不会补造缺失的
+工具结果。检测到重复工具循环后，本轮撤掉全部客户端及服务端工具和 tool_choice，要求最终答复。
+
 Gemini 3.8 Flash 建议使用已 GA 的 Google 原生 Interactions API，而不是 OpenAI 兼容层：
 
 ```json

@@ -304,14 +304,14 @@ fn gemini_interactions_vision_request(
         content.push(translated);
     }
     Ok(json!({
-        "model": display_model_name(&source.model),
+        "model": normalized_gemini_model_name(&source.model),
         "system_instruction": vision_system_prompt(),
         "input": [{"type": "user_input", "content": content}],
         "store": false,
         "stream": false,
         "generation_config": {
             "max_output_tokens": VISION_MAX_OUTPUT_TOKENS,
-            "thinking_level": "high"
+            "thinking_level": "low"
         }
     }))
 }
@@ -485,6 +485,10 @@ async fn analyze_vision_job(
             send_vision_request(request, source).await?
         }
         ProviderTransport::GeminiInteractions => {
+            let mut resolved_source = source.clone();
+            apply_bridge_managed_gemini_credentials(state, &mut resolved_source)
+                .map_err(VisionProxyError::gateway)?;
+            let source = &resolved_source;
             let api_key = source.api_key.as_ref().ok_or_else(|| {
                 VisionProxyError::gateway(format!(
                     "Vision provider '{}' has no API credential",

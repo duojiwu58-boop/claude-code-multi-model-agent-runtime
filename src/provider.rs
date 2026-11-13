@@ -1175,7 +1175,10 @@ fn load_native_provider_profiles(
         };
         let capability_defaults = match transport {
             ProviderTransport::LocalGemini => OpenAiCapabilities::local_gemini(),
-            ProviderTransport::GeminiInteractions => OpenAiCapabilities::gemini_interactions(),
+            ProviderTransport::GeminiInteractions => OpenAiCapabilities {
+                default_reasoning_effort: Some(gemini_default_thinking_level(&model).to_string()),
+                ..OpenAiCapabilities::gemini_interactions()
+            },
             ProviderTransport::OpenAiChat => OpenAiCapabilities::for_openai_base_url(&base_url),
             ProviderTransport::OpenAiResponses => {
                 OpenAiCapabilities::for_responses_base_url(&base_url)
@@ -1677,7 +1680,7 @@ fn load_persisted_gemini_thinking_level(state_path: &Path) -> Option<String> {
     read_state_object(state_path)
         .get("gemini_thinking_level")
         .and_then(Value::as_str)
-        .filter(|level| matches!(*level, "low" | "medium" | "high"))
+        .filter(|level| matches!(*level, "low" | "medium" | "high" | "xhigh"))
         .map(str::to_owned)
 }
 

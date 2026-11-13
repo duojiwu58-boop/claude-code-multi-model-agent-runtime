@@ -42,6 +42,8 @@ type
     FileName: string;
     Transport: string;
     ThinkingLevel: string;
+    ThinkingChoices: string;
+    ThinkingLocked: Boolean;
     ProviderReasoningSupported: Boolean;
     ProviderReasoningChoices: string;
     ProviderReasoningCurrent: string;
@@ -96,6 +98,7 @@ type
     FProfilesLoaded: Boolean;
     FSettingsStamp: string;
     FThinkingLevel: string;
+    FThinkingLocked: Boolean;
     FUpdatingThinkingUi: Boolean;
     FWorkerCount: Integer;
     procedure FormShown(Sender: TObject);
@@ -894,7 +897,7 @@ begin
     // 探测在途时保持“测试”按钮禁用，防止重复探测。
     FTestButton.Enabled := (FStatusLabel.Tag = 1) and not FTestInFlight;
     FThinkingGroup.Enabled :=
-      (FStatusLabel.Tag = 1) and (FThinkingLevel <> '');
+      (FStatusLabel.Tag = 1) and (FThinkingLevel <> '') and not FThinkingLocked;
     FProviderReasoningGroup.Enabled :=
       (FStatusLabel.Tag = 1) and FProviderReasoningSupported and
       (FProviderReasoningCurrent <> '');
@@ -980,6 +983,8 @@ begin
               LJson,
               'gemini_thinking_level'
             );
+            LSnapshot.ThinkingLocked := JsonBool(LJson, 'gemini_thinking_locked');
+            LSnapshot.ThinkingChoices := JsonArrayText(LJson, 'gemini_thinking_choices');
             if LJson.Values['reasoning_effort_control'] is TJSONObject then
             begin
               LControl := TJSONObject(LJson.Values['reasoning_effort_control']);
@@ -1072,9 +1077,23 @@ begin
     (ASnapshot.ThinkingLevel <> '');
   FUpdatingThinkingUi := True;
   try
+    FThinkingLocked := ASnapshot.ThinkingLocked;
     if LSupported then
     begin
       FThinkingGroup.Caption := 'Gemini Thinking（下一请求生效）';
+      // The service owns the model capability list; older services retain three tiers.
+      if Pos('xhigh', ASnapshot.ThinkingChoices) > 0 then
+      begin
+        if FThinkingGroup.Items.Count = 3 then
+          FThinkingGroup.Items.Add('极高');
+        FThinkingGroup.Columns := 4;
+      end
+      else
+      begin
+        if FThinkingGroup.Items.Count > 3 then
+          FThinkingGroup.Items.Delete(3);
+        FThinkingGroup.Columns := 3;
+      end;
       FThinkingLevel := LowerCase(ASnapshot.ThinkingLevel);
       if SameText(FThinkingLevel, 'low') then
         FThinkingGroup.ItemIndex := 0
@@ -1082,16 +1101,20 @@ begin
         FThinkingGroup.ItemIndex := 1
       else if SameText(FThinkingLevel, 'high') then
         FThinkingGroup.ItemIndex := 2
+      else if SameText(FThinkingLevel, 'xhigh') and (FThinkingGroup.Items.Count = 4) then
+        FThinkingGroup.ItemIndex := 3
       else
         FThinkingGroup.ItemIndex := -1;
-      FThinkingGroup.Enabled := not FBusy;
+      FThinkingGroup.Enabled := not FBusy and not FThinkingLocked;
+      if FThinkingLocked then
+        FThinkingGroup.Caption := 'Gemini Thinking（配置已锁定）';
     end
     else
     begin
       FThinkingLevel := '';
       FThinkingGroup.ItemIndex := -1;
       FThinkingGroup.Enabled := False;
-      FThinkingGroup.Caption := 'Gemini Thinking（3.7+ Flash）';
+      FThinkingGroup.Caption := 'Gemini Thinking（当前模型不支持调档）';
     end;
   finally
     FUpdatingThinkingUi := False;
@@ -1423,6 +1446,7 @@ begin
     0: LLevel := 'low';
     1: LLevel := 'medium';
     2: LLevel := 'high';
+    3: LLevel := 'xhigh';
   else
     Exit;
   end;

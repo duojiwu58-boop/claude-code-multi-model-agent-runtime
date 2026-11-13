@@ -514,7 +514,7 @@ fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value 
 }
 
 fn is_gemini_37_or_newer_flash_model(model: &str) -> bool {
-    let model = display_model_name(model).to_ascii_lowercase();
+    let model = normalized_gemini_model_name(model);
     let Some(rest) = model.strip_prefix("gemini-") else {
         return false;
     };
@@ -540,9 +540,25 @@ fn is_gemini_37_or_newer_flash_model(model: &str) -> bool {
     major > 3 || (major == 3 && minor >= 7)
 }
 
-fn supports_gemini_flash_thinking_levels(profile: &ProviderProfile) -> bool {
+fn supports_gemini_thinking_levels(profile: &ProviderProfile) -> bool {
     profile.transport == ProviderTransport::GeminiInteractions
-        && is_gemini_37_or_newer_flash_model(&profile.model)
+        && (is_gemini_37_or_newer_flash_model(&profile.model) || is_gemini_4_model(&profile.model))
+}
+
+fn gemini_thinking_level_locked(state: &AppState) -> bool {
+    state.routing.read().ok().is_some_and(|routing| {
+        routing
+            .profiles
+            .iter()
+            .find(|profile| profile.file_name == routing.active_file)
+            .is_some_and(|profile| {
+                supports_gemini_thinking_levels(profile)
+                    && profile
+                        .openai_capabilities
+                        .reasoning_effort_override
+                        .is_some()
+            })
+    })
 }
 
 fn effective_gemini_thinking_level(state: &AppState) -> Result<Option<String>, String> {
@@ -554,7 +570,7 @@ fn effective_gemini_thinking_level(state: &AppState) -> Result<Option<String>, S
         .profiles
         .iter()
         .find(|profile| profile.file_name == routing.active_file)
-        .filter(|profile| supports_gemini_flash_thinking_levels(profile))
+        .filter(|profile| supports_gemini_thinking_levels(profile))
     else {
         return Ok(None);
     };
@@ -566,14 +582,14 @@ fn effective_gemini_thinking_level(state: &AppState) -> Result<Option<String>, S
         return Ok(normalize_gemini_thinking_level(level, &profile.model).map(str::to_owned));
     }
     if let Some(level) = current_gemini_thinking_level(state)? {
-        return Ok(Some(level));
+        return Ok(normalize_gemini_thinking_level(&level, &profile.model).map(str::to_owned));
     }
     Ok(profile
         .openai_capabilities
         .default_reasoning_effort
         .as_deref()
         .and_then(|level| normalize_gemini_thinking_level(level, &profile.model))
-        .or(Some("medium"))
+        .or(Some(gemini_default_thinking_level(&profile.model)))
         .map(str::to_owned))
 }
 
@@ -688,6 +704,9 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
         "profile_source": profile_source,
         "settings_dir": state.settings_dir.to_string_lossy(),
         "gemini_thinking_level": gemini_thinking_level,
+        "gemini_thinking_choices": active_provider_profile(&state).filter(supports_gemini_thinking_levels)
+            .map(|profile| gemini_thinking_choices(&profile.model)).unwrap_or(&[]),
+        "gemini_thinking_locked": gemini_thinking_level_locked(&state),
         "reasoning_effort_control": reasoning_effort_control,
         "config_stamp": config_stamp,
         "settings_stamp": config_stamp
@@ -907,8 +926,8 @@ fn proxy_from_admin_request(request: &Value) -> Result<Option<String>, String> {
 
 fn gemini_thinking_level_from_admin_request(request: &Value) -> Result<String, String> {
     match request.get("level").and_then(Value::as_str) {
-        Some(level @ ("low" | "medium" | "high")) => Ok(level.to_string()),
-        Some(_) => Err("Field 'level' must be low, medium, or high".to_string()),
+        Some(level @ ("low" | "medium" | "high" | "xhigh")) => Ok(level.to_string()),
+        Some(_) => Err("Field 'level' must be low, medium, high, or xhigh".to_string()),
         None => Err("Missing string field 'level'".to_string()),
     }
 }
@@ -929,7 +948,10 @@ async fn admin_set_gemini_thinking_level(
             .profiles
             .iter()
             .find(|profile| profile.file_name == routing.active_file)
-            .is_some_and(supports_gemini_flash_thinking_levels),
+            .is_some_and(|profile| {
+                supports_gemini_thinking_levels(profile)
+                    && gemini_thinking_choices(&profile.model).contains(&level.as_str())
+            }),
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -941,9 +963,15 @@ async fn admin_set_gemini_thinking_level(
     if !supported {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Thinking level control requires an active Gemini 3.7-or-newer Flash Interactions profile"})),
+            Json(json!({"error": "Thinking level is unsupported by the active profile; Gemini 4 Carbon/Argon and Gemini 3.7-or-newer Flash support low/medium/high, Hydrogen also supports xhigh"})),
         )
             .into_response();
+    }
+    if gemini_thinking_level_locked(&state) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Gemini Thinking is locked by the profile's top-level reasoning_effort; remove that setting to enable GUI changes"})),
+        ).into_response();
     }
     if let Err(message) =
         persist_gemini_thinking_level_async(state.bridge_state_path.clone(), level.clone()).await

@@ -147,8 +147,7 @@ fn gemini_count_tokens_request(
         return Err("Gemini token count request produced no supported contents".to_string());
     }
 
-    let model = display_model_name(&profile.model);
-    let model = model.strip_prefix("models/").unwrap_or(&model);
+    let model = normalized_gemini_model_name(&profile.model);
     let mut generate = Map::new();
     generate.insert("model".to_string(), json!(format!("models/{model}")));
     generate.insert("contents".to_string(), Value::Array(contents));
@@ -195,8 +194,7 @@ fn gemini_count_tokens_request(
 }
 
 fn gemini_count_tokens_url(profile: &ProviderProfile) -> Result<String, String> {
-    let model = display_model_name(&profile.model);
-    let model = model.strip_prefix("models/").unwrap_or(&model);
+    let model = normalized_gemini_model_name(&profile.model);
     if model.is_empty()
         || !model.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')

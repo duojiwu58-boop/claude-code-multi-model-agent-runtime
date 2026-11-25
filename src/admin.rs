@@ -171,6 +171,8 @@ async fn dispatch_profile_probe(
     request: Value,
 ) -> Response {
     match profile.transport {
+        ProviderTransport::AntigravityLs => forward_ls_profile(state, profile, request, &HeaderMap::new()).await,
+        ProviderTransport::Codex => forward_codex_profile(profile, request).await,
         ProviderTransport::OpenAiChat => {
             forward_openai_profile(profile, request, state.thought_signatures.clone()).await
         }
@@ -310,7 +312,9 @@ async fn run_profile_probe(
     .flatten()
     .collect::<Vec<_>>();
 
-    let request = profile_probe_request(&profile.model);
+    let request = if profile.transport == ProviderTransport::AntigravityLs {
+        json!({"model":profile.model,"stream":false,"messages":[{"role":"user","content":"ping"}]})
+    } else { profile_probe_request(&profile.model) };
     let started = Instant::now();
     let probe_timing = Arc::new(RwLock::new(ProfileProbeTiming::new(started)));
     let outcome = tokio::time::timeout(
@@ -395,7 +399,7 @@ async fn run_profile_probe(
             );
         }
     };
-    // Every transport returns an Anthropic message at this boundary. Validate
+    // Inference transports return an Anthropic message at this boundary. Validate
     // that envelope explicitly because the native Anthropic path is otherwise
     // a byte-for-byte passthrough and a bare JSON object is not proof that the
     // selected model completed a request.
@@ -503,6 +507,8 @@ fn provider_profile_json(profile: &ProviderProfile, active_file: &str) -> Value 
         "proxy": public_proxy_url,
         "local_gemini": profile.local_gemini,
         "transport": profile.transport.as_str(),
+        "execution_mode": if profile.transport == ProviderTransport::AntigravityLs { "ls-owned-tools" } else { "provider" },
+        "ls": profile.ls.as_ref().map(|c| json!({"host_url":c.host_url,"workspace":c.workspace,"permission_mode":c.permission_mode,"usage_status":"unknown"})),
         "capabilities": openai_capabilities_json(&profile.openai_capabilities),
         "vision": {
             "mode": profile.vision.mode.as_str(),
@@ -629,6 +635,15 @@ fn reasoning_effort_control_json(state: &AppState) -> Result<Value, String> {
 }
 
 async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
+    let ls_host = if let Some(profile) = active_provider_profile(&state).filter(|p| p.transport == ProviderTransport::AntigravityLs) {
+        let outcome=tokio::time::timeout(Duration::from_secs(2),async {
+            let response=ls_host_post(profile.ls.as_ref().unwrap(),"/health",&json!({})).await?;
+            if !response.status().is_success(){return Err("LS Host is unavailable".to_string());}
+            let body=read_response_json_limited(response).await.map_err(|_|"Invalid Host status".to_string())?;
+            Ok::<_,String>(json!({"status":"ok","engine_version":body.pointer("/instance/lsVersion"),"pid":body.pointer("/instance/pid"),"execution":"ls-owned-tools","model":profile.model,"mode":"turbo","auto_approve":true,"groups":ls_model_groups(&body["models"])}))
+        }).await;
+        Some(match outcome {Ok(Ok(value))=>value,_=>json!({"status":"unavailable","execution":"ls-owned-tools"})})
+    } else {None};
     let transport = match current_gemini_transport(&state) {
         Ok(transport) => transport,
         Err(message) => {
@@ -708,6 +723,9 @@ async fn admin_status(State(state): State<Arc<AppState>>) -> Response {
             .map(|profile| gemini_thinking_choices(&profile.model)).unwrap_or(&[]),
         "gemini_thinking_locked": gemini_thinking_level_locked(&state),
         "reasoning_effort_control": reasoning_effort_control,
+        "codex_continuity": codex_continuity_status(),
+        "codex_capabilities": codex_capability_report(),
+        "ls_host":ls_host,
         "config_stamp": config_stamp,
         "settings_stamp": config_stamp
     }))
@@ -797,6 +815,14 @@ async fn admin_set_active_profile(
                 .into_response();
         }
     };
+    let mut lifecycle = match state.ls_lifecycle.try_write() {
+        Ok(guard) => guard,
+        Err(_) => return (StatusCode::CONFLICT, Json(json!({"error":"LS is busy or starting; finish/cancel the task before switching"}))).into_response(),
+    };
+    let previous = active_provider_profile(&state);
+    if let Err(err) = lifecycle.select(selected.ls.as_ref()).await {
+        return (StatusCode::CONFLICT, Json(json!({"error":err}))).into_response();
+    }
     if let Err(err) = persist_bridge_state_async(
         state.bridge_state_path.clone(),
         selected.file_name.clone(),
@@ -804,10 +830,11 @@ async fn admin_set_active_profile(
     )
     .await
     {
+        let _ = lifecycle.select(previous.as_ref().and_then(|p| p.ls.as_ref())).await;
         error!("Cannot persist active profile and proxy state: {err}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Provider switched but state was not persisted: {err}")})),
+            Json(json!({"error": format!("Provider was not switched because state persistence failed: {err}")})),
         )
             .into_response();
     }
@@ -830,7 +857,7 @@ async fn admin_reload_profiles(State(state): State<Arc<AppState>>) -> Response {
     let providers_dir = state.providers_dir.clone();
     let settings_dir = state.settings_dir.clone();
     let local_bridge_base_url = state.local_bridge_base_url.clone();
-    let loaded_profiles = match tokio::task::spawn_blocking(move || {
+    let mut loaded_profiles = match tokio::task::spawn_blocking(move || {
         load_provider_profiles(&providers_dir, &settings_dir, &local_bridge_base_url)
     })
     .await
@@ -848,6 +875,7 @@ async fn admin_reload_profiles(State(state): State<Arc<AppState>>) -> Response {
         }
     };
     let _transition = state.admin_state_lock.lock().await;
+    apply_ls_model_preferences(&mut loaded_profiles.profiles, &state.bridge_state_path);
     let active_file = match state.routing.read() {
         Ok(routing) => routing.active_file.clone(),
         Err(_) => {
@@ -884,10 +912,20 @@ async fn admin_reload_profiles(State(state): State<Arc<AppState>>) -> Response {
                 .into_response();
         }
     };
+    let mut lifecycle = match state.ls_lifecycle.try_write() {
+        Ok(guard) => guard,
+        Err(_) => return (StatusCode::CONFLICT, Json(json!({"error":"LS is busy or starting; finish/cancel the task before reloading"}))).into_response(),
+    };
+    let previous = active_provider_profile(&state);
+    let next = loaded_profiles.profiles.iter().find(|p| p.file_name == selected);
+    if let Err(err) = lifecycle.select(next.and_then(|p| p.ls.as_ref())).await {
+        return (StatusCode::CONFLICT, Json(json!({"error":err}))).into_response();
+    }
     if let Err(err) =
         persist_bridge_state_async(state.bridge_state_path.clone(), selected.clone(), proxy_url)
             .await
     {
+        let _ = lifecycle.select(previous.as_ref().and_then(|p| p.ls.as_ref())).await;
         error!("Cannot persist profiles and proxy state: {err}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

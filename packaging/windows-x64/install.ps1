@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$ProxyUrl,
     [switch]$DirectConnection,
     [int]$Port = 18787,
@@ -786,6 +786,19 @@ Copy-FileIfNeeded `
 Copy-FileIfNeeded `
     -Source (Join-Path $packageDir 'scripts\stop-bridge.ps1') `
     -Destination (Join-Path $scriptsDir 'stop-bridge.ps1')
+# LS is opt-in; install its binaries and background launcher together.
+if (Test-Path -LiteralPath (Join-Path $packageDir 'claude-ls-host.exe')) {
+    Copy-FileIfNeeded -Source (Join-Path $packageDir 'claude-ls-host.exe') -Destination (Join-Path $installDir 'claude-ls-host.exe')
+    Copy-FileIfNeeded -Source (Join-Path $packageDir 'claude-ls-launcher.exe') -Destination (Join-Path $installDir 'claude-ls-launcher.exe')
+    foreach ($lsScript in @('start-ls-host.ps1', 'manage-ls-host.ps1', 'invoke-ls-session.ps1', 'install-ls-session-task.ps1')) {
+        Copy-FileIfNeeded -Source (Join-Path $packageDir ('scripts\' + $lsScript)) -Destination (Join-Path $scriptsDir $lsScript)
+    }
+}
+if (Test-Path -LiteralPath (Join-Path $packageDir 'scripts\start-codex-host.ps1')) {
+    Copy-FileIfNeeded `
+        -Source (Join-Path $packageDir 'scripts\start-codex-host.ps1') `
+        -Destination (Join-Path $scriptsDir 'start-codex-host.ps1')
+}
 
 if ($configureGemini) {
     $escapedApiKey = $apiKey.Replace('\', '\\').Replace('"', '\"')
@@ -1134,6 +1147,13 @@ if (-not $SkipShortcuts) {
         $shortcut.Description = 'Claude Code Multi-Model Bridge'
         $shortcut.Save()
     }
+}
+
+if (Test-Path -LiteralPath (Join-Path $scriptsDir 'install-ls-session-task.ps1')) {
+    $lsPwsh = Get-Command pwsh.exe -ErrorAction Stop
+    & $lsPwsh.Source -NoProfile -NonInteractive -File (Join-Path $scriptsDir 'install-ls-session-task.ps1') -InstallDir $installDir
+    $lsTaskInstallExit = $LASTEXITCODE
+    if ($lsTaskInstallExit -ne 0) { throw "Interactive LS task installation failed: $lsTaskInstallExit" }
 }
 
 $service = Get-Service -Name $serviceName

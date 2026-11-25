@@ -183,6 +183,25 @@ if ($null -ne $service) {
     }
 }
 
+# Stop/delete the demand-only task after the bridge has stopped owning it.
+$lsScheduler = New-Object -ComObject Schedule.Service
+$lsScheduler.Connect()
+$lsFolder = $lsScheduler.GetFolder('\')
+$lsTask = $null
+try { $lsTask = $lsFolder.GetTask('ClaudeCodeBridge-LS-Interactive') } catch {}
+if ($null -ne $lsTask) {
+    $lsTask.Stop(0)
+    $lsFolder.DeleteTask('ClaudeCodeBridge-LS-Interactive',0)
+}
+
+$lsManager = Join-Path $installDir 'scripts\manage-ls-host.ps1'
+if (Test-Path -LiteralPath $lsManager) {
+    $pwshCommand = Get-Command pwsh.exe -ErrorAction Stop
+    & $pwshCommand.Source -NoProfile -File $lsManager -Action Uninstall -InstallDir $installDir
+    $lsStopExit = $LASTEXITCODE
+    if ($lsStopExit -ne 0) { throw "LS Host uninstall failed: $lsStopExit" }
+}
+
 if ([System.IO.File]::Exists($shortcutPath)) {
     Remove-Item -Path $shortcutPath -Force
 }

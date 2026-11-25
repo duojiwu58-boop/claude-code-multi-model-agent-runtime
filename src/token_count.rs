@@ -267,6 +267,9 @@ async fn anthropic_count_tokens(
     let input_tokens = estimate_anthropic_input_tokens(&request);
 
     let active_profile = active_provider_profile(&state);
+    if active_profile.as_ref().is_some_and(|p| p.transport == ProviderTransport::AntigravityLs) {
+        return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", "LS has no verified token-count endpoint");
+    }
     if let Some(profile) = active_profile.as_ref() {
         if let Some(identity) = upstream_identity_label(profile, &state.model) {
             if let Err(message) = append_bridge_identity(&mut request, &identity) {

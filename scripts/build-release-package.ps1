@@ -9,6 +9,7 @@ $packageTemplateDir = Join-Path $projectDir 'packaging\windows-x64'
 $buildTargetDir = Join-Path $projectDir 'target\package-build'
 $builtExe = Join-Path $buildTargetDir 'x86_64-pc-windows-msvc\release\claude-bridge.exe'
 $computerHostExe = Join-Path $buildTargetDir 'x86_64-pc-windows-msvc\release\claude-computer-host.exe'
+$lsHostExe = Join-Path $buildTargetDir 'x86_64-pc-windows-msvc\release\claude-ls-host.exe'
 $guiExe = Join-Path $projectDir 'ClaudeBridgeManager.exe'
 $appIcon = Join-Path `
     $projectDir `
@@ -83,6 +84,9 @@ if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $computerHostExe -PathType Leaf)) {
     throw "Computer Host executable was not produced: $computerHostExe"
 }
+if (-not (Test-Path -LiteralPath $lsHostExe -PathType Leaf)) {
+    throw "LS Host executable was not produced: $lsHostExe"
+}
 
 New-Item -ItemType Directory -Path $distDir -Force | Out-Null
 if (Test-Path -LiteralPath $stagingDir) {
@@ -100,6 +104,14 @@ if (Test-Path -LiteralPath $zipPath -PathType Leaf) {
 }
 
 Copy-Item -LiteralPath $packageTemplateDir -Destination $stagingDir -Recurse
+Copy-Item -LiteralPath (Join-Path $projectDir 'scripts\start-codex-host.ps1') -Destination (Join-Path $stagingDir 'scripts\start-codex-host.ps1')
+Copy-Item -LiteralPath (Join-Path $projectDir 'scripts\start-ls-host.ps1') -Destination (Join-Path $stagingDir 'scripts\start-ls-host.ps1')
+Copy-Item -LiteralPath (Join-Path $projectDir 'scripts\manage-ls-host.ps1') -Destination (Join-Path $stagingDir 'scripts\manage-ls-host.ps1')
+foreach ($lsScript in @('invoke-ls-session.ps1','install-ls-session-task.ps1')) {
+    Copy-Item -LiteralPath (Join-Path $projectDir ('scripts\'+$lsScript)) -Destination (Join-Path $stagingDir ('scripts\'+$lsScript))
+}
+Copy-Item -LiteralPath $lsHostExe -Destination (Join-Path $stagingDir 'claude-ls-host.exe')
+Copy-Item -LiteralPath (Join-Path (Split-Path $lsHostExe) 'claude-ls-launcher.exe') -Destination (Join-Path $stagingDir 'claude-ls-launcher.exe')
 Copy-Item `
     -LiteralPath $builtExe `
     -Destination (Join-Path $stagingDir 'claude-bridge.exe')

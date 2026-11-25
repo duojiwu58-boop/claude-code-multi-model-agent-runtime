@@ -6,17 +6,25 @@ description = "Multi-model Agent Runtime for Claude Code with deep semantic adap
 repository = "https://github.com/duojiwu58-boop/claude-code-multi-model-agent-runtime"
 license = "GPL-3.0-only"
 
+[workspace]
+members = ["crates/ls-wire", "crates/ls-agent-core"]
+resolver = "2"
+
 [dependencies]
-axum = "=0.8.9"
+ls-wire = { path = "crates/ls-wire" }
+ls-agent-core = { path = "crates/ls-agent-core" }
+serde = { version = "1", features = ["derive"] }
+axum = { version = "=0.8.9", features = ["multipart"] }
 base64 = "=0.22.1"
 futures-util = "=0.3.31"
 idna_adapter = "=1.0.0"
 indexmap = "=2.2.6"
+jsonschema = { version = "=0.55.1", default-features = false }
 png = "=0.17.16"
 reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
-serde_json = "=1.0.117"
+serde_json = "=1.0.151"
 sha2 = "=0.10.8"
-tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "signal", "time", "process", "io-util"] }
 tokio-tungstenite = "=0.28.0"
 tower-http = { version = "=0.6.11", features = ["limit", "trace"] }
 tracing = "=0.1.44"
@@ -24,7 +32,7 @@ tracing-appender = "=0.2.5"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 url = "=2.5.8"
 uuid = { version = "=1.8.0", features = ["v4"] }
-windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Environment", "Win32_System_Threading", "Win32_Security"] }
 windows = { version = "=0.61.3", features = [
     "Foundation",
     "Graphics",

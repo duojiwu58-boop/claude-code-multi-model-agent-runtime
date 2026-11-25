@@ -1,0 +1,726 @@
+{
+  "schemaVersion": 1,
+  "evidenceKind": "passive-renderer-CDP-Connect-WebSocket",
+  "captureSha256": "7917d79db9eeee8cc64d5f8758f0bdcd9b3dde29fb31dbfba8e41b401fcf6a76",
+  "captureBytes": 4593401,
+  "firstObservedUtc": "2026-11-25T01:51:03.298700+00:00",
+  "lastObservedUtc": "2026-11-25T02:03:24.343577+00:00",
+  "eventCounts": {
+    "observer-start": 1,
+    "network-enabled": 1,
+    "ws-sent": 175,
+    "ws-received": 1855,
+    "observer-disconnected": 1,
+    "discovery-unavailable": 20
+  },
+  "rpcStartCounts": {
+    "GetCascadeNuxes": 6,
+    "RecordAnalyticsEvent": 46,
+    "ListTerminals": 8,
+    "ListContextProviders": 5,
+    "GetSlashCommands": 6,
+    "GetCustomizationStates": 12,
+    "StreamAgentStateUpdates": 3,
+    "SubscribeToPlugins": 5,
+    "WatchVersionControlState": 7,
+    "UpdateConversationAnnotations": 11,
+    "GetTurnDiff": 12,
+    "RequestAgentStatePageUpdate": 3,
+    "WarmUpEnvironment": 4,
+    "FetchAdminControls": 4,
+    "ListRemotePlugins": 2,
+    "GetRepoInfos": 7,
+    "JetboxWriteSummary": 4,
+    "StartCascade": 2,
+    "GetAllWorkflows": 2,
+    "GetAllRules": 2,
+    "SendUserCascadeMessage": 2,
+    "GetMendelFlags": 3,
+    "CancelCascadeInvocation": 1,
+    "RetrieveUserQuotaSummary": 1,
+    "GetAgentScripts": 2,
+    "ResolveFolder": 1,
+    "StatUri": 1,
+    "GetUserStatus": 1
+  },
+  "installationAtExport": {
+    "version": "2.35.1",
+    "appAsarSha256": "9f0aad7274795d7fbde04931d96b348dcfc5f3d81d7373e6b70aeb09307442df",
+    "lsSha256": "73ce9a2405b455a93d1f13db2ae555da50406110217a349b6dd85c377fbdb9d1",
+    "frontendSha256": "f039eca519f153aeac9a0f1d10abc7afd8ff4b8009ef78d684669a3c7955f54d"
+  },
+  "sessions": [
+    {
+      "label": "session-1",
+      "startUtc": "2026-11-25T01:53:34.535472+00:00",
+      "startRequest": {
+        "source": "CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT",
+        "requestedModel": "MODEL_PLACEHOLDER_M532",
+        "projectEnvConfig": {
+          "projectId": "e86fc4fe-0fdc-47c2-9c5f-1af900cc98f9",
+          "defaultProjectEnvironment": {}
+        }
+      },
+      "plans": {
+        "11": {
+          "args": {
+            "steps": [
+              {
+                "status": "in_progress",
+                "title": "Inspect git diff and repo hygiene"
+              },
+              {
+                "status": "pending",
+                "title": "Audit Rust core crates"
+              },
+              {
+                "status": "pending",
+                "title": "Audit Delphi native host"
+              },
+              {
+                "status": "pending",
+                "title": "Audit Web frontend and build pipeline"
+              },
+              {
+                "status": "pending",
+                "title": "Run offline tests and static checks"
+              },
+              {
+                "status": "pending",
+                "title": "Synthesize audit report"
+              }
+            ]
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Inspect git diff and repo hygiene",
+            "markdown": "- [>] Inspect git diff and repo hygiene\n- [ ] Audit Rust core crates\n- [ ] Audit Delphi native host\n- [ ] Audit Web frontend and build pipeline\n- [ ] Run offline tests and static checks\n- [ ] Synthesize audit report\n",
+            "hidden": true
+          }
+        },
+        "26": {
+          "args": {
+            "steps": [
+              {
+                "status": "done",
+                "title": "Inspect git diff and repo hygiene"
+              },
+              {
+                "status": "in_progress",
+                "title": "Audit Rust core crates"
+              },
+              {
+                "status": "pending",
+                "title": "Audit Delphi native host"
+              },
+              {
+                "status": "pending",
+                "title": "Audit Web frontend and build pipeline"
+              },
+              {
+                "status": "pending",
+                "title": "Run offline tests and static checks"
+              },
+              {
+                "status": "pending",
+                "title": "Synthesize audit report"
+              }
+            ]
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Audit Rust core crates",
+            "markdown": "- [x] Inspect git diff and repo hygiene\n- [>] Audit Rust core crates\n- [ ] Audit Delphi native host\n- [ ] Audit Web frontend and build pipeline\n- [ ] Run offline tests and static checks\n- [ ] Synthesize audit report\n",
+            "hidden": true
+          }
+        },
+        "47": {
+          "args": {
+            "steps": [
+              {
+                "status": "done",
+                "title": "Inspect git diff and repo hygiene"
+              },
+              {
+                "status": "done",
+                "title": "Audit Rust core crates"
+              },
+              {
+                "status": "in_progress",
+                "title": "Audit Delphi native host"
+              },
+              {
+                "status": "pending",
+                "title": "Audit Web frontend and build pipeline"
+              },
+              {
+                "status": "pending",
+                "title": "Run offline tests and static checks"
+              },
+              {
+                "status": "pending",
+                "title": "Synthesize audit report"
+              }
+            ]
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Audit Delphi native host",
+            "markdown": "- [x] Inspect git diff and repo hygiene\n- [x] Audit Rust core crates\n- [>] Audit Delphi native host\n- [ ] Audit Web frontend and build pipeline\n- [ ] Run offline tests and static checks\n- [ ] Synthesize audit report\n",
+            "hidden": true
+          }
+        },
+        "64": {
+          "args": {
+            "steps": [
+              {
+                "status": "done",
+                "title": "Inspect git diff and repo hygiene"
+              },
+              {
+                "status": "done",
+                "title": "Audit Rust core crates"
+              },
+              {
+                "status": "done",
+                "title": "Audit Delphi native host"
+              },
+              {
+                "status": "in_progress",
+                "title": "Audit Web frontend and build pipeline"
+              },
+              {
+                "status": "pending",
+                "title": "Run offline tests and static checks"
+              },
+              {
+                "status": "pending",
+                "title": "Synthesize audit report"
+              }
+            ]
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Audit Web frontend and build pipeline",
+            "markdown": "- [x] Inspect git diff and repo hygiene\n- [x] Audit Rust core crates\n- [x] Audit Delphi native host\n- [>] Audit Web frontend and build pipeline\n- [ ] Run offline tests and static checks\n- [ ] Synthesize audit report\n",
+            "hidden": true
+          }
+        },
+        "80": {
+          "args": {
+            "steps": [
+              {
+                "status": "done",
+                "title": "Inspect git diff and repo hygiene"
+              },
+              {
+                "status": "done",
+                "title": "Audit Rust core crates"
+              },
+              {
+                "status": "done",
+                "title": "Audit Delphi native host"
+              },
+              {
+                "status": "done",
+                "title": "Audit Web frontend and build pipeline"
+              },
+              {
+                "status": "in_progress",
+                "title": "Run offline tests and static checks"
+              },
+              {
+                "status": "pending",
+                "title": "Synthesize audit report"
+              }
+            ]
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Run offline tests and static checks",
+            "markdown": "- [x] Inspect git diff and repo hygiene\n- [x] Audit Rust core crates\n- [x] Audit Delphi native host\n- [x] Audit Web frontend and build pipeline\n- [>] Run offline tests and static checks\n- [ ] Synthesize audit report\n",
+            "hidden": true
+          }
+        }
+      },
+      "focus": {
+        "2": {
+          "args": {
+            "focus": "Exploring project structure and repository state"
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Exploring project structure and repository state",
+            "hidden": true
+          }
+        },
+        "5": {
+          "args": {
+            "focus": "Reading documentation and surveying Rust, Delphi, Web, and test layouts"
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Reading documentation and surveying Rust, Delphi, Web, and test layouts",
+            "hidden": true
+          }
+        },
+        "12": {
+          "args": {
+            "focus": "Inspecting git diff, build scripts, and repository hygiene"
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Inspecting git diff, build scripts, and repository hygiene",
+            "hidden": true
+          }
+        },
+        "27": {
+          "args": {
+            "focus": "Auditing Rust FFI, transport, lifecycle, and runtime crates"
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Auditing Rust FFI, transport, lifecycle, and runtime crates",
+            "hidden": true
+          }
+        },
+        "48": {
+          "args": {
+            "focus": "Auditing Delphi host FFI client, task routing, draft store, and host utils"
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Auditing Delphi host FFI client, task routing, draft store, and host utils",
+            "hidden": true
+          }
+        },
+        "57": {
+          "args": {
+            "focus": "Auditing Delphi main window, task view, and WebView2 host wrapper"
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Auditing Delphi main window, task view, and WebView2 host wrapper",
+            "hidden": true
+          }
+        },
+        "65": {
+          "args": {
+            "focus": "Auditing Web frontend modules, markdown/XSS safety, and build scripts"
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Auditing Web frontend modules, markdown/XSS safety, and build scripts",
+            "hidden": true
+          }
+        },
+        "81": {
+          "args": {
+            "focus": "Running offline Node, Rust, and Delphi test suites"
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Running offline Node, Rust, and Delphi test suites",
+            "hidden": true
+          }
+        }
+      },
+      "requests": [
+        {
+          "timeUtc": "2026-11-25T01:53:34.535472+00:00",
+          "method": "StartCascade"
+        },
+        {
+          "timeUtc": "2026-11-25T01:53:34.544687+00:00",
+          "method": "WatchVersionControlState"
+        },
+        {
+          "timeUtc": "2026-11-25T01:53:34.677326+00:00",
+          "method": "JetboxWriteSummary"
+        },
+        {
+          "timeUtc": "2026-11-25T01:53:34.682162+00:00",
+          "method": "GetSlashCommands"
+        },
+        {
+          "timeUtc": "2026-11-25T01:53:34.683733+00:00",
+          "method": "SendUserCascadeMessage"
+        },
+        {
+          "timeUtc": "2026-11-25T01:53:34.684762+00:00",
+          "method": "StreamAgentStateUpdates"
+        },
+        {
+          "timeUtc": "2026-11-25T01:53:34.820659+00:00",
+          "method": "RequestAgentStatePageUpdate"
+        },
+        {
+          "timeUtc": "2026-11-25T01:54:39.624730+00:00",
+          "method": "WatchVersionControlState"
+        },
+        {
+          "timeUtc": "2026-11-25T01:57:09.273721+00:00",
+          "method": "CancelCascadeInvocation"
+        },
+        {
+          "timeUtc": "2026-11-25T01:57:09.364231+00:00",
+          "method": "GetTurnDiff"
+        }
+      ],
+      "workspaceUris": [
+        "file:///h%3A/Projects/AgyStudio"
+      ],
+      "sendConfig": {
+        "cascadeConfig": {
+          "plannerConfig": {
+            "planModel": "MODEL_PLACEHOLDER_M532",
+            "toolConfig": {
+              "runCommand": {
+                "autoCommandConfig": {
+                  "autoExecutionPolicy": "CASCADE_COMMANDS_AUTO_EXECUTION_OFF"
+                }
+              }
+            },
+            "useAiCredits": false,
+            "supportsLatexRendering": true
+          },
+          "executorConfig": {
+            "useCoreDirect": true
+          },
+          "conversationHistoryConfig": {}
+        },
+        "customAgentSpec": {
+          "builtinAgent": {
+            "defaultAgent": {
+              "isGoogle": false,
+              "isInteractive": true,
+              "surface": "AGENT_SURFACE_HUB"
+            }
+          }
+        },
+        "deliveryStrategy": "MESSAGE_DELIVERY_STRATEGY_WHEN_IDLE"
+      },
+      "correlationFields": [
+        "senderWindowId",
+        "clientMessageId"
+      ],
+      "subscribeConfig": {
+        "initialStepsPageBounds": {
+          "startIndex": -50
+        },
+        "trajectoryVerbosity": "CLIENT_TRAJECTORY_VERBOSITY_PROD_UI",
+        "initialGeneratorMetadatasPageBounds": {
+          "startIndex": -1
+        },
+        "initialExecutorMetadatasPageBounds": {
+          "endIndexExclusive": 0
+        },
+        "disableRehydration": true,
+        "enableLatencyTelemetry": true
+      },
+      "lastStateUtc": "2026-11-25T01:57:09.354584+00:00",
+      "lastState": {
+        "fullyIdle": true,
+        "status": "CASCADE_RUN_STATUS_IDLE",
+        "executableStatus": "CASCADE_RUN_STATUS_IDLE",
+        "executorLoopStatus": "CASCADE_RUN_STATUS_IDLE"
+      },
+      "lastObservedTotalLength": 85,
+      "cancelRequest": {},
+      "cancelUtc": "2026-11-25T01:57:09.273721+00:00",
+      "observedStepCount": 85,
+      "toolCounts": {
+        "update_focus": 8,
+        "run_command": 9,
+        "read_file": 49,
+        "update_steps": 5
+      },
+      "assistantResponseSteps": [],
+      "outcome": "cancelled-then-idle"
+    },
+    {
+      "label": "session-2",
+      "startUtc": "2026-11-25T01:57:41.195840+00:00",
+      "startRequest": {
+        "source": "CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT",
+        "requestedModel": "MODEL_PLACEHOLDER_M532",
+        "projectEnvConfig": {
+          "projectId": "8bb0750d-1e5a-4393-9302-92db4efa550b",
+          "defaultProjectEnvironment": {}
+        }
+      },
+      "plans": {},
+      "focus": {
+        "2": {
+          "args": {
+            "focus": "Inspecting project structure, git history, and docs"
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Inspecting project structure, git history, and docs",
+            "hidden": true
+          }
+        },
+        "10": {
+          "args": {
+            "focus": "Auditing architecture, key source files, and test suite"
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Auditing architecture, key source files, and test suite",
+            "hidden": true
+          }
+        },
+        "18": {
+          "args": {
+            "focus": "Reviewing Rust engine, LS lifecycle, and validation reports"
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Reviewing Rust engine, LS lifecycle, and validation reports",
+            "hidden": true
+          }
+        },
+        "26": {
+          "args": {
+            "focus": "Checking build scripts, Rust core structure, UI layout, and repo hygiene"
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Checking build scripts, Rust core structure, UI layout, and repo hygiene",
+            "hidden": true
+          }
+        },
+        "35": {
+          "args": {
+            "focus": "Verifying packaging drift, WebView2 host, and code metrics"
+          },
+          "finalStatus": "CORTEX_STEP_STATUS_DONE",
+          "finalHasArgs": false,
+          "render": {
+            "title": "Verifying packaging drift, WebView2 host, and code metrics",
+            "hidden": true
+          }
+        }
+      },
+      "requests": [
+        {
+          "timeUtc": "2026-11-25T01:57:41.195840+00:00",
+          "method": "StartCascade"
+        },
+        {
+          "timeUtc": "2026-11-25T01:57:41.201947+00:00",
+          "method": "WatchVersionControlState"
+        },
+        {
+          "timeUtc": "2026-11-25T01:57:41.323852+00:00",
+          "method": "JetboxWriteSummary"
+        },
+        {
+          "timeUtc": "2026-11-25T01:57:41.327605+00:00",
+          "method": "GetSlashCommands"
+        },
+        {
+          "timeUtc": "2026-11-25T01:57:41.329683+00:00",
+          "method": "SendUserCascadeMessage"
+        },
+        {
+          "timeUtc": "2026-11-25T01:57:41.330721+00:00",
+          "method": "StreamAgentStateUpdates"
+        },
+        {
+          "timeUtc": "2026-11-25T01:57:41.445898+00:00",
+          "method": "RequestAgentStatePageUpdate"
+        },
+        {
+          "timeUtc": "2026-11-25T02:00:23.540908+00:00",
+          "method": "GetTurnDiff"
+        }
+      ],
+      "workspaceUris": [
+        "file:///h%3A/Projects/AntigravityCN"
+      ],
+      "sendConfig": {
+        "cascadeConfig": {
+          "plannerConfig": {
+            "planModel": "MODEL_PLACEHOLDER_M532",
+            "toolConfig": {
+              "runCommand": {
+                "autoCommandConfig": {
+                  "autoExecutionPolicy": "CASCADE_COMMANDS_AUTO_EXECUTION_OFF"
+                }
+              }
+            },
+            "useAiCredits": false,
+            "supportsLatexRendering": true
+          },
+          "executorConfig": {
+            "useCoreDirect": true
+          },
+          "conversationHistoryConfig": {}
+        },
+        "customAgentSpec": {
+          "builtinAgent": {
+            "defaultAgent": {
+              "isGoogle": false,
+              "isInteractive": true,
+              "surface": "AGENT_SURFACE_HUB"
+            }
+          }
+        },
+        "deliveryStrategy": "MESSAGE_DELIVERY_STRATEGY_WHEN_IDLE"
+      },
+      "correlationFields": [
+        "senderWindowId",
+        "clientMessageId"
+      ],
+      "subscribeConfig": {
+        "initialStepsPageBounds": {
+          "startIndex": -50
+        },
+        "trajectoryVerbosity": "CLIENT_TRAJECTORY_VERBOSITY_PROD_UI",
+        "initialGeneratorMetadatasPageBounds": {
+          "startIndex": -1
+        },
+        "initialExecutorMetadatasPageBounds": {
+          "endIndexExclusive": 0
+        },
+        "disableRehydration": true,
+        "enableLatencyTelemetry": true
+      },
+      "lastStateUtc": "2026-11-25T02:00:23.534596+00:00",
+      "lastState": {
+        "fullyIdle": true,
+        "status": "CASCADE_RUN_STATUS_IDLE",
+        "executableStatus": "CASCADE_RUN_STATUS_IDLE",
+        "executorLoopStatus": "CASCADE_RUN_STATUS_IDLE"
+      },
+      "lastObservedTotalLength": 43,
+      "observedStepCount": 43,
+      "toolCounts": {
+        "update_focus": 5,
+        "run_command": 6,
+        "read_file": 22
+      },
+      "assistantResponseSteps": [
+        42
+      ],
+      "outcome": "report-returned-and-idle"
+    }
+  ],
+  "genericToolShapes": [
+    {
+      "session": "session-1",
+      "tool": "run_command",
+      "index": 3,
+      "outerType": "CORTEX_STEP_TYPE_GENERIC",
+      "metadataToolName": "run_command",
+      "nestedType": null,
+      "renderKeys": [
+        "titlePrefix",
+        "icon",
+        "aggregationKey",
+        "titleParts",
+        "contentBlocks"
+      ],
+      "contentBlockKinds": [
+        "terminal"
+      ]
+    },
+    {
+      "session": "session-1",
+      "tool": "read_file",
+      "index": 6,
+      "outerType": "CORTEX_STEP_TYPE_GENERIC",
+      "metadataToolName": "read_file",
+      "nestedType": null,
+      "renderKeys": [
+        "titlePrefix",
+        "icon",
+        "aggregationKey",
+        "titleParts"
+      ],
+      "contentBlockKinds": []
+    },
+    {
+      "session": "session-2",
+      "tool": "run_command",
+      "index": 3,
+      "outerType": "CORTEX_STEP_TYPE_GENERIC",
+      "metadataToolName": "run_command",
+      "nestedType": null,
+      "renderKeys": [
+        "titlePrefix",
+        "icon",
+        "aggregationKey",
+        "titleParts",
+        "contentBlocks"
+      ],
+      "contentBlockKinds": [
+        "terminal"
+      ]
+    },
+    {
+      "session": "session-2",
+      "tool": "read_file",
+      "index": 5,
+      "outerType": "CORTEX_STEP_TYPE_GENERIC",
+      "metadataToolName": "read_file",
+      "nestedType": null,
+      "renderKeys": [
+        "titlePrefix",
+        "icon",
+        "aggregationKey",
+        "titleParts"
+      ],
+      "contentBlockKinds": []
+    }
+  ],
+  "staticSourceAnchors": [
+    {
+      "term": "update_steps",
+      "characterOffset": 8099315,
+      "excerpt": "ed\"},YUc=/^\\s*[-*]\\s+\\[([ >xX\\-!])\\]\\s+(.+?)\\s*$/;\nfunction ZUc(a){if(a.metadata?.toolCall?.name===\"update_steps\"&&!a.error){var b=Bg(a)?.markdown;if(b){var c=[];for(let d of b.split(\"\\n\"))(b=YUc.exec(d))&&c.push({title:b[2],status:XUc[b[1]]??\"pending\"});c=c.length>0?c:void 0}else c=void 0;if(a.status===K.CortexStepStatus.CLEARED)return c;if(a.status===K.CortexStepStatus.DONE||a.status===K.CortexStepStatus.UNSPECIFIED)return c||a.step.case===\"generic\"&&(c=WUc(a.step.value.args?.steps))?c:WUc(a.metadata?.toolCall?.argumentsJson)}}\nfunction $Uc(a){var b;for(let f of a)if(a=ZUc(f)){b??=$X(f.metad"
+    },
+    {
+      "term": "update_focus",
+      "characterOffset": 1369088,
+      "excerpt": "\";return(a=a.titlePrefix??\"\")&&b?`${a} ${b}`:b||a}\nfunction jea(a){if(a.metadata?.toolCall?.name===\"update_focus\")return Bg(a)?.title?.trim()||void 0}function kea(a){return!a||/^[A-Z]{2}/.test(a)?a:a.charAt(0).toLowerCase()+a.slice(1)};var Fg={};\nFg.file_third_party_jetski_cortex_core_tools_pb_tools=od(\"CjN0aGlyZF9wYXJ0eS9qZXRza2kvY29ydGV4L2NvcmUvdG9vbHNfcGIvdG9vbHMucHJvdG8SFWV4YS5jb3J0ZXguY29yZS50b29scyKIAQoIUmVhZEZpbGUSFgoOZmlsZV9udW1fbGluZXMYASABKA0SFgoOZmlsZV9udW1fYnl0ZXMYAiABKA0SDAoEcGF0aBgDIAEoCRISCgpzdGFydF9saW5lGAQgASgFEhAKCGVuZF9saW5lGAUgASgFEhgKEGxpbmVfcmFuZ2VfYnl0ZXMYBiABKA0iigMKCEZ"
+    },
+    {
+      "term": "stepRenderInfo",
+      "characterOffset": 1335074,
+      "excerpt": "b=If(a.step);if(b&&b.step.case===\"runCommand\")return b.step.value;for(let h of a.step.value.result?.stepRenderInfo?.contentBlocks??[])if(h.block.case===\"terminal\"){var c=h.block.value;break}b=a.metadata?.toolCall?.name===\"run_command\";if(c||b||a.taskDetails){var d=a.step.value.args,f;if(a.metadata?.toolCall?.argumentsJson)try{var g=JSON.parse(a.metadata.toolCall.argumentsJson);g&&typeof g===\"object\"&&\n!Array.isArray(g)&&(f=g)}catch{}g=(...h)=>{for(let k of h){if(h=Jf(d,k))return h;h=f?.[k];if(typeof h===\"string\"&&h)return h}};return lc(K.CortexStepRunCommandSchema,{commandLine:c?.command||g(\"C"
+    },
+    {
+      "term": "accumulatedSectionsUpdate",
+      "characterOffset": 1345884,
+      "excerpt": ",0,0,d.totalLength,\"pendingAgentMessages\"));b.costSummary!==void 0&&(c.costSummary=b.costSummary);b.accumulatedSectionsUpdate&&(c.accumulatedSections=b.accumulatedSectionsUpdate.accumulatedSections);a=a.trajectorySlice??Tca({conversationId:b.conversationId,trajectoryId:b.trajectoryId});if(a.trajectoryId!==b.trajectoryId||a.conversationId!==b.conversationId)a={...a,trajectoryId:b.trajectoryId,conversationId:b.conversationId};b.mainTrajectoryUpdate&&\n(a=gda(a,b.mainTrajectoryUpdate));c.trajectorySlice=a;return c};function Qf(a,b=1){var c=globalThis;\"__jetboxPerf\"in c&&(c=c.__jetboxPerf.customMet"
+    }
+  ],
+  "limitations": [
+    "Not an upstream model prompt trace or Electron-main-process RPC trace.",
+    "Capture is sanitized and bounded, not byte-exact wire data.",
+    "Headers/auth payloads omitted; token-shaped keys also remove usage token counts.",
+    "Unknown pre-attach WS streams are skipped; no historical replay guarantee.",
+    "Installation hashes measured at export, not at every captured request.",
+    "Plan/focus counts refer to unique tool steps, not frame counts."
+  ]
+}

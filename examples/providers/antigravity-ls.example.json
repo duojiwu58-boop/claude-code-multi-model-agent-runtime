@@ -1,0 +1,16 @@
+{
+  "name": "Antigravity LS (LS executes tools)",
+  "protocol": "antigravity-ls",
+  "model": "gemini-4-neon-high",
+  "ls": {
+    "host_url": "http://127.0.0.1:18791",
+    "token_file": "C:/Users/YOUR_USER/AppData/Local/ClaudeCodeBridge/ls-host.token",
+    "workspace": "C:/YOUR_WORKSPACE",
+    "permission_mode": "turbo",
+    "timeout_seconds": 600,
+    "launch": {
+      "install_root": "C:/Users/YOUR_USER/AppData/Local/Programs/antigravity",
+      "data_root": "C:/Users/YOUR_USER/AppData/Local/ClaudeCodeBridge/ls-engine"
+    }
+  }
+}

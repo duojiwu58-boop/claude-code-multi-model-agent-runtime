@@ -1,5 +1,7 @@
 # Claude Code 多模型智能体运行时
 
+新增可选的 `antigravity-ls` 后端，由 LS 自主执行原生工具与 MCP。配置、原文输入入口与验收边界见 [Antigravity LS 说明](docs/ANTIGRAVITY_LS.md)。
+
 [English](README.md) | **简体中文**
 
 > 面向 Windows Claude Code 的深度语义网关。
@@ -19,6 +21,8 @@
 普通对话由当前选中的下游模型生成答案。使用 MCP 扩展时，则由该模型显式请求工具，再由声明好的执行器产出结果或文件。桥接器不会按提示词关键词偷偷路由，不会伪装当前模型并不具备的能力，也不会改写模型的最终回答。
 
 ## 当前真实能力
+
+本机 Codex 也可通过 `/v1/responses` 和 `/v1/chat/completions` 调用，支持真实 SSE、客户端工具、同线程图片结果及本地资源。参数差异、存储默认值和需原生 API 的能力见 [Codex 协议与验收说明](docs/CODEX_PROTOCOL.md#openai-http-入口)。
 
 下面的状态刻意区分真实链路证据与仅在源码中实现的支持。
 
@@ -43,7 +47,8 @@
 | Claude Bash/Text Editor/Memory 声明 | **已实测** | schema-less 客户端声明会展开为 Gemini 可调用的带 schema 函数，仍由 Claude Code 执行；tool-search 声明改为立即暴露函数 |
 | Claude Code 向 Gemini 输入音频/视频 | **不在范围** | Gemini 支持这些模态，但当前 Anthropic Messages 入口没有音频/视频块映射 |
 | Gemini 3.8 Flash Computer Use（Windows） | **已实测** | Gemini 3.8 Flash 原生动作会转换给 Claude Code 自动托管的 `gemini-computer` stdio MCP；Browser 和 Desktop 均已完成真实链路验证 |
-| Files/Batch/store 管理、Live/后台 API | **不在范围** | 保留清晰边界，不隐式启动额外服务或模型 |
+| Codex Files、Chat 存储、后台 Responses | **桥接适配** | 本地文件/PDF、查询、取消、续流；见[限额及验收](docs/CODEX_CAPABILITIES.md) |
+| Batch、Live API | **不在范围** | 需要独立的上游执行能力 |
 
 “能调用”不等于“深度适配”。通用兼容提供商只会收到其真实 API 和显式 profile 能承载的语义。
 
@@ -80,6 +85,7 @@
 | `gemini-interactions` | Google Gemini 原生 Interactions API | 保留 Google 状态、step、Thinking signature、服务端工具和原生续接 |
 | `openai-responses` | 提供商正式暴露 Responses | 保留 Responses item/event、服务端工具和经校验的有状态续接 |
 | `openai` | OpenAI Chat Completions 兼容服务 | 兼容面最广；更多语义可能需要按提供商重建或明确降级 |
+| `codex` | 本机已登录的 Codex CLI / 用户 Host | Codex 生成回答和客户端工具请求，Claude Code 执行工具；配置见[本机 Codex](PROVIDER_CONFIG.md#本机-codexclaude-code-继续执行工具) |
 
 ## 五分钟完成 Windows 配置
 

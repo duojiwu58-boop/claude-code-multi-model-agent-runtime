@@ -1,0 +1,11 @@
+{
+  "name": "Local Codex (GPT-6.1 Sol)",
+  "protocol": "codex",
+  "model": "gpt-6.1-sol",
+  "reasoning_effort": "high",
+  "codex": {
+    "app_server_url": "ws://127.0.0.1:18788",
+    "timeout_seconds": 600,
+    "native_continuation": true
+  }
+}

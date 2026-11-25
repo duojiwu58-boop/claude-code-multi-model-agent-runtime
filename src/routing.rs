@@ -1,11 +1,10 @@
-async fn responses(
+async fn legacy_responses(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> Response {
-    // Legacy compatibility only. Codex is intentionally kept on its native GPT
-    // provider and is not maintained through this bridge. Do not expand this
-    // route unless the maintenance policy at the top of this file changes.
+    // Legacy Gemini compatibility only; the profile-aware OpenAI handler never
+    // dispatches a Codex profile through this route.
     let api_key = state
         .fallback_api_key
         .clone()
@@ -186,6 +185,9 @@ async fn anthropic_messages(
             "No active provider profile",
         );
     };
+    if active_profile.transport == ProviderTransport::AntigravityLs {
+        return forward_ls_profile(&state, active_profile, request, &headers).await;
+    }
     // Per-profile runtime reasoning-effort value takes precedence over the
     // profile's static top-level value and the client request. It only
     // mutates the request-scoped profile clone: the routing table and the
@@ -230,6 +232,14 @@ async fn anthropic_messages(
         return anthropic_error(err.status, err.error_type, &err.message);
     }
     match active_profile.transport {
+        ProviderTransport::AntigravityLs => unreachable!("LS dispatched before prompt mutation"),
+        ProviderTransport::Codex => {
+            let provider_file = active_profile.file_name.clone();
+            let mut diagnostics = request_override_diagnostics;
+            diagnostics.extend(codex_request_diagnostics(&request));
+            let response = forward_codex_profile(active_profile, request).await;
+            attach_bridge_diagnostics(response, &provider_file, &diagnostics)
+        }
         ProviderTransport::Anthropic => {
             let mut diagnostics = request_override_diagnostics;
             diagnostics.extend(match active_profile.openai_capabilities.chat_dialect {

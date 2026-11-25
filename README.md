@@ -1,5 +1,9 @@
 # Claude Code Multi-Model Agent Runtime
 
+Antigravity LS autonomous execution is available as an opt-in backend. See [setup, exact user input and acceptance limits](docs/ANTIGRAVITY_LS.md).
+
+Local Codex also supports authenticated `/v1/responses`, `/v1/chat/completions`, incremental SSE, client tools and local response/conversation resources. See [Codex API behavior, storage defaults and limits](docs/CODEX_PROTOCOL.md#openai-http-入口).
+
 **English** | [简体中文](README.zh-CN.md)
 
 > A deeply adapted semantic gateway for Claude Code on Windows.
@@ -43,7 +47,8 @@ The labels below deliberately separate live evidence from source-level support.
 | Claude Bash/Text Editor/Memory declarations | **Verified** | Schema-less client declarations expand to schema-defined Gemini functions and remain executed by Claude Code; tool-search declarations use eager function exposure |
 | Gemini 3.8 Flash Computer Use on Windows | **Verified** | Native Gemini Computer Use actions are translated to a Claude Code-managed `gemini-computer` stdio MCP Host; Browser and Desktop execution are live-tested |
 | Gemini audio/video input from Claude Code | **Out of scope** | Gemini supports the modalities, but the current Anthropic Messages entry has no audio/video block mapping |
-| Files/Batch/store management and Live/background APIs | **Out of scope** | These platform-management surfaces remain outside the local coding bridge |
+| Codex Files, stored Chat and background Responses | **Adapted** | Local resources, PDF rendering, polling/cancel/replay; see [limits and verification](docs/CODEX_CAPABILITIES.md) |
+| Batch and Live APIs | **Out of scope** | Require separate upstream execution capabilities |
 
 “Callable” is not the same as “deeply adapted.” A generic compatible provider receives only the semantics its real API and explicit profile can support.
 
@@ -80,6 +85,8 @@ The bridge chooses the least-lossy configured transport, not a universal lowest 
 | `gemini-interactions` | Google Gemini native Interactions API | Preserves Google state, steps, thinking signatures, server tools, and native continuation |
 | `openai-responses` | Provider officially exposes Responses | Preserves Responses items/events, server tools, and validated stateful continuation |
 | `openai` | OpenAI Chat Completions-compatible service | Broadest compatibility; more semantics may need provider-specific reconstruction or explicit downgrade |
+| `codex` | Locally authenticated Codex CLI / user-mode host | Codex generates replies and client tool calls; Claude Code executes tools. See [local Codex setup](PROVIDER_CONFIG.md#本机-codexclaude-code-继续执行工具) |
+| `antigravity-ls` | Owned Antigravity LS / user-mode Host | LS executes native tools and MCP; exact user-input entry, approvals and recovery are described in [LS setup](docs/ANTIGRAVITY_LS.md) |
 
 ## Five-minute Windows setup
 

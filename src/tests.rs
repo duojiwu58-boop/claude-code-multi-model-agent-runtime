@@ -132,6 +132,8 @@ fn profile_json_keeps_plain_urls_and_non_url_identity_labels() {
         api_key: None,
         proxy_url: None,
         local_gemini: false,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::OpenAiChat,
         openai_capabilities: OpenAiCapabilities::default(),
         vision: VisionConfig::default(),
@@ -163,6 +165,8 @@ async fn health_json_never_exposes_url_userinfo_credentials() {
         api_key: None,
         proxy_url: Some("http://userproxy:pwproxy@127.0.0.1:7891".to_string()),
         local_gemini: false,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::OpenAiChat,
         openai_capabilities: OpenAiCapabilities::default(),
         vision: VisionConfig::default(),
@@ -172,6 +176,7 @@ async fn health_json_never_exposes_url_userinfo_credentials() {
     };
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client,
             proxy_url: Some("http://userproxy:pwproxy@127.0.0.1:7890".to_string()),
@@ -312,7 +317,7 @@ fn anthropic_sse_event_values(body: &str) -> Vec<Value> {
         .collect()
 }
 
-fn test_provider_profile(client: Client, upstream_url: String) -> ProviderProfile {
+pub(super) fn test_provider_profile(client: Client, upstream_url: String) -> ProviderProfile {
     ProviderProfile {
         file_name: "test-provider.json".to_string(),
         display_name: "Test Provider".to_string(),
@@ -326,12 +331,32 @@ fn test_provider_profile(client: Client, upstream_url: String) -> ProviderProfil
         api_key: None,
         proxy_url: None,
         local_gemini: false,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::OpenAiChat,
         openai_capabilities: OpenAiCapabilities::default(),
         vision: VisionConfig::default(),
         upstream_url,
         client,
     }
+}
+
+#[test]
+fn removed_agy_protocol_is_rejected() {
+    let dir = env::temp_dir().join(format!("removed-provider-{}", Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    let path = dir.join("removed-provider.json");
+    fs::write(
+        &path,
+        json!({"protocol": "agy", "model": "test-model", "agy": {
+            "host_url": "http://127.0.0.1:18789", "token_file": "C:/host/token"
+        }}).to_string(),
+    ).unwrap();
+    let result = load_native_provider_profiles(vec![path.clone()], "http://127.0.0.1:18787");
+    fs::remove_file(path).unwrap();
+    fs::remove_dir(dir).unwrap();
+    let error = result.err().expect("Removed protocol must not load");
+    assert!(error.contains("unsupported protocol 'agy'"), "{error}");
 }
 
 #[test]
@@ -647,6 +672,8 @@ fn qwen_vision_recognition_requires_official_qwen_endpoint() {
         api_key: None,
         proxy_url: None,
         local_gemini: false,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::Anthropic,
         openai_capabilities: OpenAiCapabilities {
             chat_dialect: dialect,
@@ -734,6 +761,8 @@ fn vision_profile_validation_rejects_missing_sources_and_proxy_chains() {
             api_key: None,
             proxy_url: None,
             local_gemini,
+            ls: None,
+        codex: None,
             transport: if local_gemini {
                 ProviderTransport::LocalGemini
             } else {
@@ -799,6 +828,8 @@ fn vision_proxy_removes_media_and_injects_untrusted_observation() {
         api_key: None,
         proxy_url: None,
         local_gemini: true,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::LocalGemini,
         openai_capabilities: OpenAiCapabilities::local_gemini(),
         vision: VisionConfig::default(),
@@ -935,6 +966,8 @@ async fn vision_proxy_calls_provider_once_and_reuses_base64_cache() {
         api_key: None,
         proxy_url: None,
         local_gemini: false,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::OpenAiChat,
         openai_capabilities: OpenAiCapabilities::default(),
         vision: VisionConfig::default(),
@@ -954,6 +987,8 @@ async fn vision_proxy_calls_provider_once_and_reuses_base64_cache() {
         api_key: None,
         proxy_url: None,
         local_gemini: false,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::OpenAiChat,
         openai_capabilities: OpenAiCapabilities::default(),
         vision: VisionConfig {
@@ -965,6 +1000,7 @@ async fn vision_proxy_calls_provider_once_and_reuses_base64_cache() {
     };
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client,
             proxy_url: None,
@@ -1054,6 +1090,7 @@ async fn mcp_generate_image_calls_gemini_saves_file_and_returns_preview() {
     let output_dir = env::temp_dir().join(format!("claude-bridge-images-{}", Uuid::new_v4()));
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client,
             proxy_url: None,
@@ -1188,6 +1225,7 @@ async fn configured_kimi_formula_is_exposed_and_executed_only_when_enabled() {
     profile.openai_capabilities.kimi_formula_tools = vec!["moonshot/web-search:latest".to_string()];
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client: Client::builder().build().unwrap(),
             proxy_url: None,
@@ -1816,6 +1854,7 @@ async fn admin_gemini_thinking_level_is_hot_persisted_and_profile_scoped() {
     profile.model = "gemini-3.8-flash".to_string();
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client: Client::builder().build().unwrap(),
             proxy_url: None,
@@ -1993,6 +2032,94 @@ fn normalized_profile_effort_maps_internal_tiers_to_official_choices() {
     assert_eq!(normalized_profile_effort(&gemini, "low"), None);
 }
 
+#[tokio::test]
+async fn local_qwen38_reasoning_gui_choices_persist_and_override_client_and_profile() {
+    let (url, requests, server) = spawn_probe_mock(
+        "/v1/chat/completions",
+        StatusCode::OK,
+        json!({"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":10,"completion_tokens":1}}),
+    )
+    .await;
+    let file = "qwen3.8-27b-local-q4.json";
+    let mut profile = anthropic_reasoning_test_profile(file, "qwen3.8-27b-q4-k-m");
+    profile.transport = ProviderTransport::OpenAiChat;
+    profile.base_url = url.clone();
+    profile.upstream_url = format!("{url}/v1/chat/completions");
+    profile.openai_capabilities = OpenAiCapabilities::default();
+    profile.openai_capabilities.reasoning_effort_override = Some("medium".into());
+    assert_eq!(
+        profile_effort_choices(&profile),
+        Some(&["xhigh", "medium", "low"][..])
+    );
+    assert_eq!(normalized_profile_effort(&profile, "max"), Some("xhigh"));
+    assert_eq!(normalized_profile_effort(&profile, "high"), Some("medium"));
+    let mut unsupported = profile.clone();
+    unsupported.transport = ProviderTransport::Anthropic;
+    assert_eq!(profile_effort_choices(&unsupported), None);
+    unsupported = profile.clone();
+    unsupported.model = "qwen3.8-other".into();
+    assert_eq!(profile_effort_choices(&unsupported), None);
+    unsupported = profile.clone();
+    unsupported.openai_capabilities.reasoning_effort = false;
+    assert_eq!(profile_effort_choices(&unsupported), None);
+
+    let root = env::temp_dir().join(format!("local-qwen38-effort-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let mut state = probe_state(vec![profile], file.into(), None, url);
+    Arc::get_mut(&mut state).unwrap().bridge_state_path = root.join("bridge-state.json");
+    assert_eq!(
+        reasoning_effort_control_json(&state).unwrap()["current"],
+        "medium"
+    );
+    for level in ["xhigh", "medium", "low"] {
+        let response =
+            admin_set_reasoning_effort(State(state.clone()), Json(json!({"level":level}))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            reasoning_effort_control_json(&state).unwrap()["current"],
+            level
+        );
+        assert_eq!(
+            load_persisted_reasoning_efforts(&state.bridge_state_path)[file],
+            level
+        );
+        let response = anthropic_messages(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(json!({
+                "model":"claude-sonnet-4-5", "max_tokens":512,
+                "output_config":{"effort":"max"},
+                "messages":[{"role":"user","content":"Reply OK"}]
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            requests.lock().unwrap().last().unwrap().0["reasoning_effort"],
+            level
+        );
+    }
+    for level in ["none", "high", "max"] {
+        let response =
+            admin_set_reasoning_effort(State(state.clone()), Json(json!({"level":level}))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(
+        reasoning_effort_control_json(&state).unwrap()["current"],
+        "low"
+    );
+    assert_eq!(
+        state.routing.read().unwrap().profiles[0]
+            .openai_capabilities
+            .reasoning_effort_override
+            .as_deref(),
+        Some("medium")
+    );
+    server.abort();
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn reasoning_effort_state_persistence_ignores_malformed_entries_and_preserves_keys() {
     let root = env::temp_dir().join(format!("claude-bridge-reasoning-state-{}", Uuid::new_v4()));
@@ -2065,6 +2192,7 @@ async fn reasoning_effort_control_admin_flow_persists_and_rejects_invalid_levels
     let gemini = interactions_test_profile("gemini-3.8-flash.json");
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client: Client::builder().build().unwrap(),
             proxy_url: None,
@@ -2194,6 +2322,7 @@ async fn reasoning_effort_control_persist_failure_keeps_memory_state() {
     qwen.openai_capabilities.chat_dialect = OpenAiChatDialect::Qwen;
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client: Client::builder().build().unwrap(),
             proxy_url: None,
@@ -2267,6 +2396,7 @@ async fn reasoning_effort_wire_assertion(
     profile.client = Client::builder().no_proxy().build().unwrap();
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client: Client::builder().no_proxy().build().unwrap(),
             proxy_url: None,
@@ -3636,6 +3766,8 @@ async fn model_by_id_serves_known_names_and_rejects_unknown() {
         api_key: None,
         proxy_url: None,
         local_gemini: false,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::Anthropic,
         openai_capabilities: OpenAiCapabilities::default(),
         vision: VisionConfig::default(),
@@ -3644,6 +3776,7 @@ async fn model_by_id_serves_known_names_and_rejects_unknown() {
     };
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client,
             proxy_url: None,
@@ -5220,6 +5353,8 @@ fn forwarding_prefers_bearer_and_supplies_default_version() {
         api_key: Some("api-key-secret".to_string()),
         proxy_url: None,
         local_gemini: false,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::Anthropic,
         openai_capabilities: OpenAiCapabilities::default(),
         vision: VisionConfig::default(),
@@ -5658,6 +5793,8 @@ fn qwen_anthropic_forwards_session_cache_header_for_official_domains() {
         api_key: Some("secret".to_string()),
         proxy_url: None,
         local_gemini: false,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::Anthropic,
         openai_capabilities: capabilities,
         vision: VisionConfig::default(),
@@ -5698,6 +5835,8 @@ async fn anthropic_forwarding_rejects_non_object_request_bodies() {
         api_key: Some("secret".to_string()),
         proxy_url: None,
         local_gemini: false,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::Anthropic,
         openai_capabilities: OpenAiCapabilities::default(),
         vision: VisionConfig::default(),
@@ -5961,6 +6100,8 @@ fn strips_bracket_suffix_from_model_identity_fallback() {
         api_key: Some("secret".to_string()),
         proxy_url: None,
         local_gemini: false,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::OpenAiChat,
         openai_capabilities: OpenAiCapabilities::default(),
         vision: VisionConfig::default(),
@@ -6036,6 +6177,8 @@ fn selects_profile_identity_and_honors_disable_switch() {
         api_key: None,
         proxy_url: None,
         local_gemini: false,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::OpenAiChat,
         openai_capabilities: OpenAiCapabilities::default(),
         vision: VisionConfig::default(),
@@ -6081,6 +6224,8 @@ fn interactions_test_profile(file_name: &str) -> ProviderProfile {
         api_key: Some("test-key".to_string()),
         proxy_url: None,
         local_gemini: false,
+        ls: None,
+        codex: None,
         transport: ProviderTransport::GeminiInteractions,
         openai_capabilities: capabilities,
         vision: VisionConfig::default(),
@@ -7004,6 +7149,7 @@ async fn anthropic_count_tokens_uses_kimi_native_estimator() {
     profile.openai_capabilities.chat_dialect = OpenAiChatDialect::Kimi;
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client: Client::builder().build().unwrap(),
             proxy_url: None,
@@ -7098,6 +7244,7 @@ async fn anthropic_messages_uses_bridge_managed_gemini_credential() {
     profile.api_key = None;
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client: Client::builder().no_proxy().build().unwrap(),
             proxy_url: None,
@@ -7174,6 +7321,7 @@ async fn anthropic_count_tokens_uses_google_native_endpoint() {
     profile.api_key = None;
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let state = Arc::new(AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client: Client::builder().build().unwrap(),
             proxy_url: None,
@@ -10209,6 +10357,8 @@ fn probe_profile(
         api_key,
         proxy_url: None,
         local_gemini: transport == ProviderTransport::LocalGemini,
+        ls: None,
+        codex: None,
         transport,
         openai_capabilities: OpenAiCapabilities::default(),
         vision: VisionConfig::default(),
@@ -10225,6 +10375,7 @@ fn probe_state(
 ) -> Arc<AppState> {
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     Arc::new(AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client: probe_http_client(),
             proxy_url: None,
@@ -10254,6 +10405,18 @@ fn probe_state(
         local_bridge_base_url: "http://127.0.0.1:18787".to_string(),
         admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
     })
+}
+
+#[tokio::test]
+async fn ls_lifecycle_switch_is_rejected_while_response_lease_is_held() {
+    let profile = test_provider_profile(Client::new(), "http://127.0.0.1:12345".into());
+    let file = profile.file_name.clone();
+    let state = probe_state(vec![profile], file.clone(), None, String::new());
+    let lease = state.ls_lifecycle.read().await;
+    let response = admin_set_active_profile(State(state.clone()), Json(json!({"file":file}))).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(state.routing.read().unwrap().active_file, file);
+    drop(lease);
 }
 
 #[derive(Clone)]

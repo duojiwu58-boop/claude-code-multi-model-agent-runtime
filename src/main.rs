@@ -1,9 +1,10 @@
-//! Maintenance scope: this bridge is maintained exclusively for Claude Code.
-//! Codex uses its native GPT provider as the primary and permanent path, so it
-//! is not a target for new bridge features. The legacy OpenAI Responses route
-//! remains only for backward compatibility; future protocol, routing, GUI, and
-//! reliability work should prioritize the Anthropic Messages API used by
-//! Claude Code.
+//! Claude Code model bridge with an authenticated OpenAI HTTP surface.
+//! A local Codex App Server can back Messages, Responses and Chat Completions;
+//! the requesting client retains ownership of function tools. Matching native
+//! API profiles pass through OpenAI requests and resources. The older Gemini
+//! Responses adapter remains scoped to the local Gemini profile.
+//! The explicit antigravity-ls Messages backend instead delegates native tools
+//! to its owned LS Host and forwards only trusted user text.
 
 mod windows_service;
 
@@ -113,6 +114,17 @@ type InteractionContinuationState = RwLock<InteractionContinuationCache>;
 include!("core.rs");
 include!("runtime.rs");
 include!("provider.rs");
+include!("ls_agent.rs");
+include!("codex.rs");
+include!("codex_state.rs");
+include!("codex_stream.rs");
+include!("codex_request.rs");
+include!("openai_inbound.rs");
+include!("openai_state.rs");
+include!("openai_background.rs");
+include!("openai_files.rs");
+include!("openai_chat_state.rs");
+include!("openai_inbound_stream.rs");
 include!("computer.rs");
 include!("mcp.rs");
 include!("vision.rs");
@@ -129,3 +141,9 @@ include!("openai_chat.rs");
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod codex_tests;
+
+#[cfg(test)]
+mod ls_agent_tests;

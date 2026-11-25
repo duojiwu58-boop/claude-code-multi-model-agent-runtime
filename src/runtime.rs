@@ -119,9 +119,10 @@ where
     let image_upstream_url = env::var("GEMINI_BRIDGE_IMAGE_UPSTREAM")
         .unwrap_or_else(|_| DEFAULT_IMAGE_UPSTREAM.to_string());
     let local_bridge_base_url = format!("http://{listen}");
-    let loaded_profiles =
+    let mut loaded_profiles =
         load_provider_profiles(&providers_dir, &settings_dir, &local_bridge_base_url)
             .map_err(|err| format!("Cannot load provider profiles: {err}"))?;
+    apply_ls_model_preferences(&mut loaded_profiles.profiles, &bridge_state_path);
     let active_profile = select_initial_profile(&loaded_profiles.profiles, &bridge_state_path);
     let proxy_url = load_persisted_gemini_proxy(&bridge_state_path).unwrap_or_else(|| {
         env::var("GEMINI_BRIDGE_PROXY")
@@ -137,6 +138,7 @@ where
     );
 
     let state = Arc::new(AppState {
+        ls_lifecycle: Default::default(),
         gemini_transport: Arc::new(RwLock::new(GeminiTransport {
             client: gemini_client,
             proxy_url,
@@ -167,12 +169,54 @@ where
         admin_state_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
 
+    api_background_recover(&state)?;
     let protected_routes = Router::new()
         .route("/v1/responses", post(responses))
+        .route("/v1/chat/completions", post(api_chat).get(api_chat_list))
+        .route(
+            "/v1/chat/completions/{id}",
+            get(api_chat_get)
+                .post(api_chat_update)
+                .delete(api_chat_delete),
+        )
+        .route("/v1/chat/completions/{id}/messages", get(api_chat_messages))
+        .route("/v1/responses/compact", post(api_compact))
+        .route("/v1/responses/input_tokens", post(api_input_tokens))
+        .route(
+            "/v1/responses/{id}",
+            get(api_response_retrieve).delete(api_response_delete),
+        )
+        .route("/v1/responses/{id}/cancel", post(api_response_cancel))
+        .route("/v1/files", get(api_file_list).post(api_file_create))
+        .route("/v1/files/{id}", get(api_file_get).delete(api_file_delete))
+        .route("/v1/files/{id}/content", get(api_file_content))
+        .route("/v1/responses/{id}/input_items", get(api_response_inputs))
+        .route("/v1/conversations", post(api_conversation_create))
+        .route(
+            "/v1/conversations/{id}",
+            get(api_conversation_get)
+                .post(api_conversation_update)
+                .delete(api_conversation_delete),
+        )
+        .route(
+            "/v1/conversations/{id}/items",
+            get(api_conversation_items).post(api_conversation_append),
+        )
+        .route(
+            "/v1/conversations/{id}/items/{item}",
+            get(api_conversation_item_get).delete(api_conversation_item_delete),
+        )
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/mcp", post(mcp))
         .route("/admin/status", get(admin_status))
+        .route("/admin/ls/status", post(admin_ls))
+        .route("/admin/ls/models", post(admin_ls))
+        .route("/admin/ls/model", post(admin_set_ls_model))
+        .route("/admin/ls/interactions", post(admin_ls))
+        .route("/admin/ls/respond", post(admin_ls))
+        .route("/admin/ls/cancel", post(admin_ls))
+        .route("/admin/ls/resume", post(admin_ls))
         .route("/admin/profiles", get(admin_profiles))
         .route("/admin/active-profile", post(admin_set_active_profile))
         .route("/admin/reload-profiles", post(admin_reload_profiles))
@@ -185,6 +229,11 @@ where
         )
         .route("/admin/reasoning-effort", post(admin_set_reasoning_effort))
         .route("/admin/shutdown", post(admin_shutdown))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            api_native_resources,
+        ))
+        .route_layer(middleware::from_fn(api_error_contract))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_local_auth,
@@ -209,6 +258,7 @@ where
     }
 
     on_started()?;
+    let ls_maintenance = tokio::spawn(maintain_ls(state.clone(), shutdown_rx.clone()));
 
     info!("Claude Code bridge listening on http://{address}");
     info!(
@@ -223,13 +273,17 @@ where
         }),
     );
     tokio::pin!(server);
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut server => result.map_err(|err| format!("Server failed: {err}")),
         _ = shutdown_signal(shutdown_rx, include_ctrl_c) => {
             let _ = graceful_tx.send(());
             finish_server_with_timeout(server.as_mut(), GRACEFUL_SHUTDOWN_TIMEOUT).await
         }
-    }
+    };
+    ls_maintenance.abort();
+    let _ = ls_maintenance.await;
+    state.ls_lifecycle.write().await.stop().await?;
+    result
 }
 
 async fn finish_server_with_timeout<F, E>(

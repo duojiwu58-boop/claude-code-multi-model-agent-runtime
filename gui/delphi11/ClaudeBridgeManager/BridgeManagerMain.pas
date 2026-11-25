@@ -50,6 +50,7 @@ type
     Stamp: string;
     SettingsDir: string;
     Detail: string;
+    LsControls: string;
   end;
 
   TMainForm = class(TForm)
@@ -67,6 +68,12 @@ type
     FStatusLabel: TLabel;
     FCurrentModelLabel: TLabel;
     FHintLabel: TLabel;
+    FLsPanel: TPanel;
+    FLsModel, FLsReasoning: TComboBox;
+    FLsGroups: string;
+    FLastLsControls: string;
+    FLsCurrentModel: string;
+    FUpdatingLs: Boolean;
     FThinkingGroup: TRadioGroup;
     FProviderReasoningGroup: TRadioGroup;
     FProviderReasoningChoices: TStringList;
@@ -101,6 +108,10 @@ type
     FThinkingLocked: Boolean;
     FUpdatingThinkingUi: Boolean;
     FWorkerCount: Integer;
+    procedure ApplyLsControls(const ASnapshot: TStatusSnapshot);
+    procedure LsModelChange(Sender: TObject);
+    procedure LsReasoningChange(Sender: TObject);
+    procedure SetLsModelAsync(const AModel: string);
     procedure FormShown(Sender: TObject);
     procedure FormResize(Sender: TObject);
     procedure RefreshClick(Sender: TObject);
@@ -324,6 +335,28 @@ begin
   FProviderReasoningGroup.Visible := False;
   FProviderReasoningGroup.OnClick := ProviderReasoningClick;
 
+  FLsPanel := TPanel.Create(Self);
+  FLsPanel.Parent := FTopPanel;
+  FLsPanel.SetBounds(596, 78, 400, 70);
+  FLsPanel.BevelOuter := bvNone;
+  FLsPanel.Visible := False;
+  with TLabel.Create(Self) do
+  begin
+    Parent := FLsPanel;
+    SetBounds(0, 0, 400, 20);
+    Caption := 'LS 模型 / 推理档位 · Turbo · 自动审批（新会话生效）';
+  end;
+  FLsModel := TComboBox.Create(Self);
+  FLsModel.Parent := FLsPanel;
+  FLsModel.SetBounds(0, 24, 270, 28);
+  FLsModel.Style := csDropDownList;
+  FLsModel.OnChange := LsModelChange;
+  FLsReasoning := TComboBox.Create(Self);
+  FLsReasoning.Parent := FLsPanel;
+  FLsReasoning.SetBounds(280, 24, 120, 28);
+  FLsReasoning.Style := csDropDownList;
+  FLsReasoning.OnChange := LsReasoningChange;
+
   FRefreshButton := TButton.Create(Self);
   FRefreshButton.Parent := FTopPanel;
   FRefreshButton.SetBounds(572, 24, 96, 34);
@@ -528,6 +561,7 @@ begin
       FSwitchButton.Left - CONTROL_GAP - FRefreshButton.Width;
     FThinkingGroup.Left :=
       FTopPanel.ClientWidth - EDGE_MARGIN - FThinkingGroup.Width;
+    FLsPanel.Left := FTopPanel.ClientWidth - EDGE_MARGIN - FLsPanel.Width;
     FProviderReasoningGroup.Left :=
       FTopPanel.ClientWidth - EDGE_MARGIN - FProviderReasoningGroup.Width;
   end;
@@ -979,6 +1013,15 @@ begin
               LSnapshot.FileName := JsonText(LProfile, 'file');
               LSnapshot.Transport := JsonText(LProfile, 'transport');
             end;
+            if LJson.Values['ls_host'] is TJSONObject then
+            begin
+              LControl := TJSONObject(LJson.Values['ls_host']);
+              LSnapshot.LsControls := LControl.ToJSON;
+              LSnapshot.Detail := 'LS Host: ' + JsonText(LControl, 'status');
+              if JsonText(LControl, 'engine_version') <> '' then
+                LSnapshot.Detail := LSnapshot.Detail + ' / ' +
+                  JsonText(LControl, 'engine_version');
+            end;
             LSnapshot.ThinkingLevel := JsonText(
               LJson,
               'gemini_thinking_level'
@@ -1034,7 +1077,10 @@ begin
     begin
       FActiveFile := ASnapshot.FileName;
       FCurrentModelLabel.Caption := '当前模型：' + ASnapshot.Model;
-      SetBridgeState(True, '当前配置：' + ASnapshot.FileName);
+      if ASnapshot.Detail <> '' then
+        SetBridgeState(True, '当前配置：' + ASnapshot.FileName + ' | ' + ASnapshot.Detail)
+      else
+        SetBridgeState(True, '当前配置：' + ASnapshot.FileName);
     end
     else
     begin
@@ -1050,6 +1096,7 @@ begin
       FStatusBar.Panels[1].Text := '配置目录：' + ASnapshot.SettingsDir;
     ApplyThinkingControls(ASnapshot);
     ApplyProviderReasoningControls(ASnapshot);
+    ApplyLsControls(ASnapshot);
     LStampChanged :=
       (ASnapshot.Stamp <> '') and (ASnapshot.Stamp <> FSettingsStamp);
     if LStampChanged then
@@ -1063,6 +1110,7 @@ begin
     SetBridgeState(False, ASnapshot.Detail);
     ApplyThinkingControls(ASnapshot);
     ApplyProviderReasoningControls(ASnapshot);
+    ApplyLsControls(ASnapshot);
     if not AQuiet then
       AppendLog('状态检查失败：' + ASnapshot.Detail);
   end;
@@ -1166,7 +1214,7 @@ begin
         FProviderReasoningGroup.ItemIndex := -1;
         FProviderReasoningGroup.Enabled := False;
         FProviderReasoningGroup.Visible := False;
-        FThinkingGroup.Visible := True;
+        FThinkingGroup.Visible := not SameText(ASnapshot.Transport, 'antigravity-ls');
       end;
     finally
       FUpdatingProviderReasoningUi := False;
@@ -1223,7 +1271,9 @@ begin
               LRow.Proxy := JsonText(LProfile, 'proxy');
               LRow.Active := JsonBool(LProfile, 'active');
               LTransport := JsonText(LProfile, 'transport');
-              if SameText(LTransport, 'gemini-interactions') then
+              if SameText(LTransport, 'antigravity-ls') then
+                LRow.Route := 'LS 自主执行'
+              else if SameText(LTransport, 'gemini-interactions') then
                 LRow.Route := 'Gemini 原生'
               else if SameText(LTransport, 'gemini') or
                  JsonBool(LProfile, 'local_gemini') then
@@ -1365,6 +1415,148 @@ begin
             AppendLog('模型已切换：' + AFileName);
             StartProfilesRefresh(True);
           end;
+        end);
+    end).Start;
+end;
+
+procedure TMainForm.ApplyLsControls(const ASnapshot: TStatusSnapshot);
+var
+  Root, Group, Variant: TJSONObject;
+  Groups, Variants: TJSONArray;
+  I, J, Selected: Integer;
+begin
+  FLsPanel.Visible := ASnapshot.Online and SameText(ASnapshot.Transport, 'antigravity-ls');
+  if not FLsPanel.Visible then Exit;
+  FThinkingGroup.Visible := False;
+  FProviderReasoningGroup.Visible := False;
+  if FBusy or FLsModel.DroppedDown or FLsReasoning.DroppedDown then Exit;
+  if (FLastLsControls <> '') and (FLastLsControls = ASnapshot.LsControls) and
+    (FLsCurrentModel = ASnapshot.Model) then Exit;
+  FUpdatingLs := True;
+  Root := TJSONObject.ParseJSONValue(ASnapshot.LsControls) as TJSONObject;
+  FLsModel.Items.BeginUpdate;
+  FLsReasoning.Items.BeginUpdate;
+  try
+    FLsModel.Items.Clear;
+    FLsReasoning.Items.Clear;
+    FLsGroups := '';
+    FLsCurrentModel := ASnapshot.Model;
+    FLsModel.Enabled := False;
+    FLsReasoning.Enabled := False;
+    if (Root = nil) or not (Root.Values['groups'] is TJSONArray) then Exit;
+    Groups := TJSONArray(Root.Values['groups']);
+    FLsGroups := Groups.ToJSON;
+    Selected := -1;
+    for I := 0 to Groups.Count - 1 do
+    begin
+      Group := Groups.Items[I] as TJSONObject;
+      FLsModel.Items.Add(JsonText(Group, 'label'));
+      Variants := Group.Values['variants'] as TJSONArray;
+      for J := 0 to Variants.Count - 1 do
+        if JsonText(Variants.Items[J] as TJSONObject, 'id') = ASnapshot.Model then Selected := I;
+    end;
+    FLsModel.ItemIndex := Selected;
+    FLsModel.Enabled := Groups.Count > 0;
+    if Selected < 0 then Exit;
+    Variants := (Groups.Items[Selected] as TJSONObject).Values['variants'] as TJSONArray;
+    for J := 0 to Variants.Count - 1 do
+    begin
+      Variant := Variants.Items[J] as TJSONObject;
+      FLsReasoning.Items.Add(JsonText(Variant, 'level'));
+      if JsonText(Variant, 'id') = ASnapshot.Model then FLsReasoning.ItemIndex := J;
+    end;
+    FLsReasoning.Enabled := Variants.Count > 1;
+  finally
+    FLastLsControls := ASnapshot.LsControls;
+    FLsReasoning.Items.EndUpdate;
+    FLsModel.Items.EndUpdate;
+    Root.Free;
+    FUpdatingLs := False;
+  end;
+end;
+
+procedure TMainForm.LsModelChange(Sender: TObject);
+var
+  Groups, Variants: TJSONArray;
+  I: Integer;
+  Chosen, Level: string;
+begin
+  if FUpdatingLs or FBusy or (FLsModel.ItemIndex < 0) then Exit;
+  Level := FLsReasoning.Text;
+  Groups := TJSONObject.ParseJSONValue(FLsGroups) as TJSONArray;
+  try
+    Variants := (Groups.Items[FLsModel.ItemIndex] as TJSONObject).Values['variants'] as TJSONArray;
+    Chosen := JsonText(Variants.Items[0] as TJSONObject, 'id');
+    for I := 0 to Variants.Count - 1 do
+      if JsonText(Variants.Items[I] as TJSONObject, 'level') = Level then
+        Chosen := JsonText(Variants.Items[I] as TJSONObject, 'id');
+    SetLsModelAsync(Chosen);
+  finally
+    Groups.Free;
+  end;
+end;
+
+procedure TMainForm.LsReasoningChange(Sender: TObject);
+var
+  Groups, Variants: TJSONArray;
+begin
+  if FUpdatingLs or FBusy or (FLsModel.ItemIndex < 0) or (FLsReasoning.ItemIndex < 0) then Exit;
+  Groups := TJSONObject.ParseJSONValue(FLsGroups) as TJSONArray;
+  try
+    Variants := (Groups.Items[FLsModel.ItemIndex] as TJSONObject).Values['variants'] as TJSONArray;
+    SetLsModelAsync(JsonText(Variants.Items[FLsReasoning.ItemIndex] as TJSONObject, 'id'));
+  finally
+    Groups.Free;
+  end;
+end;
+
+procedure TMainForm.SetLsModelAsync(const AModel: string);
+var
+  Profile, Previous: string;
+begin
+  if FClosing or FBusy or (AModel = FLsCurrentModel) then Exit;
+  Profile := FActiveFile;
+  Previous := FLsCurrentModel;
+  FLastLsControls := ''; // Also rebuild after a rejected model change.
+  SetBusy(True);
+  FLsModel.Enabled := False;
+  FLsReasoning.Enabled := False;
+  Inc(FWorkerCount);
+  TThread.CreateAnonymousThread(
+    procedure
+    var
+      Client: THTTPClient;
+      Request, Response: TJSONObject;
+      ErrorText: string;
+    begin
+      ErrorText := '';
+      try
+        Client := NewHttpClient(ACTION_RESPONSE_TIMEOUT_MS);
+        try
+          Request := TJSONObject.Create;
+          try
+            Request.AddPair('profile', Profile);
+            Request.AddPair('previous_model', Previous);
+            Request.AddPair('model', AModel);
+            Response := PostJsonWith(Client, '/admin/ls/model', Request.ToJSON);
+            Response.Free;
+          finally
+            Request.Free;
+          end;
+        finally
+          Client.Free;
+        end;
+      except
+        on E: Exception do ErrorText := E.Message;
+      end;
+      QueueToMain(
+        procedure
+        begin
+          SetBusy(False);
+          if ErrorText <> '' then AppendLog('LS 模型切换失败：' + ErrorText)
+          else AppendLog('LS 模型已保存：' + AModel + '；请开始新会话');
+          RefreshStatusAsync(True);
+          StartProfilesRefresh(True);
         end);
     end).Start;
 end;
@@ -1574,6 +1766,7 @@ begin
   else if ATransport = 'gemini-interactions' then Result := 'Gemini Interactions'
   else if ATransport = 'openai-chat' then Result := 'OpenAI Chat'
   else if ATransport = 'openai-responses' then Result := 'OpenAI Responses'
+  else if ATransport = 'antigravity-ls' then Result := 'LS 自主执行'
   else if ATransport = 'gemini' then Result := 'Gemini'
   else Result := ATransport;
 end;

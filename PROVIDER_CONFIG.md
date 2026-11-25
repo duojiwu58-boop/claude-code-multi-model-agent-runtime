@@ -1,5 +1,7 @@
 # Provider 配置指南
 
+新增可选的 `antigravity-ls` 后端，由 LS 自主执行原生工具与 MCP。配置、原文输入入口与验收边界见 [Antigravity LS 说明](docs/ANTIGRAVITY_LS.md)。
+
 桥接器使用自己的 Provider 配置文件，不再要求用户把上游模型伪装成
 `ANTHROPIC_*` 环境变量。对于支持 OpenAI Chat Completions 的服务，通常只需
 把官网示例中的 `base_url`、`api_key` 和 `model` 抄进一个 JSON 文件。
@@ -22,6 +24,8 @@
 点击“刷新”；不需要重启 Claude Code、VS Code 或桥接服务。
 
 ## 最小配置
+
+本机 Codex 使用下面的 `protocol: codex` 配置；它不需要 `base_url` 或桥接器 API Key。
 
 ```json
 {
@@ -46,6 +50,135 @@
 `base_url` 按 OpenAI SDK 的“基地址”语义处理：桥接器只在其后补
 `/chat/completions`。如果供应商给出的不是 SDK 基地址，或网关路径比较特殊，
 请用 `endpoint` 填写完整的 Chat Completions 请求地址。
+
+## 本机 Codex：Claude Code 继续执行工具
+
+`protocol: codex` 将本机 Codex 作为可切换模型后端。Codex 生成回答及真实客户端工具请求，
+桥接器还原为 Claude `tool_use`；Read/Edit/Bash/MCP 等工具由 Claude Code 执行。下一次
+Messages 请求在历史前缀和配置匹配时回填原生工具回调，并有序追加后续消息，保持同一 Codex turn；其他情况回放可见历史。
+Codex 的本地 shell、执行环境、MCP、应用及 Web Search
+在该线程关闭，不会另行执行一套工具。
+
+OpenAI HTTP 入口已支持 JSON object、后台 Responses、Files/PDF、stored Chat、n=1..4 和 custom 文本工具；
+明确请求的 reasoning.effort/reasoning_effort 优先于 profile 默认，text.verbosity 传入原生配置。
+Messages 入口的 profile/GUI effort 优先级保持不变。strict 工具参数在本地验证后才交付。
+本地资源限额和上游无法等价提供的能力见 [Codex 能力扩展](docs/CODEX_CAPABILITIES.md)。
+
+历史中的 `system` / `developer` 文本消息按原位置转换为 GPT `developer` 指令 items，
+保持内容和顺序，响应诊断说明角色映射。Claude 的 `clear_at: next_user_message` 在后面出现用户消息（包括工具结果）
+时使该条系统文本失效；默认及 `never` 保留。支持系统消息中的客户端工具增删及 effort；
+其他非文本内容会明确报错。
+协议依据：[Claude 对话中途系统消息](https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages)
+与 [OpenAI Messages 到 Items 映射](https://developers.openai.com/api/docs/guides/migrate-to-responses)。
+
+Windows 服务通常使用独立账户。推荐在已经登录 Codex 的当前用户 PowerShell 中运行：
+
+```powershell
+.\scripts\start-codex-host.ps1
+```
+
+保持该终端运行。启动脚本自动查找 `codex.exe`；找不到时用
+`-CodexCommand 'C:\完整路径\codex.exe'` 指定。需要其他 Codex 配置目录时使用
+`-CodexHome 'C:\完整路径\.codex'`。认证、模型供应商及网络代理由该用户的 Codex 自己管理。
+部署后台 Host 时应通过 `-CodexCommand` 指定与正常工作的本机 Codex 相同的新版可执行文件；
+PATH 中的 VS Code 扩展副本可能更旧。本机曾因误用 0.155 版而收到 `gpt-6.1-sol` 不支持
+ChatGPT 账号的错误，改用已安装的 0.159.2 后，真实 Claude Code 面板问候及 Read 往返通过。
+后台或登录启动的 Host 不会继承终端临时环境；需要本机代理时可使用
+`-ProxyUrl 'http://127.0.0.1:1080'`，仅给 Host 进程设置代理并保持本机连接直连。
+使用 `-LogDirectory 'C:\完整路径\日志目录'` 可将后台 Host 的输出写入日志。
+
+复制 [`examples/providers/codex-local.example.json`](examples/providers/codex-local.example.json)
+到 `%USERPROFILE%\.claude\bridge-providers\codex-local.json`：
+
+```json
+{
+  "name": "Local Codex (GPT-6.1 Sol)",
+  "protocol": "codex",
+  "model": "gpt-6.1-sol",
+  "reasoning_effort": "high",
+  "codex": {
+    "app_server_url": "ws://127.0.0.1:18788",
+    "timeout_seconds": 600,
+    "native_continuation": true
+  }
+}
+```
+
+`model` 必须是当前登录实际可以使用的 Codex 模型；示例名称不保证其他账户具有权限。
+新版桥接器中点击模型中心“刷新”，选择该配置并做连通性测试。Codex Host 未启动、模型无权限、
+登录过期和 RPC 失败都会显示错误。修改端口时同时修改脚本的 `-Port` 和 `app_server_url`。
+该 URL 只接受回环 `ws://` 地址；不连接远程 Codex。
+
+如果桥接器本身在已登录的当前用户下以控制台方式运行，也可直接启动 stdio 子进程：
+
+```json
+{
+  "name": "Local Codex (stdio)",
+  "protocol": "codex",
+  "model": "gpt-6.1-sol",
+  "reasoning_effort": "high",
+  "codex": {
+    "command": "C:\\完整路径\\codex.exe",
+    "home": "C:\\Users\\你的用户名\\.codex",
+    "timeout_seconds": 600
+  }
+}
+```
+
+`command` 默认 `codex.exe`，通过进程 PATH 查找；Windows 服务建议用用户 Host 方式。
+`home` 可省略，省略时采用该进程的 Codex 默认目录。仅填写当前用户的目录不能让独立服务账户
+使用 Windows 凭据存储。`args` 为可选的可执行文件前置参数数组，不经过 shell 拼接；不直接运行
+`.cmd/.bat/.ps1`。`app_server_url` 与 `command/args/home` 互斥。
+`timeout_seconds` 是排队、连接和生成的总时限，默认 600，允许 1–3600。最多并行生成 4 个请求；
+生成完成、失败、超时或流断开时清理所拥有的线程；等待工具结果的线程暂存用于续接。
+stdio 子进程在所属线程清理时退出，用户 Host 保持运行。
+
+`native_continuation` 默认 `true`。在工具循环内保留官方动态工具回调、线程及原生推理状态，
+待工具结果及空闲线程合计最多 32 个，每个闲置 10 分钟后清理。续接严格匹配模型、工具、指令、effort、输出格式和
+已返回历史，允许对应工具结果后追加 user/system/developer 消息；修改历史、配置变化、缓存过期或服务重启时回放可见历史。
+有稳定会话标识时，最终回答后的下一用户轮次复用原线程。接受 `metadata.session_id` 和 Claude 的
+`metadata.user_id` 中 JSON/旧式格式的会话 ID；普通账户 ID 或提示词不能标识会话。标题等辅助请求单独管理。
+无会话标识的纯文本轮次仍会重建。重建不保留隐藏推理，不能称为完全无损。
+设为 `false` 可关闭原生续接，恢复逐次回放模式。
+
+工具请求逐个返回，已排队的其他回调在后续请求交付；不保证 Claude 并行批次语义。
+带工具 ID 或稳定会话标识的已完成请求可重放相同响应，避免重试重复生成；同一对话执行范围内的并发请求等待前一请求完成。
+响应缓存最多 64 项、32 MiB、
+10 分钟。没有会话标识的首次请求不做去重。缓存仅在内存，不持久化用户内容。
+通过鉴权的 `/admin/status` 中 `codex_continuity` 查看续接/重建计数、线程数量、最近请求的耗时及用量；不记录正文。
+
+文本、图片、客户端工具及错误/图片结果、JSON Schema 输出均可转换。SSE 按原生内容项分块，
+公开推理摘要可显示为无签名 thinking；摘要不是隐藏推理，也不能作为 Anthropic 签名使用。
+用量来自 Codex 累计计数的差分，缓存读取与普通输入分开；工具回调前尚未收到 usage 时为 0，
+其用量可能在后续续接响应体现。`tool_choice` 的 `none` 移除工具，`tool` 限制工具，
+`any/tool` 校验实际调用；强制调用使用指令及结果校验，非上游原生强制选择。
+
+无法等价的参数通过响应诊断报告：`max_tokens`、采样参数、缓存断点/TTL、thinking token 预算及
+strict 工具约束不具备同等保证。接受不删除内容的 `context_management`（空 edits，或
+clear_thinking 的 keep=all）；主动上下文删除、容器和 MCP connector 控制明确拒绝。
+stop_sequences 与 bridge_controls.max_output_chars 在可见文本上本地执行；后者按字符计数，不限制推理 token 或费用。
+bridge_controls.mode=strict 拒绝无法原生保证的参数；默认兼容模式保留诊断。
+同一 Codex profile 也支持 Responses、Chat Completions 和本地资源接口。Responses 默认保存输入输出到状态文件旁的 `*.openai.json`；store=false 可关闭响应保存，但指定 conversation 时仍更新该对话。
+完整范围、容量和能力边界见 [Codex 协议适配矩阵](docs/CODEX_PROTOCOL.md#openai-http-入口)。
+
+此实现使用 OpenAI 官方 App Server 的 `dynamicTools`、`thread/inject_items` 和事件接口，
+已按本机 `codex-cli 0.159.2` 验证。动态工具和 WebSocket transport 属于实验接口；
+Codex 升级后应重新执行本项目的集成验证，旧版本缺少接口时会返回 RPC 错误。
+参见 [OpenAI 官方 App Server 文档](https://learn.chatgpt.com/docs/app-server)。
+
+离线回归与可选的真实登录验证：
+
+```powershell
+cargo test --locked --bin claude-bridge codex_
+$env:CLAUDE_BRIDGE_CODEX_TEST_MODEL = 'gpt-6.1-sol'
+$env:CLAUDE_BRIDGE_CODEX_TEST_COMMAND = (Get-Command codex.exe -CommandType Application).Source
+cargo test --locked --bin claude-bridge codex_live_client_tool_roundtrip -- --ignored --nocapture
+$env:CLAUDE_BRIDGE_CODEX_TEST_URL = 'ws://127.0.0.1:18788'
+cargo test --locked --bin claude-bridge codex_live_bridge_two_native_tool_cycles -- --ignored --nocapture
+```
+
+真实验证会消耗当前 Codex 账户额度；普通测试使用本机协议 mock，不调用模型。
+验证用户 Host 时另设 `$env:CLAUDE_BRIDGE_CODEX_TEST_URL = 'ws://127.0.0.1:18788'`。
 
 ## OpenRouter Claude Sonnet 5 / Opus 5 原生 Anthropic 配置
 

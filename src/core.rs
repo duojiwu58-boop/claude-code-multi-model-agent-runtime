@@ -28,6 +28,8 @@ enum ProviderTransport {
     OpenAiChat,
     OpenAiResponses,
     GeminiInteractions,
+    Codex,
+    AntigravityLs,
 }
 
 impl ProviderTransport {
@@ -38,6 +40,8 @@ impl ProviderTransport {
             Self::OpenAiChat => "openai-chat",
             Self::OpenAiResponses => "openai-responses",
             Self::GeminiInteractions => "gemini-interactions",
+            Self::AntigravityLs => "antigravity-ls",
+            Self::Codex => "codex",
         }
     }
 }
@@ -411,6 +415,8 @@ struct ProviderProfile {
     proxy_url: Option<String>,
     local_gemini: bool,
     transport: ProviderTransport,
+    codex: Option<CodexProviderConfig>,
+    ls: Option<LsProviderConfig>,
     openai_capabilities: OpenAiCapabilities,
     vision: VisionConfig,
     upstream_url: String,
@@ -453,6 +459,7 @@ struct GeminiTransport {
 
 #[derive(Clone)]
 struct AppState {
+    ls_lifecycle: Arc<tokio::sync::RwLock<LsLifecycle>>,
     gemini_transport: Arc<RwLock<GeminiTransport>>,
     gemini_thinking_level: Arc<RwLock<Option<String>>>,
     reasoning_efforts: Arc<RwLock<HashMap<String, String>>>,

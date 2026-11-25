@@ -1156,8 +1156,6 @@ fn load_native_provider_profiles(
             .ok_or_else(|| format!("Provider profile '{file_name}' has no model"))?;
         let context_window = profile_u64(object, &["context_window", "contextWindow"], &file_name)?;
         let display_name = profile_string(object, &["name"]).unwrap_or_else(|| model.clone());
-        let base_url = profile_string(object, &["base_url", "baseURL"])
-            .ok_or_else(|| format!("Provider profile '{file_name}' has no base_url"))?;
         let protocol = profile_string(object, &["protocol"])
             .unwrap_or_else(|| "openai".to_string())
             .to_ascii_lowercase();
@@ -1167,11 +1165,28 @@ fn load_native_provider_profiles(
             "anthropic" | "messages" => ProviderTransport::Anthropic,
             "gemini" | "local-gemini" => ProviderTransport::LocalGemini,
             "gemini-interactions" | "interactions" => ProviderTransport::GeminiInteractions,
+            "antigravity-ls" => ProviderTransport::AntigravityLs,
+            "codex" => ProviderTransport::Codex,
             other => {
                 return Err(format!(
-                    "Provider profile '{file_name}' has unsupported protocol '{other}' (expected openai, openai-responses, anthropic, gemini-interactions, or gemini)"
+                    "Provider profile '{file_name}' has unsupported protocol '{other}' (expected openai, openai-responses, anthropic, gemini-interactions, gemini, or codex)"
                 ))
             }
+        };
+        let ls = if transport == ProviderTransport::AntigravityLs { Some(parse_ls_provider_config(object, &file_name)?) } else { None };
+        let codex = if transport == ProviderTransport::Codex {
+            Some(parse_codex_provider_config(object, &file_name)?)
+        } else {
+            None
+        };
+        let base_url = if let Some(config) = &ls { config.host_url.clone() } else if transport == ProviderTransport::Codex {
+            codex
+                .as_ref()
+                .and_then(|config| config.app_server_url.clone())
+                .unwrap_or_else(|| "stdio://codex-app-server".to_string())
+        } else {
+            profile_string(object, &["base_url", "baseURL"])
+                .ok_or_else(|| format!("Provider profile '{file_name}' has no base_url"))?
         };
         let capability_defaults = match transport {
             ProviderTransport::LocalGemini => OpenAiCapabilities::local_gemini(),
@@ -1184,6 +1199,7 @@ fn load_native_provider_profiles(
                 OpenAiCapabilities::for_responses_base_url(&base_url)
             }
             ProviderTransport::Anthropic => OpenAiCapabilities::for_anthropic_base_url(&base_url),
+            ProviderTransport::Codex | ProviderTransport::AntigravityLs => OpenAiCapabilities::default(),
         };
         let mut openai_capabilities =
             parse_openai_capabilities_with_defaults(object, &file_name, capability_defaults)?;
@@ -1211,6 +1227,7 @@ fn load_native_provider_profiles(
                 ProviderTransport::Anthropic => anthropic_messages_endpoint(&base_url),
                 ProviderTransport::GeminiInteractions => gemini_interactions_endpoint(&base_url),
                 ProviderTransport::LocalGemini => base_url.clone(),
+                ProviderTransport::Codex | ProviderTransport::AntigravityLs => base_url.clone(),
             });
         let api_key = profile_string(object, &["api_key", "apiKey"]);
         let api_key_env = profile_string(object, &["api_key_env", "apiKeyEnv"]);
@@ -1239,6 +1256,8 @@ fn load_native_provider_profiles(
             ));
         }
         if transport != ProviderTransport::LocalGemini
+            && transport != ProviderTransport::Codex
+            && transport != ProviderTransport::AntigravityLs
             && api_key.is_none()
             && !(transport == ProviderTransport::GeminiInteractions && bridge_managed_credentials)
         {
@@ -1296,6 +1315,8 @@ fn load_native_provider_profiles(
             proxy_url,
             local_gemini: transport == ProviderTransport::LocalGemini,
             transport,
+            codex,
+            ls,
             openai_capabilities,
             vision,
             upstream_url,
@@ -1397,6 +1418,8 @@ fn load_legacy_provider_profile(
         proxy_url,
         local_gemini,
         transport,
+        codex: None,
+        ls: None,
         openai_capabilities,
         vision: VisionConfig::default(),
         upstream_url,
@@ -1769,6 +1792,7 @@ fn runtime_reasoning_efforts(state: &AppState) -> Result<HashMap<String, String>
 /// none/low/high/max. Ambiguous tiers (Qwen high/max, DeepSeek medium/xhigh)
 /// are deliberately not exposed as choices.
 const QWEN_ANTHROPIC_EFFORT_CHOICES: &[&str] = &["none", "low", "medium", "xhigh"];
+const QWEN38_LOCAL_EFFORT_CHOICES: &[&str] = &["xhigh", "medium", "low"];
 const DEEPSEEK_ANTHROPIC_EFFORT_CHOICES: &[&str] = &["none", "low", "high", "max"];
 
 fn is_qwen38_max_model(model: &str) -> bool {
@@ -1782,18 +1806,24 @@ fn is_supported_deepseek_v4_anthropic_model(model: &str) -> bool {
     )
 }
 
-/// The Provider Reasoning control covers only the official Qwen3.8-Max and
+/// The Provider Reasoning control covers the official Qwen3.8-Max and
 /// the repository's supported DeepSeek V4 models on their Anthropic
 /// transports, and only while the capability that emits the upstream effort
 /// field is enabled. Inferring the dialect from a DashScope/Maas host alone
 /// would wrongly match other models routed through the same host, so the
 /// model ID and transport are checked explicitly. Gemini keeps its separate
-/// thinking-level control; OpenRouter, Kimi, and the Responses/Chat
-/// transports are out of scope.
+/// thinking-level control. The local Qwen3.8-27B OpenAI Chat model also
+/// participates, using the three effort values its llama.cpp template accepts.
 fn profile_effort_choices(profile: &ProviderProfile) -> Option<&'static [&'static str]> {
-    if profile.transport != ProviderTransport::Anthropic
-        || !profile.openai_capabilities.reasoning_effort
+    if !profile.openai_capabilities.reasoning_effort {
+        return None;
+    }
+    if profile.transport == ProviderTransport::OpenAiChat
+        && display_model_name(&profile.model).eq_ignore_ascii_case("qwen3.8-27b-q4-k-m")
     {
+        return Some(QWEN38_LOCAL_EFFORT_CHOICES);
+    }
+    if profile.transport != ProviderTransport::Anthropic {
         return None;
     }
     match profile.openai_capabilities.chat_dialect {
@@ -1817,7 +1847,14 @@ fn normalized_profile_effort(profile: &ProviderProfile, effort: &str) -> Option<
     if !is_reasoning_effort(effort) {
         return None;
     }
-    let choice = if choices == QWEN_ANTHROPIC_EFFORT_CHOICES {
+    let choice = if choices == QWEN38_LOCAL_EFFORT_CHOICES {
+        match effort {
+            "none" | "minimal" | "low" => "low",
+            "medium" | "high" => "medium",
+            "xhigh" | "max" => "xhigh",
+            _ => return None,
+        }
+    } else if choices == QWEN_ANTHROPIC_EFFORT_CHOICES {
         match effort {
             "none" => "none",
             "minimal" | "low" => "low",

@@ -318,7 +318,9 @@ fn gemini_interactions_vision_request(
 
 fn parse_vision_observation(transport: ProviderTransport, body: &Value) -> String {
     match transport {
-        ProviderTransport::Anthropic => value_to_text(body.get("content").unwrap_or(&Value::Null)),
+        ProviderTransport::Anthropic | ProviderTransport::Codex | ProviderTransport::AntigravityLs => {
+            value_to_text(body.get("content").unwrap_or(&Value::Null))
+        }
         ProviderTransport::GeminiInteractions => body
             .get("steps")
             .and_then(Value::as_array)
@@ -414,6 +416,17 @@ async fn analyze_vision_job(
     }
 
     let (status, response_body) = match source.transport {
+        ProviderTransport::AntigravityLs => return Err(VisionProxyError { status: StatusCode::BAD_REQUEST, error_type: "invalid_request_error", message: "LS cannot be used as a vision proxy".into() }),
+        ProviderTransport::Codex => {
+            let response =
+                forward_codex_profile(source.clone(), anthropic_vision_request(source, job)).await;
+            let status = reqwest::StatusCode::from_u16(response.status().as_u16())
+                .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
+            let body = axum::body::to_bytes(response.into_body(), MAX_UPSTREAM_RESPONSE_BYTES)
+                .await
+                .map_err(|err| VisionProxyError::gateway(err.to_string()))?;
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
         ProviderTransport::LocalGemini => {
             let api_key = state.fallback_api_key.as_deref().ok_or_else(|| {
                 VisionProxyError::gateway(

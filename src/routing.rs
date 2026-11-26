@@ -311,7 +311,10 @@ async fn anthropic_messages(
                 return anthropic_error(StatusCode::UNAUTHORIZED, "authentication_error", &message);
             }
             let mut diagnostics = request_override_diagnostics;
-            diagnostics.extend(gemini_interaction_request_diagnostics(&request));
+            diagnostics.extend(gemini_interaction_request_diagnostics_for_profile(
+                &request,
+                &active_profile,
+            ));
             diagnostics.extend(gemini_4_request_diagnostics(&request, &active_profile));
             if let Some(diagnostic) = gemini_interaction_pdf_tool_diagnostic(
                 &request,

@@ -568,6 +568,17 @@ fn capability_gemini_remote_mcp_servers(
                     translated.insert("allowed_tools".to_string(), json!(allowed_tools));
                 }
 
+                if let Some(defer_loading) = server.get("defer_loading") {
+                    let defer_loading = defer_loading.as_bool().ok_or_else(|| {
+                        format!(
+                            "Provider profile '{file_name}' capability '{name}' server '{server_name}' defer_loading must be a boolean"
+                        )
+                    })?;
+                    if defer_loading {
+                        translated.insert("defer_loading".to_string(), json!(true));
+                    }
+                }
+
                 Ok(Value::Object(translated))
             })
             .collect();
@@ -1016,6 +1027,12 @@ fn parse_openai_capabilities_with_defaults(
             defaults.gemini_store,
             file_name,
         )?,
+        gemini_tool_retrieval: capability_bool(
+            object,
+            &["gemini_tool_retrieval", "geminiToolRetrieval"],
+            defaults.gemini_tool_retrieval,
+            file_name,
+        )?,
         gemini_service_tier,
         gemini_tool_choice_override,
         user_id,
@@ -1052,6 +1069,7 @@ fn openai_capabilities_json(capabilities: &OpenAiCapabilities) -> Value {
         "gemini_file_search_store_names": capabilities.gemini_file_search_store_names,
         "gemini_remote_mcp_servers": remote_mcp_servers,
         "gemini_store": capabilities.gemini_store,
+        "gemini_tool_retrieval": capabilities.gemini_tool_retrieval,
         "gemini_service_tier": capabilities.gemini_service_tier,
         "gemini_tool_choice_override": capabilities.gemini_tool_choice_override
     })

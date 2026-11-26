@@ -1,14 +1,74 @@
+// Map a validated Interactions document to the GenerateContent Part consumed
+// by countTokens. Metadata belongs beside fileData/inlineData, not inside it.
+// https://aistudio.google.com/api-reference/caching (Part)
+fn gemini_count_document_part(document: &Value) -> Option<Value> {
+    let mime = document
+        .get("mime_type")
+        .cloned()
+        .unwrap_or_else(|| json!("application/pdf"));
+    let mut part = if let Some(data) = document.get("data") {
+        json!({"inlineData": {"mimeType": mime, "data": data}})
+    } else if let Some(uri) = document.get("uri") {
+        json!({"fileData": {"mimeType": mime, "fileUri": uri}})
+    } else {
+        return None;
+    };
+    if let Some(resolution) = document.get("resolution").and_then(Value::as_str) {
+        part["mediaResolution"] = json!({
+            "level": format!("MEDIA_RESOLUTION_{}", resolution.to_ascii_uppercase())
+        });
+    }
+    for (source, target, fields) in [
+        (
+            "page_options",
+            "documentMetadata",
+            &[("start_page", "startPage"), ("end_page", "endPage")][..],
+        ),
+        (
+            "spreadsheet_options",
+            "spreadsheetMetadata",
+            &[
+                ("sheet_index", "sheetIndex"),
+                ("visible_cells", "visibleCells"),
+            ][..],
+        ),
+    ] {
+        if let Some(options) = document.get("processing").and_then(|p| p.get(source)) {
+            let mut metadata = Map::new();
+            for (from, to) in fields {
+                if let Some(value) = options.get(*from) {
+                    metadata.insert((*to).to_string(), value.clone());
+                }
+            }
+            if let Some(layers) = options.get("content_layers").and_then(Value::as_array) {
+                metadata.insert(
+                    "contentLayers".to_string(),
+                    Value::Array(
+                        layers
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|s| json!(s.to_ascii_uppercase()))
+                            .collect(),
+                    ),
+                );
+            }
+            part[target] = Value::Object(metadata);
+        }
+    }
+    Some(part)
+}
+
 fn gemini_count_token_parts(
     content: &Value,
     tool_names: &HashMap<String, String>,
     max_tool_result_chars: Option<u64>,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, String> {
     let Some(parts) = content.as_array() else {
-        return content
+        return Ok(content
             .as_str()
             .filter(|text| !text.is_empty())
             .map(|text| vec![json!({"text": text})])
-            .unwrap_or_default();
+            .unwrap_or_default());
     };
     let mut translated = Vec::new();
     for part in parts {
@@ -18,40 +78,28 @@ fn gemini_count_token_parts(
                     translated.push(json!({"text": text}));
                 }
             }
-            Some("image" | "document") => {
+            Some("document") => {
+                if let Some(document) = interaction_content_from_anthropic_checked(part)? {
+                    if let Some(count_part) = gemini_count_document_part(&document) {
+                        translated.push(count_part);
+                    }
+                }
+            }
+            Some("image") => {
                 let Some(source) = part.get("source") else {
                     continue;
                 };
+                let mime = source
+                    .get("media_type")
+                    .cloned()
+                    .unwrap_or_else(|| json!("application/octet-stream"));
                 match source.get("type").and_then(Value::as_str) {
-                    Some("base64") => translated.push(json!({
-                        "inlineData": {
-                            "mimeType": source.get("media_type").cloned().unwrap_or_else(|| json!("application/octet-stream")),
-                            "data": source.get("data").cloned().unwrap_or(Value::Null)
-                        }
-                    })),
-                    Some("url") => translated.push(json!({
-                        "fileData": {
-                            "mimeType": source.get("media_type").cloned().unwrap_or_else(|| {
-                                if part.get("type").and_then(Value::as_str) == Some("document") {
-                                    json!("application/pdf")
-                                } else {
-                                    json!("application/octet-stream")
-                                }
-                            }),
-                            "fileUri": source.get("url").cloned().unwrap_or(Value::Null)
-                        }
-                    })),
-                    Some("text") => {
-                        if let Some(text) = source.get("data").and_then(Value::as_str) {
-                            translated.push(json!({"text": text}));
-                        }
-                    }
-                    Some("content") => {
-                        let text = value_to_text(source.get("content").unwrap_or(&Value::Null));
-                        if !text.is_empty() {
-                            translated.push(json!({"text": text}));
-                        }
-                    }
+                    Some("base64") => translated.push(json!({"inlineData": {
+                        "mimeType": mime, "data": source.get("data").cloned().unwrap_or(Value::Null)
+                    }})),
+                    Some("url") => translated.push(json!({"fileData": {
+                        "mimeType": mime, "fileUri": source.get("url").cloned().unwrap_or(Value::Null)
+                    }})),
                     _ => {}
                 }
             }
@@ -75,10 +123,32 @@ fn gemini_count_token_parts(
                     .get(call_id)
                     .map(String::as_str)
                     .unwrap_or("unknown_function");
-                let translated_result = interaction_tool_result_value(
+                if document_tool_name_is(name)
+                    && part.get("is_error").and_then(Value::as_bool) != Some(true)
+                {
+                    if let Some((summary_text, doc_block)) = expand_document_slice_tool_result(
+                        part.get("content").unwrap_or(&Value::Null),
+                    ) {
+                        translated.push(json!({
+                            "functionResponse": {
+                                "name": name,
+                                "response": {
+                                    "result": summary_text.get("text").cloned().unwrap_or_else(|| json!("")),
+                                    "is_error": false
+                                }
+                            }
+                        }));
+                        if let Some(count_part) = gemini_count_document_part(&doc_block) {
+                            translated.push(count_part);
+                        }
+                        continue;
+                    }
+                }
+                let translated_result = interaction_tool_result_value_checked(
                     part.get("content").unwrap_or(&Value::Null),
                     max_tool_result_chars,
-                );
+                    false,
+                )?;
                 translated.push(json!({
                     "functionResponse": {
                         "name": name,
@@ -89,33 +159,15 @@ fn gemini_count_token_parts(
                     }
                 }));
                 for document in translated_result.documents {
-                    if let Some(data) = document.get("data") {
-                        translated.push(json!({
-                            "inlineData": {
-                                "mimeType": document
-                                    .get("mime_type")
-                                    .cloned()
-                                    .unwrap_or_else(|| json!("application/pdf")),
-                                "data": data
-                            }
-                        }));
-                    } else if let Some(uri) = document.get("uri") {
-                        translated.push(json!({
-                            "fileData": {
-                                "mimeType": document
-                                    .get("mime_type")
-                                    .cloned()
-                                    .unwrap_or_else(|| json!("application/pdf")),
-                                "fileUri": uri
-                            }
-                        }));
+                    if let Some(count_part) = gemini_count_document_part(&document) {
+                        translated.push(count_part);
                     }
                 }
             }
             _ => {}
         }
     }
-    translated
+    Ok(translated)
 }
 
 fn gemini_count_tokens_request(
@@ -127,22 +179,22 @@ fn gemini_count_tokens_request(
         .and_then(Value::as_array)
         .ok_or_else(|| "Missing required array field 'messages'".to_string())?;
     let tool_names = interaction_tool_names_from_messages(messages);
-    let contents: Vec<Value> = messages
-        .iter()
-        .filter_map(|message| {
-            let role = match message.get("role").and_then(Value::as_str) {
-                Some("user") => "user",
-                Some("assistant") => "model",
-                _ => return None,
-            };
-            let parts = gemini_count_token_parts(
-                message.get("content").unwrap_or(&Value::Null),
-                &tool_names,
-                profile.openai_capabilities.max_tool_result_chars,
-            );
-            (!parts.is_empty()).then(|| json!({"role": role, "parts": parts}))
-        })
-        .collect();
+    let mut contents = Vec::new();
+    for message in messages {
+        let role = match message.get("role").and_then(Value::as_str) {
+            Some("user") => "user",
+            Some("assistant") => "model",
+            _ => continue,
+        };
+        let parts = gemini_count_token_parts(
+            message.get("content").unwrap_or(&Value::Null),
+            &tool_names,
+            profile.openai_capabilities.max_tool_result_chars,
+        )?;
+        if !parts.is_empty() {
+            contents.push(json!({"role": role, "parts": parts}));
+        }
+    }
     if contents.is_empty() {
         return Err("Gemini token count request produced no supported contents".to_string());
     }
@@ -267,8 +319,15 @@ async fn anthropic_count_tokens(
     let input_tokens = estimate_anthropic_input_tokens(&request);
 
     let active_profile = active_provider_profile(&state);
-    if active_profile.as_ref().is_some_and(|p| p.transport == ProviderTransport::AntigravityLs) {
-        return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", "LS has no verified token-count endpoint");
+    if active_profile
+        .as_ref()
+        .is_some_and(|p| p.transport == ProviderTransport::AntigravityLs)
+    {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "LS has no verified token-count endpoint",
+        );
     }
     if let Some(profile) = active_profile.as_ref() {
         if let Some(identity) = upstream_identity_label(profile, &state.model) {
@@ -346,7 +405,7 @@ async fn anthropic_count_tokens(
     else {
         return anthropic_token_count_response(input_tokens, "estimated");
     };
-    let diagnostics = gemini_interaction_request_diagnostics(&request);
+    let diagnostics = gemini_interaction_request_diagnostics_for_profile(&request, &profile);
     let credential_result = apply_bridge_managed_gemini_credentials(&state, &mut profile);
     let native_result = async {
         credential_result?;

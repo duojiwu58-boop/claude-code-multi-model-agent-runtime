@@ -16,6 +16,7 @@ fn api_test_state(p: ProviderProfile) -> Arc<AppState> {
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             active_file: p.file_name.clone(),
             profiles: vec![p],

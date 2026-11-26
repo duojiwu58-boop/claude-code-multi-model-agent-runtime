@@ -244,12 +244,12 @@ fn remember_interaction_continuation(
     persist_interaction_continuation_cache(&snapshot);
 }
 
-fn interaction_content_from_anthropic(part: &Value) -> Option<Value> {
+fn interaction_content_from_anthropic_checked(part: &Value) -> Result<Option<Value>, String> {
     match part.get("type").and_then(Value::as_str) {
-        Some("text") => part
+        Some("text") => Ok(part
             .get("text")
             .and_then(Value::as_str)
-            .map(|text| json!({"type": "text", "text": text})),
+            .map(|text| json!({"type": "text", "text": text}))),
         Some("search_result") => {
             let title = part
                 .get("title")
@@ -270,50 +270,97 @@ fn interaction_content_from_anthropic(part: &Value) -> Option<Value> {
                 text.push_str("\n\n");
                 text.push_str(&body);
             }
-            Some(json!({"type": "text", "text": text}))
+            Ok(Some(json!({"type": "text", "text": text})))
         }
         Some(block_type @ ("image" | "document")) => {
-            let source = part.get("source")?;
+            let Some(source) = part.get("source") else {
+                return Ok(None);
+            };
             let mut content = Map::new();
             content.insert("type".to_string(), json!(block_type));
+            let title_hint = part.get("title").and_then(Value::as_str);
             match source.get("type").and_then(Value::as_str) {
                 Some("base64") => {
                     content.insert(
                         "data".to_string(),
                         source.get("data").cloned().unwrap_or(Value::Null),
                     );
-                    content.insert(
-                        "mime_type".to_string(),
-                        source.get("media_type").cloned().unwrap_or(Value::Null),
-                    );
+                    let mime_type = source
+                        .get("media_type")
+                        .filter(|value| !value.is_null())
+                        .cloned()
+                        .or_else(|| {
+                            (block_type == "document")
+                                .then(|| title_hint.and_then(gemini_document_mime_from_path_or_url))
+                                .flatten()
+                                .map(|mime| json!(mime))
+                        })
+                        .unwrap_or(Value::Null);
+                    content.insert("mime_type".to_string(), mime_type);
                 }
                 Some("url") => {
-                    content.insert(
-                        "uri".to_string(),
-                        source.get("url").cloned().unwrap_or(Value::Null),
-                    );
+                    let url_value = source.get("url").cloned().unwrap_or(Value::Null);
+                    content.insert("uri".to_string(), url_value.clone());
                     if block_type == "document" {
-                        content.insert(
-                            "mime_type".to_string(),
-                            source
-                                .get("media_type")
-                                .cloned()
-                                .unwrap_or_else(|| json!("application/pdf")),
-                        );
+                        let inferred = source
+                            .get("media_type")
+                            .filter(|value| !value.is_null())
+                            .cloned()
+                            .or_else(|| {
+                                url_value
+                                    .as_str()
+                                    .and_then(gemini_document_mime_from_path_or_url)
+                                    .or_else(|| {
+                                        title_hint.and_then(gemini_document_mime_from_path_or_url)
+                                    })
+                                    .map(|mime| json!(mime))
+                            })
+                            .unwrap_or_else(|| json!("application/pdf"));
+                        content.insert("mime_type".to_string(), inferred);
                     }
                 }
+                Some("file") if block_type == "document" => {
+                    let raw_ref = source
+                        .get("file_id")
+                        .or_else(|| source.get("uri"))
+                        .or_else(|| source.get("url"))
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            "Anthropic document file source requires file_id or uri".to_string()
+                        })?;
+                    let uri = normalize_gemini_file_uri(raw_ref)?;
+                    content.insert("uri".to_string(), json!(uri));
+                    let mime_type = source
+                        .get("media_type")
+                        .filter(|value| !value.is_null())
+                        .cloned()
+                        .or_else(|| {
+                            title_hint
+                                .and_then(gemini_document_mime_from_path_or_url)
+                                .map(|mime| json!(mime))
+                        })
+                        .unwrap_or_else(|| json!("application/pdf"));
+                    content.insert("mime_type".to_string(), mime_type);
+                }
                 Some("text") if block_type == "document" => {
-                    let text = source.get("data").and_then(Value::as_str)?;
+                    let Some(text) = source.get("data").and_then(Value::as_str) else {
+                        return Ok(None);
+                    };
                     content.insert(
                         "data".to_string(),
                         json!(BASE64_STANDARD.encode(text.as_bytes())),
                     );
-                    content.insert("mime_type".to_string(), json!("text/plain"));
+                    let mime_type = source
+                        .get("media_type")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or("text/plain");
+                    content.insert("mime_type".to_string(), json!(mime_type));
                 }
                 Some("content") if block_type == "document" => {
                     let text = value_to_text(source.get("content").unwrap_or(&Value::Null));
                     if text.is_empty() {
-                        return None;
+                        return Ok(None);
                     }
                     content.insert(
                         "data".to_string(),
@@ -321,12 +368,46 @@ fn interaction_content_from_anthropic(part: &Value) -> Option<Value> {
                     );
                     content.insert("mime_type".to_string(), json!("text/plain"));
                 }
-                _ => return None,
+                _ => return Ok(None),
             }
-            Some(Value::Object(content))
+            if block_type == "document" {
+                let mime_str = content
+                    .get("mime_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/pdf")
+                    .to_string();
+                if let Some(resolution) = part
+                    .get("resolution")
+                    .or_else(|| source.get("resolution"))
+                    .filter(|value| !value.is_null())
+                {
+                    let resolution = resolution.as_str().ok_or_else(|| {
+                        "Gemini document resolution must be a string".to_string()
+                    })?;
+                    let validated = validate_gemini_media_resolution(resolution)?;
+                    content.insert("resolution".to_string(), json!(validated));
+                }
+                if let Some(processing) = build_gemini_document_processing(
+                    &mime_str,
+                    part.get("processing").or_else(|| source.get("processing")),
+                    part.get("page_options")
+                        .or_else(|| source.get("page_options")),
+                    part.get("spreadsheet_options")
+                        .or_else(|| source.get("spreadsheet_options")),
+                )? {
+                    content.insert("processing".to_string(), processing);
+                }
+            }
+            Ok(Some(Value::Object(content)))
         }
-        _ => None,
+        _ => Ok(None),
     }
+}
+
+fn interaction_content_from_anthropic(part: &Value) -> Option<Value> {
+    interaction_content_from_anthropic_checked(part)
+        .ok()
+        .flatten()
 }
 
 struct InteractionToolResultTranslation {
@@ -334,18 +415,25 @@ struct InteractionToolResultTranslation {
     documents: Vec<Value>,
 }
 
-fn interaction_tool_result_value(
+fn interaction_tool_result_value_checked(
     content: &Value,
     max_chars: Option<u64>,
-) -> InteractionToolResultTranslation {
+    inline_documents: bool,
+) -> Result<InteractionToolResultTranslation, String> {
     if let Some(parts) = content.as_array() {
-        let translated: Vec<Value> = parts
-            .iter()
-            .filter_map(interaction_content_from_anthropic)
-            .collect();
-        let (documents, translated): (Vec<_>, Vec<_>) = translated
-            .into_iter()
-            .partition(|part| part.get("type").and_then(Value::as_str) == Some("document"));
+        let mut translated = Vec::new();
+        for part in parts {
+            if let Some(value) = interaction_content_from_anthropic_checked(part)? {
+                translated.push(value);
+            }
+        }
+        let (documents, translated): (Vec<_>, Vec<_>) = if inline_documents {
+            (Vec::new(), translated)
+        } else {
+            translated
+                .into_iter()
+                .partition(|part| part.get("type").and_then(Value::as_str) == Some("document"))
+        };
         if !translated.is_empty() {
             let combined_text = translated
                 .iter()
@@ -361,21 +449,21 @@ fn interaction_tool_result_value(
                         .into_iter()
                         .filter(|part| part.get("type").and_then(Value::as_str) != Some("text")),
                 );
-                return InteractionToolResultTranslation {
+                return Ok(InteractionToolResultTranslation {
                     result: Value::Array(bounded),
                     documents,
-                };
+                });
             }
-            return InteractionToolResultTranslation {
+            return Ok(InteractionToolResultTranslation {
                 result: Value::Array(translated),
                 documents,
-            };
+            });
         }
         if !documents.is_empty() {
-            return InteractionToolResultTranslation {
+            return Ok(InteractionToolResultTranslation {
                 result: json!("Document attached in the following user input."),
                 documents,
-            };
+            });
         }
     }
     let text = if let Some(text) = content.as_str() {
@@ -383,10 +471,28 @@ fn interaction_tool_result_value(
     } else {
         value_to_text(content)
     };
-    InteractionToolResultTranslation {
+    Ok(InteractionToolResultTranslation {
         result: Value::String(bound_tool_result_text(text, max_chars)),
         documents: Vec::new(),
-    }
+    })
+}
+
+#[cfg(test)]
+fn interaction_tool_result_value(
+    content: &Value,
+    max_chars: Option<u64>,
+) -> InteractionToolResultTranslation {
+    interaction_tool_result_value_checked(content, max_chars, false).unwrap_or_else(|_| {
+        let text = if let Some(text) = content.as_str() {
+            text.to_string()
+        } else {
+            value_to_text(content)
+        };
+        InteractionToolResultTranslation {
+            result: Value::String(bound_tool_result_text(text, max_chars)),
+            documents: Vec::new(),
+        }
+    })
 }
 
 fn is_legacy_interaction_tool_call_text(text: &str) -> bool {
@@ -394,21 +500,22 @@ fn is_legacy_interaction_tool_call_text(text: &str) -> bool {
     text.starts_with("[Tool call:") && text.contains("]\nArguments:")
 }
 
-fn interaction_user_steps(
+fn interaction_user_steps_checked(
     content: &Value,
     tool_names: &HashMap<String, String>,
     text_tool_history: bool,
     max_tool_result_chars: Option<u64>,
-) -> Vec<Value> {
+    inline_tool_result_documents: bool,
+) -> Result<Vec<Value>, String> {
     if let Some(text) = content.as_str() {
-        return if text.is_empty() {
+        return Ok(if text.is_empty() {
             Vec::new()
         } else {
             vec![json!({"type": "user_input", "content": [{"type": "text", "text": text}]})]
-        };
+        });
     }
     let Some(parts) = content.as_array() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut steps = Vec::new();
     let mut user_content = Vec::new();
@@ -435,6 +542,53 @@ fn interaction_user_steps(
                     continue;
                 }
             }
+            if document_tool_name_is(&name)
+                && part.get("is_error").and_then(Value::as_bool) != Some(true)
+            {
+                if let Some((summary_text, doc_block)) =
+                    expand_document_slice_tool_result(part.get("content").unwrap_or(&Value::Null))
+                {
+                    if text_tool_history {
+                        user_content.push(json!({
+                            "type": "text",
+                            "text": format!(
+                                "An earlier {name} operation produced this result. It is historical context:"
+                            )
+                        }));
+                        user_content.push(summary_text);
+                        user_content.push(doc_block);
+                        continue;
+                    }
+                    if !user_content.is_empty() {
+                        steps.push(json!({
+                            "type": "user_input",
+                            "content": std::mem::take(&mut user_content)
+                        }));
+                    }
+                    if inline_tool_result_documents {
+                        steps.push(json!({
+                            "type": "function_result",
+                            "call_id": call_id,
+                            "name": name,
+                            "is_error": false,
+                            "result": [summary_text, doc_block]
+                        }));
+                    } else {
+                        steps.push(json!({
+                            "type": "function_result",
+                            "call_id": call_id,
+                            "name": name,
+                            "is_error": false,
+                            "result": [summary_text]
+                        }));
+                        steps.push(json!({
+                            "type": "user_input",
+                            "content": [doc_block]
+                        }));
+                    }
+                    continue;
+                }
+            }
             if text_tool_history {
                 let status = if part.get("is_error").and_then(Value::as_bool) == Some(true) {
                     "error"
@@ -447,10 +601,11 @@ fn interaction_user_steps(
                         "An earlier {name} operation produced this {status}. It is historical context:"
                     )
                 }));
-                let translated_result = interaction_tool_result_value(
+                let translated_result = interaction_tool_result_value_checked(
                     part.get("content").unwrap_or(&Value::Null),
                     max_tool_result_chars,
-                );
+                    false,
+                )?;
                 match translated_result.result {
                     Value::Array(result_content) => user_content.extend(result_content),
                     Value::String(text) if !text.is_empty() => {
@@ -467,10 +622,11 @@ fn interaction_user_steps(
                     "content": std::mem::take(&mut user_content)
                 }));
             }
-            let translated_result = interaction_tool_result_value(
+            let translated_result = interaction_tool_result_value_checked(
                 part.get("content").unwrap_or(&Value::Null),
                 max_tool_result_chars,
-            );
+                inline_tool_result_documents,
+            )?;
             steps.push(json!({
                 "type": "function_result",
                 "call_id": call_id,
@@ -484,14 +640,31 @@ fn interaction_user_steps(
                     "content": translated_result.documents
                 }));
             }
-        } else if let Some(translated) = interaction_content_from_anthropic(part) {
+        } else if let Some(translated) = interaction_content_from_anthropic_checked(part)? {
             user_content.push(translated);
         }
     }
     if !user_content.is_empty() {
         steps.push(json!({"type": "user_input", "content": user_content}));
     }
-    steps
+    Ok(steps)
+}
+
+#[cfg(test)]
+fn interaction_user_steps(
+    content: &Value,
+    tool_names: &HashMap<String, String>,
+    text_tool_history: bool,
+    max_tool_result_chars: Option<u64>,
+) -> Vec<Value> {
+    interaction_user_steps_checked(
+        content,
+        tool_names,
+        text_tool_history,
+        max_tool_result_chars,
+        false,
+    )
+    .unwrap_or_default()
 }
 
 fn computer_tool_name_is(name: &str, short_name: &str) -> bool {
@@ -1042,11 +1215,12 @@ fn interaction_tool_names_from_messages(messages: &[Value]) -> HashMap<String, S
     names
 }
 
-fn interaction_steps_from_messages(
+fn interaction_steps_from_messages_checked(
     messages: &[Value],
     text_tool_history: bool,
     max_tool_result_chars: Option<u64>,
-) -> Vec<Value> {
+    inline_tool_result_documents: bool,
+) -> Result<Vec<Value>, String> {
     let mut steps = Vec::new();
     let mut tool_names = HashMap::new();
     for message in messages {
@@ -1059,16 +1233,32 @@ fn interaction_steps_from_messages(
                     text_tool_history,
                 ));
             }
-            Some("user") => steps.extend(interaction_user_steps(
+            Some("user") => steps.extend(interaction_user_steps_checked(
                 content,
                 &tool_names,
                 text_tool_history,
                 max_tool_result_chars,
-            )),
+                inline_tool_result_documents,
+            )?),
             _ => {}
         }
     }
-    steps
+    Ok(steps)
+}
+
+#[cfg(test)]
+fn interaction_steps_from_messages(
+    messages: &[Value],
+    text_tool_history: bool,
+    max_tool_result_chars: Option<u64>,
+) -> Vec<Value> {
+    interaction_steps_from_messages_checked(
+        messages,
+        text_tool_history,
+        max_tool_result_chars,
+        false,
+    )
+    .unwrap_or_default()
 }
 
 fn interaction_value_contains_pdf_document(value: &Value) -> bool {
@@ -1250,7 +1440,71 @@ fn gemini_mcp_server_name(name: &str) -> Option<String> {
     (!translated.is_empty()).then_some(translated)
 }
 
-fn translated_anthropic_mcp_servers(request: &Value) -> Result<Vec<Value>, String> {
+fn mcp_toolset_uniform_defer_loading(toolset: &Value) -> (bool, bool) {
+    let default_enabled = toolset
+        .pointer("/default_config/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let default_defer = toolset
+        .pointer("/default_config/defer_loading")
+        .and_then(Value::as_bool);
+    let configs = toolset
+        .get("configs")
+        .and_then(Value::as_object);
+    let uses_deferred_controls = default_defer.is_some()
+        || configs.is_some_and(|configs| {
+            configs.values().any(|config| {
+                config
+                    .get("defer_loading")
+                    .is_some_and(|value| !value.is_null())
+            })
+        });
+    if !uses_deferred_controls {
+        return (false, false);
+    }
+    let default_defer_true = default_defer == Some(true);
+    let any_enabled_non_deferred = configs.is_some_and(|configs| {
+        configs.values().any(|config| {
+            let enabled = config
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(default_enabled);
+            enabled && config.get("defer_loading").and_then(Value::as_bool) == Some(false)
+        })
+    });
+    let any_enabled_deferred = configs.is_some_and(|configs| {
+        configs.values().any(|config| {
+            let enabled = config
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(default_enabled);
+            enabled && config.get("defer_loading").and_then(Value::as_bool) == Some(true)
+        })
+    });
+    let all_explicit_enabled_deferred = !default_enabled
+        && configs.is_some_and(|configs| {
+            let enabled_configs: Vec<&Value> = configs
+                .values()
+                .filter(|config| config.get("enabled").and_then(Value::as_bool) == Some(true))
+                .collect();
+            !enabled_configs.is_empty()
+                && enabled_configs.iter().all(|config| {
+                    config
+                        .get("defer_loading")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(default_defer_true)
+                })
+        });
+    let uniform_defer = (default_defer_true && !any_enabled_non_deferred)
+        || all_explicit_enabled_deferred;
+    let mixed_granularity = !uniform_defer && (default_defer_true || any_enabled_deferred);
+    (uniform_defer, mixed_granularity)
+}
+
+fn translated_anthropic_mcp_servers(
+    request: &Value,
+    allow_tool_retrieval: bool,
+) -> Result<Vec<Value>, String> {
     let Some(servers) = request.get("mcp_servers") else {
         return Ok(Vec::new());
     };
@@ -1369,6 +1623,10 @@ fn translated_anthropic_mcp_servers(request: &Value) -> Result<Vec<Value>, Strin
                 .collect::<Vec<_>>();
             mcp_server.insert("allowed_tools".to_string(), json!(allowed_tools));
         }
+        let (uniform_defer, _) = mcp_toolset_uniform_defer_loading(toolset);
+        if allow_tool_retrieval && uniform_defer {
+            mcp_server.insert("defer_loading".to_string(), json!(true));
+        }
         translated.push(Value::Object(mcp_server));
     }
 
@@ -1395,11 +1653,26 @@ fn translated_interaction_tools(
     request: &Value,
     capabilities: &OpenAiCapabilities,
 ) -> Result<Vec<Value>, String> {
+    translated_interaction_tools_with_retrieval(request, capabilities, false)
+}
+
+fn translated_interaction_tools_with_retrieval(
+    request: &Value,
+    capabilities: &OpenAiCapabilities,
+    allow_tool_retrieval: bool,
+) -> Result<Vec<Value>, String> {
     let mut translated = Vec::new();
     let computer_context = computer_conversation_context(request);
     let requested_cancel_tool = computer_context
         .as_ref()
         .and_then(|_| requested_computer_cancel_tool_name(request));
+    let allow_tool_retrieval =
+        allow_tool_retrieval && computer_context.is_none() && requested_cancel_tool.is_none();
+    let forced_tool_name = (request.pointer("/tool_choice/type").and_then(Value::as_str)
+        == Some("tool"))
+    .then(|| request.pointer("/tool_choice/name").and_then(Value::as_str))
+    .flatten();
+    let mut has_deferred_tools = false;
     let omit_code_execution =
         interaction_request_contains_pdf(request) || computer_context.is_some();
     if let Some(tools) = request.get("tools").and_then(Value::as_array) {
@@ -1426,7 +1699,26 @@ fn translated_interaction_tools(
                 }
                 continue;
             }
-            if let Some(translated_tool) = anthropic_client_tool_as_function(tool)? {
+            if let Some(mut translated_tool) = anthropic_client_tool_as_function(tool)? {
+                let name = translated_tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if allow_tool_retrieval
+                    && tool.get("defer_loading").and_then(Value::as_bool) == Some(true)
+                    && forced_tool_name != Some(name)
+                {
+                    translated_tool["defer_loading"] = json!(true);
+                    if let Some(short_desc) = tool
+                        .get("short_description")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        translated_tool["short_description"] = json!(short_desc);
+                    }
+                    has_deferred_tools = true;
+                }
                 push_unique_interaction_tool(&mut translated, translated_tool);
                 continue;
             }
@@ -1459,6 +1751,21 @@ fn translated_interaction_tools(
             });
             if let Some(description) = tool.get("description") {
                 translated_tool["description"] = description.clone();
+            }
+            if allow_tool_retrieval
+                && tool.get("defer_loading").and_then(Value::as_bool) == Some(true)
+                && forced_tool_name != Some(name)
+            {
+                translated_tool["defer_loading"] = json!(true);
+                if let Some(short_desc) = tool
+                    .get("short_description")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    translated_tool["short_description"] = json!(short_desc);
+                }
+                has_deferred_tools = true;
             }
             push_unique_interaction_tool(&mut translated, translated_tool);
         }
@@ -1498,16 +1805,36 @@ fn translated_interaction_tools(
             }));
         }
     }
-    translated.extend(capabilities.gemini_remote_mcp_servers.iter().cloned());
-    for request_server in translated_anthropic_mcp_servers(request)? {
+    for server in &capabilities.gemini_remote_mcp_servers {
+        let mut server = server.clone();
+        if !allow_tool_retrieval {
+            if let Some(object) = server.as_object_mut() {
+                object.remove("defer_loading");
+            }
+        } else if server.get("defer_loading").and_then(Value::as_bool) == Some(true) {
+            has_deferred_tools = true;
+        }
+        translated.push(server);
+    }
+    for request_server in translated_anthropic_mcp_servers(request, allow_tool_retrieval)? {
         let duplicate = translated.iter().any(|existing| {
             existing.get("type").and_then(Value::as_str) == Some("mcp_server")
                 && existing.get("name").and_then(Value::as_str)
                     == request_server.get("name").and_then(Value::as_str)
         });
         if !duplicate {
+            if request_server
+                .get("defer_loading")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                has_deferred_tools = true;
+            }
             translated.push(request_server);
         }
+    }
+    if allow_tool_retrieval && has_deferred_tools {
+        push_unique_interaction_tool(&mut translated, json!({"type": "tool_search"}));
     }
     Ok(translated)
 }
@@ -1549,6 +1876,15 @@ fn is_gemini_4_hydrogen_model(model: &str) -> bool {
     model == "gemini-4-hydrogen" || model.starts_with("gemini-4-hydrogen-")
 }
 
+fn is_gemini_4_neon_model(model: &str) -> bool {
+    let model = normalized_gemini_model_name(model);
+    model == "gemini-4-neon" || model.starts_with("gemini-4-neon-")
+}
+
+fn gemini_supports_xhigh(model: &str) -> bool {
+    is_gemini_4_hydrogen_model(model) || is_gemini_4_neon_model(model)
+}
+
 // Inspect actual message content, including historical tool screenshots. Do not
 // mistake tool schemas or text mentioning images for image input.
 fn is_gemini_4_carbon_model(model: &str) -> bool {
@@ -1560,10 +1896,48 @@ fn is_gemini_4_model(model: &str) -> bool {
     is_gemini_4_argon_model(model)
         || is_gemini_4_carbon_model(model)
         || is_gemini_4_hydrogen_model(model)
+        || is_gemini_4_neon_model(model)
+}
+
+fn is_gemini_36_or_newer_flash_model(model: &str) -> bool {
+    let model = normalized_gemini_model_name(model);
+    let Some(rest) = model.strip_prefix("gemini-") else {
+        return false;
+    };
+    let Some((version, variant)) = rest.split_once('-') else {
+        return false;
+    };
+    if variant != "flash" && !variant.starts_with("flash-") {
+        return false;
+    }
+    let mut version_parts = version.split('.');
+    let (Some(major), Some(minor), None) = (
+        version_parts
+            .next()
+            .and_then(|part| part.parse::<u64>().ok()),
+        version_parts
+            .next()
+            .and_then(|part| part.parse::<u64>().ok()),
+        version_parts.next(),
+    ) else {
+        return false;
+    };
+    major > 3 || (major == 3 && minor >= 6)
+}
+
+fn gemini_supports_tool_retrieval(model: &str) -> bool {
+    is_gemini_4_model(model) || is_gemini_36_or_newer_flash_model(model)
+}
+
+fn gemini_supports_inline_tool_result_documents(model: &str) -> bool {
+    let normalized = normalized_gemini_model_name(model);
+    is_gemini_4_model(&normalized)
+        || normalized.starts_with("gemini-3")
+        || is_gemini_36_or_newer_flash_model(&normalized)
 }
 
 fn gemini_thinking_choices(model: &str) -> &'static [&'static str] {
-    if is_gemini_4_hydrogen_model(model) {
+    if gemini_supports_xhigh(model) {
         &["low", "medium", "high", "xhigh"]
     } else {
         &["low", "medium", "high"]
@@ -1571,7 +1945,7 @@ fn gemini_thinking_choices(model: &str) -> &'static [&'static str] {
 }
 
 fn gemini_default_thinking_level(model: &str) -> &'static str {
-    if is_gemini_4_hydrogen_model(model) {
+    if gemini_supports_xhigh(model) {
         "high"
     } else {
         "medium"
@@ -1692,7 +2066,7 @@ fn normalize_gemini_thinking_level<'a>(effort: &'a str, model: &str) -> Option<&
         }
         "none" | "minimal" | "low" => Some(effort),
         "medium" => Some("medium"),
-        "xhigh" | "max" if is_gemini_4_hydrogen_model(&model) => Some("xhigh"),
+        "xhigh" | "max" if gemini_supports_xhigh(&model) => Some("xhigh"),
         "high" | "xhigh" | "max" => Some("high"),
         _ => None,
     }
@@ -1987,13 +2361,43 @@ fn gemini_4_request_diagnostics(request: &Value, profile: &ProviderProfile) -> V
     diagnostics
 }
 
+#[cfg(test)]
 fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
+    gemini_interaction_request_diagnostics_with_tool_retrieval(request, false)
+}
+
+fn gemini_interaction_request_diagnostics_for_profile(
+    request: &Value,
+    profile: &ProviderProfile,
+) -> Vec<String> {
+    let allow_tool_retrieval = profile.openai_capabilities.gemini_tool_retrieval
+        && profile.openai_capabilities.gemini_store
+        && gemini_supports_tool_retrieval(&profile.model)
+        && computer_conversation_context(request).is_none();
+    gemini_interaction_request_diagnostics_with_tool_retrieval(request, allow_tool_retrieval)
+}
+
+fn gemini_interaction_request_diagnostics_with_tool_retrieval(
+    request: &Value,
+    allow_tool_retrieval: bool,
+) -> Vec<String> {
     let mut diagnostics = Vec::new();
     let mut add = |message: &str| {
         if !diagnostics.iter().any(|existing| existing == message) {
             diagnostics.push(message.to_string());
         }
     };
+    let request_has_deferred_tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("defer_loading").and_then(Value::as_bool) == Some(true)
+                    || (tool.get("type").and_then(Value::as_str) == Some("mcp_toolset")
+                        && mcp_toolset_uniform_defer_loading(tool).0)
+            })
+        });
+    let native_tool_retrieval_active = allow_tool_retrieval && request_has_deferred_tools;
 
     for field in [
         "metadata",
@@ -2103,9 +2507,15 @@ fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
                     "Cannot safely translate Anthropic schema-less toolset '{tool_type}' to Gemini: use Claude Code Chrome/Computer Use or an MCP browser tool so the client executes actions and returns screenshots"
                 ));
             } else if tool_type.starts_with("tool_search_tool_") {
-                add(&format!(
-                    "Replaced Anthropic server tool search '{tool_type}' by eagerly exposing the request's function tools to Gemini"
-                ));
+                if native_tool_retrieval_active {
+                    add(&format!(
+                        "Mapped Anthropic server tool search '{tool_type}' to Gemini native server-side 'tool_search' with deferred loading"
+                    ));
+                } else {
+                    add(&format!(
+                        "Replaced Anthropic server tool search '{tool_type}' by eagerly exposing the request's function tools to Gemini"
+                    ));
+                }
             } else if tool_type.starts_with("advisor_") {
                 add(&format!(
                     "Skipped Anthropic advisor tool '{tool_type}': Gemini has no separate advisor service and performs the reasoning in the active model"
@@ -2130,7 +2540,14 @@ fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
                             })
                         });
                 if uses_deferred_loading {
-                    add("Gemini Remote MCP discovers tools server-side and does not expose Anthropic defer_loading controls; the controls were not forwarded");
+                    let (uniform_defer, mixed_granularity) = mcp_toolset_uniform_defer_loading(tool);
+                    if !(allow_tool_retrieval && uniform_defer) {
+                        if allow_tool_retrieval && mixed_granularity {
+                            add("Gemini Remote MCP only supports server-wide defer_loading and cannot enforce per-tool defer_loading overrides; the server's tools were loaded eagerly");
+                        } else {
+                            add("Gemini Remote MCP discovers tools server-side and does not expose Anthropic defer_loading controls; the controls were not forwarded");
+                        }
+                    }
                 }
             }
         }
@@ -2162,6 +2579,9 @@ fn gemini_interaction_request_diagnostics(request: &Value) -> Vec<String> {
         "allowed_callers",
         "eager_input_streaming",
     ] {
+        if field == "defer_loading" && native_tool_retrieval_active {
+            continue;
+        }
         if anthropic_request_uses_extension(request, field) {
             add(&format!(
                 "Ignored Anthropic extension '{field}' while translating to Gemini Interactions"
@@ -2744,25 +3164,29 @@ fn translate_gemini_interactions_request_with_continuation(
     let text_tool_history = continuation.is_none()
         && interaction_messages_have_tool_history(messages)
         && !interaction_history_supports_native_replay(messages);
+    let inline_tool_result_documents = gemini_supports_inline_tool_result_documents(&model);
     let input = if let Some(continuation) = &continuation {
-        messages[continuation.input_start..]
+        let mut steps = Vec::new();
+        for message in messages[continuation.input_start..]
             .iter()
             .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-            .flat_map(|message| {
-                interaction_user_steps(
-                    message.get("content").unwrap_or(&Value::Null),
-                    &continuation.tool_names,
-                    false,
-                    profile.openai_capabilities.max_tool_result_chars,
-                )
-            })
-            .collect()
+        {
+            steps.extend(interaction_user_steps_checked(
+                message.get("content").unwrap_or(&Value::Null),
+                &continuation.tool_names,
+                false,
+                profile.openai_capabilities.max_tool_result_chars,
+                inline_tool_result_documents,
+            )?);
+        }
+        steps
     } else {
-        interaction_steps_from_messages(
+        interaction_steps_from_messages_checked(
             messages,
             text_tool_history,
             profile.openai_capabilities.max_tool_result_chars,
-        )
+            inline_tool_result_documents,
+        )?
     };
     if input.is_empty() {
         return Err("Gemini Interactions request produced no supported input steps".to_string());
@@ -2814,7 +3238,20 @@ fn translate_gemini_interactions_request_with_continuation(
     let requested_cancel_tool = computer_conversation_context(request)
         .as_ref()
         .and_then(|_| requested_computer_cancel_tool_name(request));
-    let tools = translated_interaction_tools(request, &profile.openai_capabilities)?;
+    // Server-side tool_search + defer_loading requires stored continuation so
+    // Gemini circulates tool_search_call / tool_search_result signatures on the
+    // server. Stateless runs or full-history fallback without a stored ID fall
+    // back cleanly to eager exposure.
+    let allow_tool_retrieval = profile.openai_capabilities.gemini_tool_retrieval
+        && store_interaction
+        && allow_continuation
+        && gemini_supports_tool_retrieval(&model)
+        && (continuation.is_some() || !interaction_messages_have_tool_history(messages));
+    let tools = translated_interaction_tools_with_retrieval(
+        request,
+        &profile.openai_capabilities,
+        allow_tool_retrieval,
+    )?;
     if !tools.is_empty() && repeated_tool_loop.is_none() {
         let tool_choice = requested_cancel_tool
             .as_ref()
@@ -2937,9 +3374,12 @@ fn interaction_request_has_mixed_tools(request: &Value) -> bool {
     let has_function = tools
         .iter()
         .any(|tool| tool.get("type").and_then(Value::as_str) == Some("function"));
-    let has_server_tool = tools
-        .iter()
-        .any(|tool| tool.get("type").and_then(Value::as_str) != Some("function"));
+    let has_server_tool = tools.iter().any(|tool| {
+        !matches!(
+            tool.get("type").and_then(Value::as_str),
+            Some("function" | "tool_search")
+        )
+    });
     has_function && has_server_tool
 }
 
@@ -2951,10 +3391,51 @@ fn remove_interaction_server_tools(request: &mut Value) -> bool {
     tools.retain(|tool| {
         matches!(
             tool.get("type").and_then(Value::as_str),
-            Some("function" | "computer_use")
+            Some("function" | "computer_use" | "tool_search")
         )
     });
+    let any_deferred = tools
+        .iter()
+        .any(|tool| tool.get("defer_loading").and_then(Value::as_bool) == Some(true));
+    if !any_deferred {
+        tools.retain(|tool| tool.get("type").and_then(Value::as_str) != Some("tool_search"));
+    }
     original_len != tools.len()
+}
+
+fn strip_interaction_tool_retrieval(request: &mut Value) -> bool {
+    let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    let original_len = tools.len();
+    tools.retain(|tool| tool.get("type").and_then(Value::as_str) != Some("tool_search"));
+    if tools.len() != original_len {
+        changed = true;
+    }
+    for tool in tools.iter_mut() {
+        if let Some(object) = tool.as_object_mut() {
+            if object.remove("defer_loading").is_some() {
+                changed = true;
+            }
+            if object.remove("short_description").is_some() {
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn is_tool_retrieval_error(status: u16, message: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let message = message.to_ascii_lowercase();
+    message.contains("tool_search")
+        || message.contains("defer_loading")
+        || message.contains("deferred loading")
+        || message.contains("deferred function")
+        || message.contains("short_description")
 }
 
 fn interaction_request_has_computer_use(request: &Value) -> bool {
@@ -3035,6 +3516,8 @@ fn is_gemini_server_tool_step(step_type: &str) -> bool {
             | "file_search_result"
             | "mcp_server_tool_call"
             | "mcp_server_tool_result"
+            | "tool_search_call"
+            | "tool_search_result"
     )
 }
 
@@ -3043,6 +3526,7 @@ struct InteractionServerToolTrace {
     steps: Vec<Value>,
     web_search_requests: u64,
     web_fetch_requests: u64,
+    tool_search_requests: u64,
 }
 
 impl InteractionServerToolTrace {
@@ -3067,6 +3551,8 @@ impl InteractionServerToolTrace {
             self.web_search_requests = self.web_search_requests.saturating_add(1);
         } else if step_type == "url_context_call" {
             self.web_fetch_requests = self.web_fetch_requests.saturating_add(1);
+        } else if step_type == "tool_search_call" {
+            self.tool_search_requests = self.tool_search_requests.saturating_add(1);
         }
         if self.steps.len() >= INTERACTION_SERVER_TOOL_TRACE_CAPACITY {
             return;
@@ -3085,6 +3571,12 @@ impl InteractionServerToolTrace {
             google.insert(
                 "interaction_server_tools".to_string(),
                 Value::Array(self.steps.clone()),
+            );
+        }
+        if self.tool_search_requests > 0 {
+            google.insert(
+                "tool_search_requests".to_string(),
+                json!(self.tool_search_requests),
             );
         }
         if interaction_usage
@@ -3521,6 +4013,7 @@ async fn forward_gemini_interactions_profile(
         );
     };
     let mut mixed_tools_fallback = false;
+    let mut tool_retrieval_fallback = false;
     let mut continuation_fallback = false;
     let mut runtime_diagnostics = Vec::new();
     if interaction_request.get("previous_interaction_id").is_none()
@@ -3623,6 +4116,23 @@ async fn forward_gemini_interactions_profile(
                 );
                 continue;
             }
+        }
+
+        if !tool_retrieval_fallback
+            && is_tool_retrieval_error(status.as_u16(), &message)
+            && strip_interaction_tool_retrieval(&mut interaction_request)
+        {
+            tool_retrieval_fallback = true;
+            runtime_diagnostics.push(
+                "Gemini rejected deferred tool retrieval; retried with eager function exposure"
+                    .to_string(),
+            );
+            warn!(
+                provider = %profile.file_name,
+                upstream_error = %message,
+                "Gemini rejected tool_search/defer_loading; retrying with eager tool declarations"
+            );
+            continue;
         }
 
         if !continuation_fallback

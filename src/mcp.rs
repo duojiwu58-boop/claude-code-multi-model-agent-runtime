@@ -154,7 +154,9 @@ async fn configured_kimi_formula_tools(state: &AppState) -> Result<Vec<KimiFormu
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| format!("Kimi formula '{formula}' returned an unnamed function"))?;
-            if name == "generate_image" || !names.insert(name.to_string()) {
+            if matches!(name, "generate_image" | "inspect_document")
+                || !names.insert(name.to_string())
+            {
                 return Err(format!(
                     "Kimi formula tool name '{name}' conflicts with another MCP tool"
                 ));
@@ -280,13 +282,13 @@ async fn mcp(
                         "name": "claude-code-gemini-image",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "instructions": "Use generate_image when the user asks to create or draw an image. It returns a rendered image and a saved local file path."
+                    "instructions": "Use generate_image when the user asks to create or draw an image. Use inspect_document when the active Gemini Interactions model needs to read or slice local PDF, Word, PowerPoint, Excel, or OpenDocument files by pages, sheets, cell ranges, or content layers."
                 }),
             )
         }
         "ping" => mcp_json_response(id, json!({})),
         "tools/list" => {
-            let mut tools = vec![image_generation_tool()];
+            let mut tools = vec![image_generation_tool(), inspect_document_tool()];
             match configured_kimi_formula_tools(&state).await {
                 Ok(formula_tools) => {
                     tools.extend(formula_tools.into_iter().map(|tool| tool.mcp_definition))
@@ -329,6 +331,14 @@ async fn mcp(
                             "isError": false
                         }),
                     ),
+                    Err(message) => mcp_json_response(id, mcp_tool_result(message, true)),
+                };
+            }
+            if name == Some("inspect_document") {
+                return match execute_inspect_document(&state, request.pointer("/params/arguments"))
+                    .await
+                {
+                    Ok(result) => mcp_json_response(id, result),
                     Err(message) => mcp_json_response(id, mcp_tool_result(message, true)),
                 };
             }

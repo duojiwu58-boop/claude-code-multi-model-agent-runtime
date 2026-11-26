@@ -153,6 +153,7 @@ where
         interaction_continuations: Arc::new(RwLock::new(interaction_continuations)),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: loaded_profiles.profiles,
             active_file: active_profile,

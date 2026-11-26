@@ -430,12 +430,35 @@ Kimi Formula 官方工具通过本地 MCP 显式启用；空数组表示完全�
 
 ## Gemini 原生 Interactions（推荐）
 
-### Gemini 4 Argon / Carbon / Hydrogen 推理档位
+### Gemini 4 Neon（2026-11-26 文档核对）
+
+配置示例：[gemini-4-neon.example.json](examples/providers/gemini-4-neon.example.json)。
+Neon 复用 Gemini 4 Interactions 请求结构，默认 high，支持 xhigh；同步上限为 65,536，
+输入、思考与输出共享 1,048,576 token。桥接器已将 Neon 接入既有后台长输出、上下文预算预检、
+15 分钟普通流空闲超时及管理端四档切换。保持 65,536 的 profile 上限即可用于普通任务；
+需要长输出时提高该上限，同时客户端请求也需超过 65,536，并保持 gemini_store=true。
+参见 [Neon 迁移指南](https://aistudio.google.com/docs/whats-new-gemini-4-neon)。
+
+同期新增能力适配状态：
+- [Tool retrieval（Preview）](https://aistudio.google.com/docs/tool-retrieval)：已支持服务端按需工具检索。
+  当模型为 Gemini 3.6+ Flash 或 Gemini 4 系列、且 `gemini_store: true`、`gemini_tool_retrieval: true`、
+  未处于无续接回放或 Computer Use 会话时，桥接器透传函数上的 `defer_loading: true`（及可选 `short_description`）
+  与统一延迟的 Remote MCP `defer_loading: true`，并自动注入单个服务端 `{"type": "tool_search"}`；
+  `tool_search_call` / `tool_search_result` 步骤在流式与非流式路径均归档到 `provider_metadata.google`。
+  遇到无状态模式、续接回退、强制具名 `tool_choice` 或上游 400 拒绝时自动成对剥离并回退到全量暴露。
+- [文件处理与切片](https://aistudio.google.com/docs/document-processing#customize-document-processing)：已支持全部 11 种
+  Office / OpenDocument MIME 自动推断与透传、Gemini `file` URI 来源、`resolution` 与 `processing`
+  （`page_options` 页码/内容层与 `spreadsheet_options` 工作表/A1 单元格范围/内容层）校验映射；
+  Gemini 3+/4+ 的工具结果 `document` 直接保留在原生 `function_result.result` 中（旧模型仍回退到后续 `user_input`）。
+  内置 `/mcp` 同时新增 `inspect_document` 工具，通过 Gemini Files API 断点续传与 48h SHA-256 缓存上传本地文档并按切片注入
+  `function_result.result`。音视频输入仍需后续单独扩展。
+
+### Gemini 4 Argon / Carbon / Hydrogen / Neon 推理档位
 
 截至 2026-11-14，三个 Gemini 4 模型均使用 `gemini-interactions`，共享 1M 上下文预算及后台长输出路径。
-Carbon 与 Argon 支持 low/medium/high，默认 medium；Hydrogen 支持 low/medium/high/xhigh，默认 high。
-Hydrogen 的客户端 xhigh/max 保留为 xhigh，其他两个模型映射为 high；none/minimal/disabled 均映射为 low。
-`/admin/status` 返回模型对应的 `gemini_thinking_choices`，GUI 对 Hydrogen 显示“极高”第四档。
+Carbon 与 Argon 支持 low/medium/high，默认 medium；Hydrogen 与 Neon 支持 low/medium/high/xhigh，默认 high。
+Hydrogen 与 Neon 的客户端 xhigh/max 保留为 xhigh，其他两个模型映射为 high；none/minimal/disabled 均映射为 low。
+`/admin/status` 返回模型对应的 `gemini_thinking_choices`，GUI 对 Hydrogen/Neon 显示“极高”第四档。
 持久化的 xhigh 在切换到 Carbon/Argon 后有效值为 high，管理端拒绝直接给这两个模型设置 xhigh。
 详见 [官方 Thinking](https://aistudio.google.com/docs/thinking) 与 [Long decode](https://aistudio.google.com/docs/long-decode)。
 
@@ -495,7 +518,7 @@ Interactions 和 Token Count 统一去除模型名首尾空格、可选的 `mode
 运行时发生工具组合降级或有状态续接回退时，通过同一响应头说明原因。
 无状态模式（gemini_store=false）或续接 ID 不可用时，完整的已签名客户端工具历史按原生 thought、function_call、function_result 回放，保留调用 ID、参数、错误结果和签名。
 只有历史缺少签名、工具结果缺失/重复/孤立或包含无法恢复的服务端工具状态时，才使用明确诊断的有损文本恢复；不伪造签名。
-Argon 的图片输入仍保留已实测的 65536 上限，避免进入拒绝图片的后台后端；该限制不扩展到 Carbon/Hydrogen。
+Argon 的图片输入仍保留已实测的 65536 上限，避免进入拒绝图片的后台后端；该限制不扩展到 Carbon/Hydrogen/Neon。
 429 使用统一的有限重试及 Retry-After 策略；等待响应头和重试的总时间受模型超时限制，
 拿到响应头后普通 SSE 使用空闲超时；后台 SSE 另有上述 24 小时总时限。
 
@@ -685,7 +708,7 @@ Claude Code 请求在此 transport 上按下表映射：
 | `output_config.format`                     | `response_format`（JSON Schema 会经过 Gemini 兼容清洗）                                                            |
 | `output_config.effort: low/medium/high`    | `thinking_level: low/medium/high`                                                                                  |
 | `output_config.effort: xhigh/max`          | 保守钳制为 `thinking_level: high`                                                                                  |
-| document 的 URL/base64/text/content source | 原生 `document` content，尽量保留 MIME type；工具结果中的 PDF 会移到紧随其后的合法 `user_input`               |
+| document 的 URL/base64/file/text/content source | 原生 `document` content，自动推断 11 种 Office/OpenDocument 与 PDF MIME，校验并透传 `resolution`/`processing`（`page_options`/`spreadsheet_options`）；Gemini 3+/4+ 工具结果文档保留在 `function_result.result` 中 |
 | 含 PDF 且 profile 启用 `code_execution`    | 仅对本次请求省略原生 Code Execution 并报告兼容性降级；其他兼容工具保留                                            |
 | `service_tier: standard_only`              | `service_tier: standard`                                                                                           |
 | `service_tier: auto`                       | 不发送该字段，使用 Google 默认 `standard`，不会自动升级为付费 `priority`                                           |
@@ -693,7 +716,7 @@ Claude Code 请求在此 transport 上按下表映射：
 | `web_search_*` / `web_fetch_*` / `code_execution_*` | 分别映射为 `google_search` / `url_context` / `code_execution`，并与 profile 配置去重                    |
 | `mcp_servers` + `mcp_toolset`              | 原生 Remote MCP；转换 Bearer 鉴权、名称与 allowlist，denylist 因无法强制执行而拒绝                        |
 | `bash_*` / `text_editor_*` / `memory_*`    | 展开为带 schema 的 client function，工具动作仍由 Claude Code 在本机执行                                  |
-| `tool_search_tool_*`                       | Gemini 无按需 tool search；改为立即暴露请求中的函数并报告诊断                                            |
+| `tool_search_tool_*` + `defer_loading`     | Gemini 3.6+ Flash / Gemini 4 在 `gemini_store=true` 且 `gemini_tool_retrieval=true` 时映射为服务端 `{"type":"tool_search"}` + `defer_loading`；否则或回退时立即全量暴露并报告诊断 |
 | `search_result` 输入块                     | 保留 title、source 与正文，转换成有来源标记的 Gemini 文本上下文；不伪造 Anthropic 加密引用索引           |
 
 无法安全映射的 Anthropic 字段会写入服务日志，并以可重复的
@@ -898,8 +921,9 @@ profile 时检查引用是否存在。
 | `kimi_formula_tools`             | `[]`                                                             | 显式启用的 Kimi 官方 Formula URI；通过本地 MCP 获取 schema 并执行，默认不启用、不产生额外费用                                                |
 | `gemini_builtin_tools`           | `[]`                                                             | 仅 `gemini-interactions` 使用；接受工具名或含原生选项的对象，支持 `google_search`、`url_context`、`code_execution`、`google_maps`、`file_search` |
 | `gemini_file_search_store_names` | `[]`                                                             | 仅 `gemini-interactions` 使用；非空时启用 Google 原生 File Search，并传入指定 `fileSearchStores/...` 资源名                                  |
-| `gemini_remote_mcp_servers`      | `[]`                                                             | 仅 `gemini-interactions` 使用；显式配置 HTTPS Streamable HTTP MCP server、可选 headers 与 `allowed_tools`；管理输出会脱敏 header 值          |
+| `gemini_remote_mcp_servers`      | `[]`                                                             | 仅 `gemini-interactions` 使用；显式配置 HTTPS Streamable HTTP MCP server、可选 headers、`allowed_tools` 与 `defer_loading`；管理输出会脱敏 header 值 |
 | `gemini_store`                   | `true`                                                           | 仅 `gemini-interactions` 使用；关闭时不在 Google 端存储交互，也不使用 `previous_interaction_id`                                             |
+| `gemini_tool_retrieval`          | `true`                                                           | 仅 `gemini-interactions` 使用；在支持的模型与有状态续接下透传 `defer_loading` 并注入服务端 `tool_search`；设为 `false` 可强制全量暴露工具 |
 | `gemini_service_tier`            | 未设置                                                           | 可选 `auto`、`standard`、`priority`、`flex`；`auto` 允许 Claude fast mode 映射 Priority，固定档位覆盖请求映射                              |
 | `gemini_tool_choice_override`    | 未设置                                                           | 可选 `auto`、`any`、`none`、`validated`；设置后覆盖 Claude 的 tool choice，`validated` 保留 Gemini 原生 schema 约束                          |
 

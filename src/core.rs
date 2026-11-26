@@ -236,6 +236,7 @@ struct OpenAiCapabilities {
     gemini_file_search_store_names: Vec<String>,
     gemini_remote_mcp_servers: Vec<Value>,
     gemini_store: bool,
+    gemini_tool_retrieval: bool,
     gemini_service_tier: Option<String>,
     gemini_tool_choice_override: Option<String>,
     user_id: Option<String>,
@@ -276,6 +277,7 @@ impl Default for OpenAiCapabilities {
             gemini_file_search_store_names: Vec::new(),
             gemini_remote_mcp_servers: Vec::new(),
             gemini_store: true,
+            gemini_tool_retrieval: true,
             gemini_service_tier: None,
             gemini_tool_choice_override: None,
             user_id: None,
@@ -458,6 +460,13 @@ struct GeminiTransport {
 }
 
 #[derive(Clone)]
+struct CachedGeminiFile {
+    uri: String,
+    name: String,
+    expires_at: SystemTime,
+}
+
+#[derive(Clone)]
 struct AppState {
     ls_lifecycle: Arc<tokio::sync::RwLock<LsLifecycle>>,
     gemini_transport: Arc<RwLock<GeminiTransport>>,
@@ -472,6 +481,7 @@ struct AppState {
     #[allow(dead_code)]
     computer: Arc<ComputerBroker>,
     vision_cache: Arc<VisionObservationCache>,
+    gemini_file_cache: Arc<GeminiFileCache>,
     routing: Arc<RwLock<ProviderRoutingState>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     settings_dir: PathBuf,

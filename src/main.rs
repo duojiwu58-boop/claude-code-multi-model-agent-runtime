@@ -89,6 +89,12 @@ const DEFAULT_IMAGE_UPSTREAM: &str =
     "https://generativelanguage.googleapis.com/v1beta/interactions";
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const COMPUTER_PROTOCOL_VERSION: &str = "gemini-computer-v1";
+const DOCUMENT_PROTOCOL_VERSION: &str = "gemini-document-v1";
+const GEMINI_FILE_CACHE_CAPACITY: usize = 256;
+const GEMINI_MAX_DOCUMENT_BYTES: u64 = 50 * 1024 * 1024;
+const GEMINI_FILE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const GEMINI_FILE_PROCESSING_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const GEMINI_FILE_PROCESSING_MAX_POLLS: usize = 30;
 // Identity phrases Claude Code injects into system prompts. These are matched
 // as phrases/patterns rather than whole declarations so that subagent persona
 // variants ("You are a file search specialist for Claude Code, ...", "You are
@@ -105,6 +111,7 @@ const CLAUDE_CO_AUTHOR_LINE: &str = "Co-Authored-By: Claude <noreply@anthropic.c
 
 type ThoughtSignatureCache = RwLock<IndexMap<String, String>>;
 type VisionObservationCache = tokio::sync::Mutex<IndexMap<String, String>>;
+type GeminiFileCache = tokio::sync::Mutex<IndexMap<String, CachedGeminiFile>>;
 type InteractionContinuationState = RwLock<InteractionContinuationCache>;
 
 // These cohesive source slices are included at crate root so this first
@@ -126,6 +133,7 @@ include!("openai_files.rs");
 include!("openai_chat_state.rs");
 include!("openai_inbound_stream.rs");
 include!("computer.rs");
+include!("gemini_documents.rs");
 include!("mcp.rs");
 include!("vision.rs");
 include!("admin.rs");

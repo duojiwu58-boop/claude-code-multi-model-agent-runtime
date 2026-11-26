@@ -192,6 +192,7 @@ async fn health_json_never_exposes_url_userinfo_credentials() {
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![profile.clone()],
             active_file: profile.file_name.clone(),
@@ -1015,6 +1016,7 @@ async fn vision_proxy_calls_provider_once_and_reuses_base64_cache() {
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![target.clone(), source],
             active_file: target.file_name.clone(),
@@ -1105,6 +1107,7 @@ async fn mcp_generate_image_calls_gemini_saves_file_and_returns_preview() {
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: Vec::new(),
             active_file: String::new(),
@@ -1240,6 +1243,7 @@ async fn configured_kimi_formula_is_exposed_and_executed_only_when_enabled() {
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![profile],
             active_file: "kimi-k3.json".to_string(),
@@ -1814,6 +1818,8 @@ fn gemini_flash_thinking_controls_support_37_and_newer_versions() {
         "gemini-4-hydrogen",
         " MODELS/Gemini-4-Hydrogen ",
         "gemini-4-hydrogen-preview",
+        "gemini-4-neon",
+        " MODELS/Gemini-4-Neon-preview ",
     ] {
         profile.model = model.to_string();
         assert!(supports_gemini_thinking_levels(&profile), "{model}");
@@ -1869,6 +1875,7 @@ async fn admin_gemini_thinking_level_is_hot_persisted_and_profile_scoped() {
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![profile],
             active_file: "gemini-3.8-flash.json".to_string(),
@@ -2207,6 +2214,7 @@ async fn reasoning_effort_control_admin_flow_persists_and_rejects_invalid_levels
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![qwen, gemini],
             active_file: "qwen3.8-max.json".to_string(),
@@ -2337,6 +2345,7 @@ async fn reasoning_effort_control_persist_failure_keeps_memory_state() {
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![qwen],
             active_file: "qwen3.8-max.json".to_string(),
@@ -2411,6 +2420,7 @@ async fn reasoning_effort_wire_assertion(
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![profile.clone()],
             active_file: profile.file_name.clone(),
@@ -3791,6 +3801,7 @@ async fn model_by_id_serves_known_names_and_rejects_unknown() {
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![profile],
             active_file: "qwen.json".to_string(),
@@ -7164,6 +7175,7 @@ async fn anthropic_count_tokens_uses_kimi_native_estimator() {
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![profile],
             active_file: "kimi-k3.json".to_string(),
@@ -7259,6 +7271,7 @@ async fn anthropic_messages_uses_bridge_managed_gemini_credential() {
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![profile],
             active_file: "gemini-interactions.json".to_string(),
@@ -7336,6 +7349,7 @@ async fn anthropic_count_tokens_uses_google_native_endpoint() {
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles: vec![profile],
             active_file: "gemini-interactions.json".to_string(),
@@ -8903,6 +8917,8 @@ fn gemini_4_thinking_levels_are_supported_on_all_request_paths() {
         "gemini-4-hydrogen",
         " MODELS/Gemini-4-Hydrogen ",
         "gemini-4-hydrogen-preview",
+        "gemini-4-neon",
+        " MODELS/Gemini-4-Neon-preview ",
     ] {
         profile.model = model.to_string();
         profile.openai_capabilities.default_reasoning_effort = Some("none".to_string());
@@ -8930,7 +8946,9 @@ fn gemini_4_thinking_levels_are_supported_on_all_request_paths() {
             ("high", "high"),
             (
                 "max",
-                if is_gemini_4_hydrogen_model(model) {
+                if model.to_ascii_lowercase().contains("hydrogen")
+                    || model.to_ascii_lowercase().contains("neon")
+                {
                     "xhigh"
                 } else {
                     "high"
@@ -8938,7 +8956,9 @@ fn gemini_4_thinking_levels_are_supported_on_all_request_paths() {
             ),
             (
                 "xhigh",
-                if is_gemini_4_hydrogen_model(model) {
+                if model.to_ascii_lowercase().contains("hydrogen")
+                    || model.to_ascii_lowercase().contains("neon")
+                {
                     "xhigh"
                 } else {
                     "high"
@@ -10390,6 +10410,7 @@ fn probe_state(
         interaction_continuations: Arc::new(RwLock::new(InteractionContinuationCache::default())),
         computer: Arc::new(ComputerBroker),
         vision_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
+        gemini_file_cache: Arc::new(tokio::sync::Mutex::new(IndexMap::new())),
         routing: Arc::new(RwLock::new(ProviderRoutingState {
             profiles,
             active_file,
